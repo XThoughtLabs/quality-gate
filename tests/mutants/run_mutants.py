@@ -133,7 +133,7 @@ MUTANTS: list[tuple[str, str, str, str, str]] = [
     ("FB-pr", "gate/feedback.py", 'if pull is None or (event_name == "issue_comment" and pull.get("number") != pr):', "if pull is None:", "R: the marker's SHA on another PR"),
     ("FB-silent", "gate/feedback.py", '"post": code not in SILENT,', '"post": True,', "R: the gate answers every comment"),
     ("FB-path", "gate/feedback.py", 'if run.get("path") != feedback.get("judge_workflow_path") or run.get("event") != "pull_request_target":', "if False:", "the expected workflow"),
-    ("COMMON-C5", "gate/common.py", 'MENTION = "`@claude`"', 'MENTION = "@claude"', "C-5 a bare mention of the executor"),
+    ("FB-mention", "gate/common.py", 'MENTION = "`@claude`"', 'MENTION = "@claude"', "C-5 a bare mention of the executor"),
     # review_local
     ("REV-L1", "gate/review_local.py", 'if not name.startswith("REVIEWER_")', "if True", "L-1 the key's path reaches the model"),
     ("REV-R-marker", "gate/review_local.py", 'f"<!-- gate-review sha={sha} verdict={answer[\'verdict\']} -->",', '"",', "R: no marker in the comment"),

@@ -2,3 +2,7 @@
 __pycache__/
 *.pyc
 .pytest_cache/
+
+# Local logs of test runs: they hold this machine's paths.
+evidence-local/
+reproduce-out/
