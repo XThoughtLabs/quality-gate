@@ -17,7 +17,6 @@ from gate.common import EXIT_OK, MENTION, UsageError, fail_usage, load_config, n
 
 REVIEW_CONTEXT = "independent-review"
 SAFE_REF = re.compile(r"[A-Za-z0-9._/-]+")
-SAFE_APP = re.compile(r"[A-Za-z0-9-]+")
 # Written by gate.review_local. Only its SHA is used, and that SHA is then checked.
 MARKER = re.compile(r"<!-- gate-review sha=([0-9a-f]{40}) verdict=(pass|changes_requested) -->")
 
@@ -171,7 +170,7 @@ def cmd_outputs(args: argparse.Namespace) -> int:
     if pr is not None and not (isinstance(pr, int) and not isinstance(pr, bool) and pr > 0):
         raise UsageError("the PR number is not a positive integer")
     apps = [str(feedback.get(key)) for key in ("reviewer_app", "executor_app") if feedback.get(key)]
-    if not all(SAFE_APP.fullmatch(app) for app in apps):
+    if not all(SAFE_REF.fullmatch(app) for app in apps):
         raise UsageError("an app's name holds characters the gate does not pass on")
     with open(args.output, "a", encoding="utf-8", newline="\n") as handle:
         handle.write(f"act={'true' if decision.get('act') else 'false'}\n")

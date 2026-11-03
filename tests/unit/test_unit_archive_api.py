@@ -16,6 +16,8 @@ from urllib.parse import parse_qs, urlparse
 
 import pytest
 
+pytestmark = pytest.mark.req("W-4", "W-5", "W-11", "W-12", "W-13", "F-4")
+
 BOT = "github-actions[bot]"
 SECRET = "SENTINEL-VALUE-1234"
 PREFIX = "/repos/example/app"
@@ -90,7 +92,14 @@ class Handler(BaseHTTPRequestHandler):
             if self.command == "GET" and route.startswith("/git/trees/"):
                 commit = route.rsplit("/", 1)[1]
                 tree = fake.trees[fake.commits[commit]["tree"]]
-                return self._reply(200, {"truncated": False, "tree": [{"path": p, "type": "blob", "sha": s} for p, s in tree.items()]})
+                return self._reply(
+                    200,
+                    {
+                        "sha": fake.commits[commit]["tree"],
+                        "truncated": False,
+                        "tree": [{"path": p, "type": "blob", "sha": s} for p, s in tree.items()],
+                    },
+                )
             if self.command == "GET" and route.startswith("/git/blobs/"):
                 data = fake.blobs[route.rsplit("/", 1)[1]]
                 if fake.corrupt_blobs:
@@ -118,7 +127,8 @@ class Handler(BaseHTTPRequestHandler):
                 fake.blobs[sha] = base64.b64decode(body["content"])
                 return self._reply(201, {"sha": sha})
             if self.command == "POST" and route == "/git/trees":
-                tree = dict(fake.trees[fake.commits[body["base_tree"]]["tree"]]) if body.get("base_tree") else {}
+                # base_tree names a tree: a commit's SHA here is a fault of the code.
+                tree = dict(fake.trees[body["base_tree"]]) if body.get("base_tree") else {}
                 for entry in body["tree"]:
                     tree[entry["path"]] = entry["sha"]
                 sha = fake.new_sha("tree")

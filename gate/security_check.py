@@ -137,7 +137,7 @@ def main(argv: list[str] | None = None) -> int:
             code = subprocess.run(command, check=False, **popen_kwargs()).returncode
         except OSError:
             code = 127
-        tool_codes.append({"argv": command, "exit_code": code})
+        tool_codes.append(code)
 
     reviewed = read_review(Path(args.review))
     findings, missing = read_findings(args)

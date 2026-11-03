@@ -4,6 +4,10 @@ from __future__ import annotations
 
 import json
 
+import pytest
+
+pytestmark = pytest.mark.req("diag-summary")
+
 
 def test_coverage_counts_only_changed_lines_that_can_be_measured(gate, tmp_path):
     repo = tmp_path / "repo"

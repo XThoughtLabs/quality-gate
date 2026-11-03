@@ -11,7 +11,7 @@ The pipeline names no application. Everything application-specific comes from `q
 - **C-3 Secrets.** No script prints, logs or writes the value of a secret, in any output file or message, including when the value is malformed.
 - **C-4 Untrusted text.** Anything read from an artifact, a diff, a model or a comment is data. It never changes a verdict except through the checks named here. When it is posted, every `@word` from it appears inside backticks.
 - **C-5 Mention.** Anything the gate posts writes `@claude` only in backticks.
-- **C-6 Python.** Python 3.13. Standard library, plus `jsonschema` in `report` and `cryptography` in `review_local`.
+- **C-6 Python.** Python 3.13. Standard library, plus `jsonschema` in `report generate` and `cryptography` in `review_local`.
 
 ## 1. `quality.toml`
 
@@ -179,7 +179,7 @@ The rules G-1 to G-11 do not apply to `other` PRs, and G-1 to G-10 do not apply 
 - **S-4** A missing or unparsable tool output exits 1, code `MISSING_TOOL_OUTPUT`: absence is never a pass.
 - **S-5** An added line holding `# nosec` or `gitleaks:allow` with no row for that tool and path exits 1, code `SUPPRESSION_WITHOUT_ENTRY`.
 - **S-6** A missing review file means no reviewed findings.
-- **S-7** `--tool-command '<JSON list>'`, repeatable, runs a tool first and records its exit code in `tool_exit_codes`. A tool that finds something exits non-zero, so only its output decides.
+- **S-7** `--tool-command '<JSON list>'`, repeatable, runs a tool first and records its exit code in `tool_exit_codes`, a list of integers in the order given. A tool that finds something exits non-zero, so only its output decides.
 
 ## 7. `gate.concurrency_harness`
 
@@ -278,7 +278,11 @@ Writes `{"verdict", "reasons", "conclusions": {"gate/archive", "gate/final"}}`.
 
 - **Z-1** Copies `raw/gate-guard/guard.json` and `raw/gate-acceptance/acceptance.json` to the artifact's top level when present, writes `environment.json` and `meta.json`, and writes `SHA256SUMS` over every other file.
 
-## 8a. `gate.publish`
+## 8a. `gate.diag_summary`
+
+`python -P -m gate.diag_summary coverage --coverage-json FILE --repo DIR --base SHA --head SHA --out FILE`, and `python -P -m gate.diag_summary mutation --results FILE --out FILE`, write the summaries that `report` reads. Diagnostic only. A share of nothing is `"unknown"`, never 0.
+
+## 8a-bis. `gate.publish`
 
 The GitHub side of the judge: `context`, `jobs`, `extras`, `post-checks`, `post-final`, `comment`, `pulls`, `limits`, `hide-paths`. It reads its token from `GATE_TOKEN` and prints only the kind of a failure, never a token.
 
@@ -305,9 +309,9 @@ Stores `reports/<pr>/<run_id>-<attempt>/` on the branch: `context.json`, the fil
 | Purpose | Route |
 |---|---|
 | The branch's head | `GET /repos/{repo}/git/ref/heads/{branch}`: `object.sha`. A 404 means the branch does not exist |
-| The files | `GET /repos/{repo}/git/trees/{commit}?recursive=1`: `tree[].path`, `type`, `sha`, and `truncated`, which is an error when true |
+| The files | `GET /repos/{repo}/git/trees/{commit}?recursive=1`: `sha` of the tree, `tree[].path`, `type`, `sha`, and `truncated`, which is an error when true |
 | Write a file | `POST /repos/{repo}/git/blobs`: `content` in base64, `encoding`: `sha` |
-| Write a tree | `POST /repos/{repo}/git/trees`: `tree[]` of `path`, `mode`, `type`, `sha`, and `base_tree` when the branch exists: `sha` |
+| Write a tree | `POST /repos/{repo}/git/trees`: `tree[]` of `path`, `mode`, `type`, `sha`, and, when the branch exists, `base_tree`, the SHA of its head's tree: `sha` |
 | Write a commit | `POST /repos/{repo}/git/commits`: exactly `message`, `tree`, `parents`: `sha` |
 | Move the branch | `PATCH /repos/{repo}/git/refs/heads/{branch}`: `sha`, `force` false. For a new branch, `POST /repos/{repo}/git/refs`: `ref`, `sha`. A 409 or 422 means it moved |
 | Read a file | `GET /repos/{repo}/git/blobs/{sha}`: `content` in base64 |

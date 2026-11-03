@@ -14,6 +14,8 @@ from pathlib import Path
 
 import pytest
 
+pytestmark = pytest.mark.req("V-1", "V-2", "V-4", "V-5", "X-2")
+
 HEAD_RUN = "1001"
 RUN_STEPS = ("gate/env", "gate/guard", "gate/tests", "gate/acceptance", "gate/security")
 PASSING_TEST = "def test_ok():\n    assert 1 + 1 == 2\n"

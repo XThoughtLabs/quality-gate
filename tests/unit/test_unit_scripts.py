@@ -9,6 +9,8 @@ from pathlib import Path
 
 import pytest
 
+pytestmark = pytest.mark.req("P-1", "P-2", "Q-1a", "R-9", "R-10", "A-9", "D-8", "E-4a", "F-2a", "Z-1", "C-1")
+
 SECRET = "SENTINEL-VALUE-1234"
 
 

@@ -5,7 +5,10 @@ from __future__ import annotations
 import re
 from pathlib import Path
 
+import pytest
 import yaml
+
+pytestmark = pytest.mark.req("Y-3", "Y-5", "Y-7", "Y-14", "Y-15")
 
 WORKFLOWS = Path(__file__).resolve().parents[2] / ".github" / "workflows"
 

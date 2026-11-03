@@ -150,6 +150,7 @@ class ApiRemote:
         self.base = os.environ.get("GITHUB_API_URL", "https://api.github.com").rstrip("/")
         self.token = os.environ.get("GATE_TOKEN", "")
         self.head: str | None = None
+        self.head_tree: str | None = None
 
     def _call(self, method: str, route: str, body: Any = None) -> Any:
         data = json.dumps(body).encode() if body is not None else None
@@ -184,6 +185,7 @@ class ApiRemote:
         tree = self._safe("GET", f"/git/trees/{commit}?recursive=1")
         if tree.get("truncated"):
             raise RemoteError("the tree of the branch is too large to read whole")
+        self.head_tree = tree.get("sha")
         return {entry["path"]: entry["sha"] for entry in tree.get("tree", []) if entry.get("type") == "blob"}
 
     def paths(self) -> set[str]:
@@ -197,7 +199,7 @@ class ApiRemote:
             entries.append({"path": name, "mode": "100644", "type": "blob", "sha": blob["sha"]})
         tree_body: dict[str, Any] = {"tree": entries}
         if self.head:
-            tree_body["base_tree"] = self.head
+            tree_body["base_tree"] = self.head_tree
         tree = self._safe("POST", "/git/trees", tree_body)
         # No author, committer or signature: GitHub signs a commit only without them.
         commit = self._safe(

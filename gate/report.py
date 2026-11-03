@@ -18,8 +18,6 @@ import sys
 from pathlib import Path, PurePosixPath
 from typing import Any
 
-import jsonschema
-
 from gate.common import (
     DIAGNOSTIC_CHECKS,
     EXIT_OK,
@@ -484,7 +482,12 @@ def cmd_generate(args: argparse.Namespace) -> int:
 
     verdict, reasons, checks, facts = judge(context, jobs, artifact, config, extras)
     report = build_report(context, artifact, extras, verdict, reasons, facts)
-    jsonschema.validate(report, json.loads(SCHEMA_PATH.read_text(encoding="utf-8")))
+    import jsonschema  # noqa: PLC0415  # reason: only this command needs the library (C-6)
+
+    try:
+        jsonschema.validate(report, json.loads(SCHEMA_PATH.read_text(encoding="utf-8")))
+    except jsonschema.ValidationError as error:
+        raise UsageError(f"the report does not match its schema: {error.message}") from error
 
     out = Path(args.out)
     write_json(out / "report.json", report)
@@ -642,8 +645,6 @@ def main(argv: list[str] | None = None) -> int:
         return handlers[args.command](args)
     except UsageError as error:
         return fail_usage(str(error))
-    except jsonschema.ValidationError as error:
-        return fail_usage(f"the report does not match its schema: {error.message}")
 
 
 if __name__ == "__main__":
