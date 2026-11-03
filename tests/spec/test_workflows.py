@@ -569,14 +569,26 @@ def test_y18_the_prompt_comes_from_the_default_branch_and_the_notes_stay_outside
 
 @pytest.mark.req("Y-19")
 def test_y19_the_guard_gets_the_prs_author_from_the_trusted_context():
+    import tomllib
+
+    # 1. like every check, the gate/guard step runs gate.run_checks, so that its exit code is recorded
     st = next(s for s in run_steps() if s.get("name") == "gate/guard")
     script = str(st.get("run", ""))
-    assert "gate.guard" in script and "--author" in script, "gate.guard is called with --author"
-    m = re.search(r'--author\s+"?\$\{?(\w+)', script)
-    assert m, f"--author takes a shell variable, not an expression pasted into the script (Y-8): {script}"
-    env = st.get("env") or {}
-    assert m.group(1) in env, f"the variable {m.group(1)} is set in the step's env"
-    assert "${{" in str(env[m.group(1)]), "from the workflow's trusted context"
+    assert "gate.run_checks" in script and re.search(r"--check\s+gate/guard\b", script), \
+        f"the gate/guard step must run gate.run_checks with --check gate/guard: {script}"
+    # 2. the gate's own gate/builtin_checks.toml has a gate/guard command: --author {env:GATE_PR_AUTHOR}
+    path = GATE_ROOT / "gate" / "builtin_checks.toml"
+    assert path.exists(), f"{path} must exist (CONTRACTS.md Y-19)"
+    guard = tomllib.loads(path.read_text(encoding="utf-8"))["checks"]["gate/guard"]
+    commands = guard["commands"]
+    assert any(isinstance(c, list) and "--author" in c and c.index("--author") + 1 < len(c)
+               and c[c.index("--author") + 1] == "{env:GATE_PR_AUTHOR}" for c in commands), \
+        f"no gate/guard command holds `--author {{env:GATE_PR_AUTHOR}}`: {commands}"
+    # 3. the workflow-level env of judge.yml sets GATE_PR_AUTHOR from the PR's author in the trusted event
+    env = load("judge").get("env") or {}
+    assert "GATE_PR_AUTHOR" in env, f"judge.yml's workflow-level env must set GATE_PR_AUTHOR, has {list(env)}"
+    assert "github.event.pull_request.user.login" in str(env["GATE_PR_AUTHOR"]) and "${{" in str(env["GATE_PR_AUTHOR"]), \
+        f"GATE_PR_AUTHOR is {env['GATE_PR_AUTHOR']!r}"
 
 
 @pytest.mark.req("Y-19")
