@@ -1,17 +1,21 @@
 """Judge a PR's change against the rules of design section 6, from git objects only.
 
-This script never runs code from the repository it reads.
+This script never runs code from the repository it reads, nor any command its git
+settings name.
 """
 
 from __future__ import annotations
 
 import argparse
 import ast
+import configparser
+import fnmatch
 import hashlib
 import json
 import re
 import subprocess
 import sys
+import tomllib
 from dataclasses import dataclass, field
 from pathlib import Path, PurePosixPath
 
@@ -29,12 +33,31 @@ FIXED_PROTECTED = (
     "OPEN-ISSUES.md",
     "SOURCE-MANIFEST.json",
     "evidence/",
+    "security-review.md",
 )
+# What controls which tests are collected or how the security tools run (decision W).
+PROTECTED_NAMES_ANY_FOLDER = {
+    "pytest.ini",
+    ".pytest.ini",
+    ".bandit",
+    "bandit.yaml",
+    "bandit.yml",
+    ".gitleaks.toml",
+    ".gitleaksignore",
+}
+PROTECTED_ROOT_CONFTEST = "conftest.py"
+PROTECTED_INI_SECTIONS = {
+    "setup.cfg": ("tool:*", "coverage:*", "bandit", "flake8", "mypy*"),
+    "tox.ini": ("pytest", "tox*", "testenv*", "coverage:*", "bandit", "flake8", "mypy*"),
+}
 FIXED_THRESHOLD_KEYS = ("fail_under", "fail-under", "cov-fail-under")
 KNOWN_FAILING_PATH = "acceptance/known-failing.txt"
+# The action's default git identity, for commits that do not name the app.
+ACTION_DEFAULT_BOT = "claude[bot]"
 
-# A repository's own settings must never start a command from here.
-_SAFE_DIFF = ("--no-renames", "--no-color", "--no-ext-diff", "--no-textconv")
+# A repository's own settings must never start a command from here. --text keeps a
+# .gitattributes in the repository from hiding a change.
+_SAFE_DIFF = ("--no-renames", "--no-color", "--no-ext-diff", "--no-textconv", "--text")
 _SKIP_DECORATORS = (
     "pytest.mark.skip",
     "pytest.mark.skipif",
@@ -45,12 +68,24 @@ _SKIP_DECORATORS = (
     "unittest.expectedFailure",
 )
 _SKIP_CALLS = ("pytest.skip", "pytest.xfail")
-_SUPPRESSIONS = ("# noqa", "type: ignore", "pytest.skip(")
+_SUPPRESSIONS = (
+    ("# noqa", re.compile(r"#\s*noqa\b", re.IGNORECASE)),
+    ("# type: ignore", re.compile(r"#\s*type:\s*ignore\b", re.IGNORECASE)),
+    ("# ruff: noqa", re.compile(r"#\s*ruff:\s*noqa\b", re.IGNORECASE)),
+    ("# flake8: noqa", re.compile(r"#\s*flake8:\s*noqa\b", re.IGNORECASE)),
+    ("# mypy: ignore-errors", re.compile(r"#\s*mypy:\s*ignore-errors\b", re.IGNORECASE)),
+    ("# pylint: disable", re.compile(r"#\s*pylint:\s*disable\b", re.IGNORECASE)),
+    ("# pragma: no cover", re.compile(r"#\s*pragma:\s*no\s*cover\b", re.IGNORECASE)),
+    ("pytest.skip(", re.compile(r"pytest\.skip\(", re.IGNORECASE)),
+)
 _REASON = re.compile(r"#\s*reason:\s*\S")
 _USES = re.compile(r"""^\s*(?:-\s*)?uses:\s*['"]?([^'"\s#]+)""")
 _FULL_SHA = re.compile(r"^[0-9a-f]{40}$")
 _HUNK = re.compile(r"^@@ -\d+(?:,\d+)? \+(\d+)(?:,(\d+))? @@")
 _REQUIREMENT = re.compile(r"^([A-Za-z0-9][A-Za-z0-9._-]*)(\[[^\]]*\])?\s*(?:==\s*([^\s;]+))?")
+_COMMENT = re.compile(r"(^|\s)[#;].*$")
+_NO_COV = re.compile(r"(?<![\w-])--no-cov\b")
+_TRUE_COMPARISONS = (ast.Eq, ast.Is, ast.LtE, ast.GtE)
 
 
 @dataclass
@@ -59,12 +94,17 @@ class Result:
     head_sha: str
     violations: list[dict] = field(default_factory=list)
     needs_code_owner: list[str] = field(default_factory=list)
+    marked_tests: list[dict] = field(default_factory=list)
     dependency_changes: list[dict] = field(default_factory=list)
     fingerprint: dict = field(default_factory=dict)
     repeated_fix: bool = False
 
     def add(self, rule: str, path: str, detail: str) -> None:
         self.violations.append({"rule": rule, "path": path, "detail": detail})
+
+    def mark(self, path: str, name: str) -> None:
+        self.marked_tests.append({"path": path, "name": name})
+        self.needs_code_owner.append(path)
 
 
 class Git:
@@ -121,6 +161,18 @@ class Git:
         raw = self.run("diff", *_SAFE_DIFF, start, end)
         return normalized_fingerprint(raw.decode("utf-8", "replace"))
 
+    def commit_identities(self, start: str, end: str) -> set[str]:
+        """The author and committer names of the commits a PR adds."""
+        raw = self.run("log", "--format=%an%x00%cn", f"{start}..{end}")
+        names: set[str] = set()
+        for line in raw.decode("utf-8", "replace").splitlines():
+            names.update(line.split("\0"))
+        return names
+
+    def own_commits(self, previous: str, base: str, head: str) -> int:
+        """The commits since the previous round that are neither merges nor from the base."""
+        return int(self.run("rev-list", "--no-merges", "--count", head, f"^{previous}", f"^{base}").decode().strip())
+
 
 def normalized_fingerprint(diff: str) -> str:
     """SHA-256 of a diff with its line numbers, blob hashes and line endings removed."""
@@ -142,12 +194,23 @@ def normalized_fingerprint(diff: str) -> str:
     return hashlib.sha256(normalized.encode("utf-8")).hexdigest()
 
 
-def branch_kind(branch: str) -> str:
-    if branch.startswith("ai/"):
-        return "ai"
-    if branch.startswith("spec/"):
+def pr_kind(branch: str, author: str, identities: set[str], config: dict) -> str:
+    """The kind of a PR (decision V). A branch name can only make the rules stricter."""
+    app = config.get("feedback", {}).get("executor_app")
+    app_login = f"{app}[bot]".lower() if app else None
+    author_lower = author.lower()
+    names = {name.lower() for name in identities}
+    bot_names = {ACTION_DEFAULT_BOT} | ({app_login} if app_login else set())
+    strict = (
+        author_lower.endswith("[bot]")
+        or bool(names & bot_names)
+        or branch.lower().startswith(("ai/", "spec/"))
+    )
+    if not strict:
+        return "other"
+    if app_login and author_lower == app_login and branch.startswith("spec/"):
         return "spec"
-    return "other"
+    return "ai"
 
 
 def is_protected(path: str, protected: list[str]) -> bool:
@@ -159,15 +222,53 @@ def is_protected(path: str, protected: list[str]) -> bool:
     return False
 
 
+def is_protected_control_file(path: str) -> bool:
+    lowered = path.lower()
+    if lowered == PROTECTED_ROOT_CONFTEST:
+        return True
+    return PurePosixPath(lowered).name in PROTECTED_NAMES_ANY_FOLDER
+
+
+def _ini_sections(text: str, patterns: tuple[str, ...]) -> dict[str, dict[str, str]] | None:
+    parser = configparser.ConfigParser(interpolation=None, strict=False)
+    try:
+        parser.read_string(text)
+    except configparser.Error:
+        return None
+    return {
+        name: dict(parser.items(name))
+        for name in parser.sections()
+        if any(fnmatch.fnmatch(name.lower(), pattern) for pattern in patterns)
+    }
+
+
+def protected_section_changed(path: str, base_text: str | None, head_text: str | None) -> str | None:
+    """Say which protected section of a root configuration file changed, or None."""
+    lowered = path.lower()
+    if lowered == "pyproject.toml":
+        try:
+            before = tomllib.loads(base_text or "").get("tool", {})
+            after = tomllib.loads(head_text or "").get("tool", {})
+        except tomllib.TOMLDecodeError:
+            return "the file cannot be parsed"
+        changed = sorted(key for key in set(before) | set(after) if before.get(key) != after.get(key))
+        return f"[tool.{changed[0]}] changed" if changed else None
+    patterns = PROTECTED_INI_SECTIONS.get(lowered)
+    if patterns is None:
+        return None
+    before_ini = _ini_sections(base_text or "", patterns)
+    after_ini = _ini_sections(head_text or "", patterns)
+    if before_ini is None or after_ini is None:
+        return "the file cannot be parsed"
+    changed = sorted(key for key in set(before_ini) | set(after_ini) if before_ini.get(key) != after_ini.get(key))
+    return f"[{changed[0]}] changed" if changed else None
+
+
 def is_test_file(path: str) -> bool:
     pure = PurePosixPath(path)
     if pure.suffix != ".py":
         return False
-    return (
-        pure.name.startswith("test_")
-        or pure.name.endswith("_test.py")
-        or "tests" in pure.parts[:-1]
-    )
+    return pure.name.startswith("test_") or pure.name.endswith("_test.py") or "tests" in pure.parts[:-1]
 
 
 def _dotted(node: ast.AST) -> str:
@@ -190,8 +291,43 @@ class TestFacts:
     skips: int
     always_true: int
     broad_raises: int
+    early_returns: int
+    cases: int | None
+    code: str
     first_line: int
     last_line: int
+
+
+def _is_check_call(name: str) -> bool:
+    last = name.rsplit(".", 1)[-1]
+    return name == "pytest.raises" or name.startswith("self.assert") or last.startswith("assert_")
+
+
+def _assert_is_always_true(test: ast.AST) -> bool:
+    if isinstance(test, ast.Constant):
+        return bool(test.value)
+    if isinstance(test, ast.BoolOp) and isinstance(test.op, ast.Or):
+        return any(isinstance(value, ast.Constant) and bool(value.value) for value in test.values)
+    if isinstance(test, ast.Compare) and len(test.ops) == 1 and isinstance(test.ops[0], _TRUE_COMPARISONS):
+        return ast.dump(test.left) == ast.dump(test.comparators[0])
+    return False
+
+
+def _has_check(statements: list[ast.stmt]) -> bool:
+    for statement in statements:
+        for node in ast.walk(statement):
+            if isinstance(node, ast.Assert) or (isinstance(node, ast.Call) and _is_check_call(_dotted(node.func))):
+                return True
+    return False
+
+
+def _parametrize_cases(function: ast.AST) -> int | None:
+    total = None
+    for decorator in function.decorator_list:
+        if isinstance(decorator, ast.Call) and _decorator_name(decorator) == "pytest.mark.parametrize":
+            if len(decorator.args) >= 2 and isinstance(decorator.args[1], (ast.List, ast.Tuple)):
+                total = (total or 0) + len(decorator.args[1].elts)
+    return total
 
 
 def _facts_of(function: ast.AST, inherited_skips: int) -> TestFacts:
@@ -202,23 +338,35 @@ def _facts_of(function: ast.AST, inherited_skips: int) -> TestFacts:
     for node in ast.walk(function):
         if isinstance(node, ast.Assert):
             checks += 1
-            if isinstance(node.test, ast.Constant) and bool(node.test.value):
+            if _assert_is_always_true(node.test):
                 always_true += 1
         elif isinstance(node, ast.Call):
             name = _dotted(node.func)
-            if name == "pytest.raises":
-                checks += 1
-                if node.args and _dotted(node.args[0]) in ("Exception", "BaseException"):
-                    broad_raises += 1
-            elif name.startswith("self.assert"):
+            if name == "pytest.raises" and node.args and _dotted(node.args[0]) in ("Exception", "BaseException"):
+                broad_raises += 1
+            if _is_check_call(name):
                 checks += 1
             elif name in _SKIP_CALLS:
                 skips += 1
-    return TestFacts(checks, skips + inherited_skips, always_true, broad_raises, function.lineno, function.end_lineno)
+    early_returns = sum(
+        isinstance(statement, ast.Return) and _has_check(function.body[index + 1 :])
+        for index, statement in enumerate(function.body)
+    )
+    return TestFacts(
+        checks,
+        skips + inherited_skips,
+        always_true,
+        broad_raises,
+        early_returns,
+        _parametrize_cases(function),
+        ast.dump(function),
+        function.lineno,
+        function.end_lineno,
+    )
 
 
-def collect_tests(source: str) -> dict[str, TestFacts]:
-    """Map each test function, by qualified name, to what it checks. Raises SyntaxError."""
+def collect_functions(source: str) -> tuple[dict[str, TestFacts], dict[str, str]]:
+    """Map each test to what it checks, and each other function to its code. Raises SyntaxError."""
     tree = ast.parse(source)
     module_skips = 0
     for node in tree.body:
@@ -229,18 +377,23 @@ def collect_tests(source: str) -> dict[str, TestFacts]:
             module_skips += sum(_decorator_name(value) in _SKIP_DECORATORS for value in values)
 
     tests: dict[str, TestFacts] = {}
+    others: dict[str, str] = {}
     function_types = (ast.FunctionDef, ast.AsyncFunctionDef)
 
-    def visit(body: list[ast.stmt], prefix: str, inherited: int) -> None:
+    def visit(body: list[ast.stmt], prefix: str, inherited: int, in_class: bool) -> None:
         for node in body:
-            if isinstance(node, function_types) and node.name.startswith("test_"):
-                tests[prefix + node.name] = _facts_of(node, inherited)
+            if isinstance(node, function_types):
+                is_test = node.name.startswith("test") if in_class else node.name.startswith("test_")
+                if is_test:
+                    tests[prefix + node.name] = _facts_of(node, inherited)
+                else:
+                    others[prefix + node.name] = ast.dump(node)
             elif isinstance(node, ast.ClassDef):
                 own = sum(_decorator_name(d) in _SKIP_DECORATORS for d in node.decorator_list)
-                visit(node.body, f"{prefix}{node.name}.", inherited + own)
+                visit(node.body, f"{prefix}{node.name}.", inherited + own, True)
 
-    visit(tree.body, "", module_skips)
-    return tests
+    visit(tree.body, "", module_skips, False)
+    return tests, others
 
 
 def check_tests(git: Git, base: str, head: str, status: str, path: str, result: Result) -> list[tuple[int, int]]:
@@ -253,11 +406,11 @@ def check_tests(git: Git, base: str, head: str, status: str, path: str, result: 
     if base_source is None or head_source is None:
         return []
     try:
-        base_tests = collect_tests(base_source)
+        base_tests, base_others = collect_functions(base_source)
     except SyntaxError:
         return []
     try:
-        head_tests = collect_tests(head_source)
+        head_tests, head_others = collect_functions(head_source)
     except SyntaxError:
         result.add("TEST_WEAKENED", path, "the changed test file cannot be parsed")
         return []
@@ -268,15 +421,31 @@ def check_tests(git: Git, base: str, head: str, status: str, path: str, result: 
         if after is None:
             result.add("TEST_DELETED", path, f"{name} was removed")
             continue
+        weakened = False
         if after.skips > before.skips:
             result.add("TEST_SKIPPED", path, f"{name} gained a skip or an expected failure")
             flagged.append((after.first_line, after.last_line))
+            weakened = True
         if after.checks < before.checks:
             result.add("TEST_WEAKENED", path, f"{name} has {after.checks} checks, down from {before.checks}")
+            weakened = True
         if after.always_true > before.always_true:
             result.add("TEST_WEAKENED", path, f"{name} gained an always-true assert")
+            weakened = True
         if after.broad_raises > before.broad_raises:
             result.add("TEST_WEAKENED", path, f"{name} gained pytest.raises(Exception)")
+            weakened = True
+        if after.early_returns > before.early_returns:
+            result.add("TEST_WEAKENED", path, f"{name} gained a return ahead of a check")
+            weakened = True
+        if before.cases is not None and (after.cases is None or after.cases < before.cases):
+            result.add("TEST_WEAKENED", path, f"{name} has fewer parametrized cases")
+            weakened = True
+        if not weakened and before.code != after.code:
+            result.mark(path, name)
+    for name, before_code in sorted(base_others.items()):
+        if head_others.get(name) != before_code:
+            result.mark(path, name)
     return flagged
 
 
@@ -288,7 +457,7 @@ def check_suppressions(
     source = git.show(head, path)
     lines = source.split("\n") if source is not None else []
     for number, text in git.added_lines(base, head, path):
-        marker = next((mark for mark in _SUPPRESSIONS if mark in text), None)
+        marker = next((label for label, pattern in _SUPPRESSIONS if pattern.search(text)), None)
         if marker is None:
             continue
         if marker == "pytest.skip(" and any(first <= number <= last for first, last in flagged):
@@ -299,26 +468,34 @@ def check_suppressions(
 
 
 def threshold_values(text: str, keys: list[str]) -> dict[str, list[float]]:
+    """The numeric values of each threshold key. A key in a comment does not count."""
+    bare = "\n".join(_COMMENT.sub("", line) for line in text.split("\n"))
     values: dict[str, list[float]] = {}
     for key in keys:
-        pattern = re.compile(rf"(?:^|[^\w-]|--){re.escape(key)}\s*=\s*(-?\d+(?:\.\d+)?)", re.MULTILINE)
-        found = [float(match.group(1)) for match in pattern.finditer(text)]
+        spelled = r"[-_]".join(re.escape(part) for part in re.split(r"[-_]", key))
+        pattern = re.compile(
+            rf"""(?<![\w-])(?:--)?{spelled}["']?\s*(?:=|:|,|\s)\s*["']?(-?\d+(?:\.\d+)?)""",
+            re.IGNORECASE,
+        )
+        found = [float(match.group(1)) for match in pattern.finditer(bare)]
         if found:
             values[key] = found
     return values
 
 
-def check_thresholds(git: Git, base: str, head: str, path: str, keys: list[str], result: Result) -> None:
+def check_thresholds(git: Git, base: str, head: str, status: str, path: str, keys: list[str], result: Result) -> None:
     before = threshold_values(git.show(base, path) or "", keys)
     after = threshold_values(git.show(head, path) or "", keys)
     for key, old_values in before.items():
-        new_values = after.get(key, [])
-        if len(new_values) < len(old_values):
+        new_values = after.get(key)
+        if not new_values:
             result.add("THRESHOLD_LOWERED", path, f"{key} was removed")
-            continue
-        for old, new in zip(old_values, new_values):
-            if new < old:
-                result.add("THRESHOLD_LOWERED", path, f"{key} went from {old:g} to {new:g}")
+        elif min(new_values) < min(old_values):
+            result.add("THRESHOLD_LOWERED", path, f"{key} went from {min(old_values):g} to {min(new_values):g}")
+    if status != "D":
+        for number, text in git.added_lines(base, head, path):
+            if _NO_COV.search(_COMMENT.sub("", text)):
+                result.add("THRESHOLD_LOWERED", path, f"line {number} adds --no-cov")
 
 
 def parse_requirements(text: str) -> dict[str, tuple[str, str | None, bool]]:
@@ -423,7 +600,7 @@ def stored_runs(reports_dir: str, pr: int) -> list[dict]:
 
 
 def check_repeated(git: Git, base: str, head: str, head_sha: str, args: argparse.Namespace, result: Result) -> None:
-    earlier = []
+    earlier: list[dict] = []
     if args.reports_dir and not Path(args.reports_dir).is_dir():
         # A lost read of the stored runs must never look like "no earlier rounds".
         raise UsageError("the folder of stored runs is missing")
@@ -441,6 +618,9 @@ def check_repeated(git: Git, base: str, head: str, head_sha: str, args: argparse
         "round": git.fingerprint(previous, head),
         "cumulative": git.fingerprint(base, head),
     }
+    # A round of merges from the base holds no fix at all, so it cannot repeat one.
+    if previous != base and git.own_commits(previous, base, head) == 0:
+        return
     for record in earlier:
         stored = record.get("fingerprint")
         if not isinstance(stored, dict):
@@ -507,29 +687,38 @@ def check_known_failing(git: Git, base: str, head: str, kind: str, args: argpars
             result.add("KNOWN_FAILING_REMOVED_NOT_PASSED", KNOWN_FAILING_PATH, f"{test_id} has no stored pass")
 
 
+def check_ai_rules(git: Git, base: str, head: str, changes: list[tuple[str, str]], guard: dict, result: Result) -> None:
+    protected = [*FIXED_PROTECTED, *guard.get("extra_protected", [])]
+    keys = [*FIXED_THRESHOLD_KEYS, *guard.get("threshold_keys", [])]
+    changed = {path for _, path in changes}
+    for status, path in changes:
+        if is_protected(path, protected) or is_protected_control_file(path):
+            result.add("PROTECTED_PATH", path, f"status {status}")
+        else:
+            section = protected_section_changed(path, git.show(base, path), git.show(head, path))
+            if section:
+                result.add("PROTECTED_PATH", path, section)
+        if PurePosixPath(path).name.lower() == PROTECTED_ROOT_CONFTEST and path.lower() != PROTECTED_ROOT_CONFTEST:
+            result.needs_code_owner.append(path)
+        flagged: list[tuple[int, int]] = []
+        if is_test_file(path):
+            flagged = check_tests(git, base, head, status, path, result)
+        if status != "D":
+            check_suppressions(git, base, head, path, flagged, result)
+        check_thresholds(git, base, head, status, path, keys, result)
+    check_dependencies(git, base, head, changed, guard, result)
+
+
 def judge(args: argparse.Namespace, config: dict) -> Result:
     git = Git(args.repo)
     head = git.run("rev-parse", f"{args.head}^{{commit}}").decode().strip()
     base = git.run("merge-base", args.base, head).decode().strip()
-    kind = branch_kind(args.branch)
+    kind = pr_kind(args.branch, args.author, git.commit_identities(base, head), config)
     result = Result(kind=kind, head_sha=head)
     changes = git.changes(base, head)
-    guard = config.get("guard", {})
 
     if kind == "ai":
-        protected = [*FIXED_PROTECTED, *guard.get("extra_protected", [])]
-        keys = [*FIXED_THRESHOLD_KEYS, *guard.get("threshold_keys", [])]
-        changed = {path for _, path in changes}
-        for status, path in changes:
-            if is_protected(path, protected):
-                result.add("PROTECTED_PATH", path, f"status {status}")
-            flagged: list[tuple[int, int]] = []
-            if is_test_file(path):
-                flagged = check_tests(git, base, head, status, path, result)
-            if status != "D":
-                check_suppressions(git, base, head, path, flagged, result)
-            check_thresholds(git, base, head, path, keys, result)
-        check_dependencies(git, base, head, changed, guard, result)
+        check_ai_rules(git, base, head, changes, config.get("guard", {}), result)
 
     if kind == "spec":
         for _, path in changes:
@@ -557,6 +746,7 @@ def main(argv: list[str] | None = None) -> int:
     parser.add_argument("--base", required=True)
     parser.add_argument("--head", required=True)
     parser.add_argument("--branch", required=True)
+    parser.add_argument("--author", required=True)
     parser.add_argument("--config", required=True)
     parser.add_argument("--out", required=True)
     parser.add_argument("--reports-dir")
@@ -576,6 +766,7 @@ def main(argv: list[str] | None = None) -> int:
             "head_sha": result.head_sha,
             "violations": result.violations,
             "needs_code_owner": sorted(set(result.needs_code_owner)),
+            "marked_tests": result.marked_tests,
             "dependency_changes": result.dependency_changes,
             "fingerprint": result.fingerprint,
             "repeated_fix": result.repeated_fix,

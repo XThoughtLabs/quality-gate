@@ -31,6 +31,7 @@ jobs:
       pull-requests: write
     outputs:
       act: ${{ steps.decision.outputs.act }}
+      head-sha: ${{ steps.decision.outputs.head-sha }}
       pr: ${{ steps.decision.outputs.pr }}
       head-ref: ${{ steps.decision.outputs.head-ref }}
       allowed-bots: ${{ steps.decision.outputs.allowed-bots }}
@@ -70,9 +71,10 @@ jobs:
       - name: Decide
         id: decision
         run: |
+          python -P -m gate.archive check-actors --api-repo "$GITHUB_REPOSITORY" --branch reports --config "$GATE_CONFIG" --out actors.json || true
           python -P -m gate.publish pulls --out pulls.json
           python -P -m gate.publish review-statuses --event-name "$GATE_EVENT_NAME" --event "$GITHUB_EVENT_PATH" --out statuses.json
-          python -P -m gate.feedback decide --event-name "$GATE_EVENT_NAME" --event "$GITHUB_EVENT_PATH" --pulls pulls.json --statuses statuses.json --reports-dir .stored/reports --config "$GATE_CONFIG" --out decision.json
+          python -P -m gate.feedback decide --event-name "$GATE_EVENT_NAME" --event "$GITHUB_EVENT_PATH" --pulls pulls.json --statuses statuses.json --actors actors.json --reports-dir .stored/reports --config "$GATE_CONFIG" --out decision.json
           python -P -m gate.feedback outputs --decision decision.json --config "$GATE_CONFIG" --output "$GITHUB_OUTPUT" --note note/comment.txt
 
       - name: Say what was decided and why
@@ -93,6 +95,10 @@ jobs:
     name: fix
     needs: decide
     if: ${{ needs.decide.outputs.act == 'true' }}
+    # One fix at a time per PR. The executor then rechecks the head, so a queued one stops.
+    concurrency:
+      group: gate-fix-${{ needs.decide.outputs.pr }}
+      cancel-in-progress: false
     permissions:
       contents: read
     uses: ./.github/workflows/executor.yml
@@ -101,6 +107,7 @@ jobs:
       prompt-file: ${{ inputs.prompt-file }}
       pr-number: ${{ needs.decide.outputs.pr }}
       head-ref: ${{ needs.decide.outputs.head-ref }}
+      expected-head: ${{ needs.decide.outputs.head-sha }}
       allowed-bots: ${{ needs.decide.outputs.allowed-bots }}
       fix-note-artifact: gate-fix-note
     secrets:

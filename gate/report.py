@@ -14,6 +14,7 @@ import io
 import json
 import os
 import platform
+import re
 import sys
 from pathlib import Path, PurePosixPath
 from typing import Any
@@ -93,9 +94,7 @@ def read_rows(path: Path) -> list[dict[str, str]] | None:
 
 def parse_exit_code(value: Any) -> int | None:
     text = str(value).strip()
-    if text.lstrip("-").isdigit():
-        return int(text)
-    return None
+    return int(text) if re.fullmatch(r"-?\d+", text) else None
 
 
 def safe_member(root: Path, relative: str) -> Path | None:
@@ -191,7 +190,7 @@ def judge(context: dict, jobs: dict, artifact: Path, config: dict, extras: dict)
 
         # Cross-check each step's trusted conclusion against its exit codes.
         if rows is not None:
-            for check in (*RUN_STEPS, *DIAGNOSTIC_CHECKS):
+            for check in (*RUN_STEPS, *DIAGNOSTIC_CHECKS, "setup"):
                 check_rows = rows_by_check.get(check)
                 step = steps.get(check)
                 if not check_rows:
@@ -234,6 +233,8 @@ def judge(context: dict, jobs: dict, artifact: Path, config: dict, extras: dict)
 
     for check in failed_checks:
         reason("FAILED_CHECK", f"{check} failed")
+    if steps.get("setup", {}).get("conclusion") == "failure":
+        reason("FAILED_CHECK", "setup failed, so the checks did not run on a prepared application")
     env_failures = extras.get("env_failures", [])
     for role in env_failures if isinstance(env_failures, list) else []:
         reason("FAILED_CHECK", f"gate/env failed in the {role} job")
@@ -319,7 +320,7 @@ def bypass_merges(merges: list[Any]) -> list[dict]:
 
 
 def build_report(
-    context: dict, artifact: Path, extras: dict, verdict: str, reasons: list[dict], facts: dict
+    context: dict, artifact: Path, extras: dict, verdict: str, reasons: list[dict], facts: dict, config: dict
 ) -> dict:
     def artifact_json(*parts: str) -> Any:
         return read_json_or_none(artifact.joinpath(*parts)) if artifact.is_dir() else None
@@ -335,6 +336,9 @@ def build_report(
     security = artifact_json("raw", "gate-security", "security.json")
     if isinstance(security, dict) and isinstance(security.get("findings"), list):
         findings += [item for item in security["findings"] if isinstance(item, dict)]
+    for review in extras.get("review_verdicts", []) if isinstance(extras.get("review_verdicts"), list) else []:
+        if isinstance(review, dict):
+            findings.append({"tool": "review", "rule": str(review.get("verdict")), "path": str(review.get("sha"))})
 
     acceptance = artifact_json("acceptance.json")
     known_failing: Any = "unknown"
@@ -361,15 +365,34 @@ def build_report(
         human = {"interventions": "unknown", "minutes": "unknown"}
 
     rounds = extras.get("rounds")
-    if not isinstance(rounds, list):
-        rounds = []
+    rounds = list(rounds) if isinstance(rounds, list) else []
+    own = guard.get("fingerprint")
+    if isinstance(own, dict) and not any(isinstance(item, dict) and item.get("head_sha") == context.get("head_sha") for item in rounds):
+        rounds.append({"head_sha": context.get("head_sha"), "round": own.get("round"), "cumulative": own.get("cumulative")})
     dependency_changes = guard.get("dependency_changes")
+    needs_code_owner = guard.get("needs_code_owner")
+    marked_tests = guard.get("marked_tests")
+    setup_rows = facts["rows"].get("setup", [])
+    setup: Any = "not-configured"
+    if setup_rows:
+        setup = {
+            "conclusion": str(facts["steps"].get("setup", {}).get("conclusion", "not-run")),
+            "exit_codes": [parse_exit_code(row.get("exit_code")) for row in setup_rows],
+        }
+    accepted = (config.get("archive") or {}).get("accepted_foreign_commits")
 
     return {
         "verification": {
             **{field: context.get(field) for field in CONTEXT_FIELDS},
+            "trusted_sha": context.get("trusted_sha", "unknown"),
+            "author": context.get("author", "unknown"),
             "execution_environment": context.get("execution_environment", "unknown"),
         },
+        "setup": setup,
+        "needs_code_owner": needs_code_owner if isinstance(needs_code_owner, list) else [],
+        "marked_tests": marked_tests if isinstance(marked_tests, list) else [],
+        "accepted_foreign_commits": accepted if isinstance(accepted, list) else [],
+        "independent_review": extras.get("independent_review", "unknown"),
         "environment": object_or_unknown(artifact_json("environment.json")),
         "checks": build_checks(artifact, facts),
         "coverage": object_or_unknown(artifact_json("raw", "diag-coverage", "summary.json")),
@@ -401,6 +424,8 @@ def render_markdown(report: dict) -> str:
         "",
         f"**Preliminary verdict: {cell(report['verdicts']['preliminary'])}**",
         "",
+        "The final verdict comes after the evidence is stored: see the check `gate/final`, and `final.json` beside this report.",
+        "",
         "## Verification record",
         "",
         "| Field | Value |",
@@ -422,6 +447,21 @@ def render_markdown(report: dict) -> str:
         lines.append(f"| {cell(check['id'])} | {cell(check['class'])} | {cell(check['conclusion'])} | {codes} |")
 
     known = report["known_failing"]
+    lines += ["", "## Marked for the code owner", ""]
+    lines += [f"- {cell(path)}" for path in report["needs_code_owner"]] or ["None."]
+    lines += [
+        f"- changed test: {cell(item.get('path'))}: {cell(item.get('name'))}"
+        for item in report["marked_tests"]
+        if isinstance(item, dict)
+    ]
+
+    lines += ["", "## Accepted foreign commits on the reports branch", ""]
+    lines += [
+        f"- {cell(item.get('sha'))}, {cell(item.get('date'))}: {cell(item.get('reason'))}"
+        for item in report["accepted_foreign_commits"]
+        if isinstance(item, dict)
+    ] or ["None."]
+
     lines += ["", "## Known-failing list", ""]
     if isinstance(known, dict):
         lines.append(f"Size: {known['size']}.")
@@ -481,7 +521,7 @@ def cmd_generate(args: argparse.Namespace) -> int:
     artifact = Path(args.artifact)
 
     verdict, reasons, checks, facts = judge(context, jobs, artifact, config, extras)
-    report = build_report(context, artifact, extras, verdict, reasons, facts)
+    report = build_report(context, artifact, extras, verdict, reasons, facts, config)
     import jsonschema  # noqa: PLC0415  # reason: only this command needs the library (C-6)
 
     try:

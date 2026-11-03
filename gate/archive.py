@@ -14,6 +14,7 @@ import argparse
 import base64
 import json
 import os
+import re
 import shutil
 import subprocess
 import sys
@@ -23,7 +24,7 @@ import urllib.request
 from pathlib import Path
 from typing import Any
 
-from gate.common import EXIT_OK, EXIT_RULE_FAILED, EXIT_USAGE, sha256_bytes, sha256_file, write_json
+from gate.common import EXIT_OK, EXIT_RULE_FAILED, EXIT_USAGE, UsageError, load_config, sha256_bytes, write_json
 
 MAX_PUSH_TRIES = 6  # the first try and 5 retries
 DEFAULT_MAX_BYTES = 200_000_000
@@ -34,7 +35,10 @@ _RAW_ATTRIBUTES = b"* -text -filter -ident\n"
 SUMS = "SHA256SUMS"
 EXPECTED_AUTHOR = "github-actions[bot]"
 ANOTHER_ACTOR = "reports written by another actor"
+UNCHECKED_ACTORS = "the authors of reports could not be checked"
 COMMIT_PAGES = 100
+FILE_PAGES = 30
+_FULL_SHA = re.compile(r"^[0-9a-f]{40}$")
 _IDENTITY = (
     "-c",
     "user.name=gate-archive",
@@ -60,6 +64,31 @@ class RemoteError(OSError):
 def _force_remove(function: Any, path: str, _error: Any) -> None:
     os.chmod(path, 0o700)
     function(path)
+
+
+def parse_accepted(config: dict) -> dict[str, dict]:
+    """The accepted foreign commits of a configuration. An incomplete entry is ignored."""
+    entries = (config.get("archive") or {}).get("accepted_foreign_commits") or []
+    accepted: dict[str, dict] = {}
+    if not isinstance(entries, list):
+        return accepted
+    for entry in entries:
+        if not isinstance(entry, dict):
+            continue
+        sha, reason, date = entry.get("sha"), entry.get("reason"), entry.get("date")
+        if isinstance(sha, str) and _FULL_SHA.match(sha) and str(reason or "").strip() and str(date or "").strip():
+            accepted[sha] = entry
+    return accepted
+
+
+def load_accepted(path: str | None) -> dict[str, dict]:
+    """An unreadable configuration accepts nothing: every foreign commit then stays foreign."""
+    if not path:
+        return {}
+    try:
+        return parse_accepted(load_config(path))
+    except UsageError:
+        return {}
 
 
 class GitRemote:
@@ -114,7 +143,7 @@ class GitRemote:
         return {
             path.relative_to(self.work).as_posix()
             for path in self.work.rglob("*")
-            if path.is_file() and ".git" not in path.relative_to(self.work).parts
+            if path.is_file() and path.relative_to(self.work).parts[0] != ".git"
         }
 
     def commit(self, files: dict[str, bytes], message: str) -> str:
@@ -137,18 +166,18 @@ class GitRemote:
         root = check / folder
         return {path.relative_to(root).as_posix(): path.read_bytes() for path in root.rglob("*") if path.is_file()}
 
-    def foreign_commits(self) -> list[str]:
-        return []
+    def foreign_commits(self, _accepted: dict[str, dict]) -> tuple[list[str], list[str]]:
+        return [], []
 
 
 class ApiRemote:
     """The branch on GitHub, written through the API so that GitHub signs each commit."""
 
-    def __init__(self, repository: str, branch: str) -> None:
+    def __init__(self, repository: str, branch: str, base: str | None = None, token: str | None = None) -> None:
         self.repository = repository
         self.branch = branch
-        self.base = os.environ.get("GITHUB_API_URL", "https://api.github.com").rstrip("/")
-        self.token = os.environ.get("GATE_TOKEN", "")
+        self.base = (base or os.environ.get("GITHUB_API_URL", "https://api.github.com")).rstrip("/")
+        self.token = os.environ.get("GATE_TOKEN", "") if token is None else token
         self.head: str | None = None
         self.head_tree: str | None = None
 
@@ -230,19 +259,55 @@ class ApiRemote:
                 found[path[len(prefix) :]] = base64.b64decode(blob["content"])
         return found
 
-    def foreign_commits(self) -> list[str]:
-        """Each commit on the branch not written and signed for github-actions[bot]."""
+    def _only_adds_records(self, sha: str) -> bool:
+        """Whether a commit has one parent and only adds files under reports/."""
+        for page in range(1, FILE_PAGES + 1):
+            commit = self._safe("GET", f"/commits/{sha}?per_page=100&page={page}")
+            if len(commit.get("parents") or []) != 1:
+                return False
+            files = commit.get("files") or []
+            for item in files:
+                if item.get("status") != "added" or not str(item.get("filename", "")).startswith("reports/"):
+                    return False
+            if len(files) < 100:
+                return True
+        return False
+
+    def foreign_commits(self, accepted: dict[str, dict]) -> tuple[list[str], list[str]]:
+        """Each commit not written and signed for github-actions[bot], and those accepted of them."""
+        if self._read_head() is None:
+            return [], []
         foreign: list[str] = []
+        found: list[str] = []
         for page in range(1, COMMIT_PAGES + 1):
             commits = self._safe("GET", f"/commits?sha={self.branch}&per_page=100&page={page}")
             for item in commits:
                 author = (item.get("author") or {}).get("login")
                 verified = ((item.get("commit") or {}).get("verification") or {}).get("verified")
-                if author != EXPECTED_AUTHOR or verified is not True:
-                    foreign.append(str(item.get("sha")))
+                if author == EXPECTED_AUTHOR and verified is True:
+                    continue
+                sha = str(item.get("sha"))
+                if sha in accepted and self._only_adds_records(sha):
+                    found.append(sha)
+                else:
+                    foreign.append(sha)
             if len(commits) < 100:
-                return foreign
+                return foreign, found
         raise RemoteError("too many commits on the branch to check")
+
+
+def actors_status(remote: Any, accepted: dict[str, dict]) -> dict:
+    """Whether the branch can be trusted. Anything unreadable means it cannot."""
+    try:
+        foreign, found = remote.foreign_commits(accepted)
+    except (RemoteError, KeyError, TypeError, ValueError, AttributeError):
+        return {"actors_ok": False, "foreign_commits": [], "accepted_commits": [], "reason": UNCHECKED_ACTORS}
+    return {
+        "actors_ok": not foreign,
+        "foreign_commits": foreign,
+        "accepted_commits": found,
+        "reason": ANOTHER_ACTOR if foreign else None,
+    }
 
 
 def is_unsafe(relative: Path, full: Path) -> bool:
@@ -303,18 +368,20 @@ def result(**fields: Any) -> dict:
         "artifact_present": False,
         "skipped_unsafe": [],
         "actors_ok": True,
+        "accepted_commits": [],
     }
     return {**base, **fields}
 
 
-def check_actors(remote: Any, outcome: dict) -> dict:
-    """Fail the store when anyone but the judge wrote to the branch."""
-    try:
-        foreign = remote.foreign_commits()
-    except RemoteError:
-        return {**outcome, "actors_ok": False, "reason": "the authors of reports could not be checked"}
-    if foreign:
-        return {**outcome, "actors_ok": False, "reason": ANOTHER_ACTOR, "foreign_commits": foreign}
+def check_actors(remote: Any, outcome: dict, accepted: dict[str, dict]) -> dict:
+    """Fail the store when anyone but the judge wrote to the branch. The evidence stays stored."""
+    status = actors_status(remote, accepted)
+    outcome = {**outcome, "actors_ok": status["actors_ok"], "accepted_commits": status["accepted_commits"]}
+    if status["actors_ok"]:
+        return outcome
+    outcome["reason"] = status["reason"]
+    if status["foreign_commits"]:
+        outcome["foreign_commits"] = status["foreign_commits"]
     return outcome
 
 
@@ -361,7 +428,7 @@ def store(args: argparse.Namespace, remote: Any) -> dict:
             artifact_present=present,
             skipped_unsafe=skipped,
         )
-        return check_actors(remote, outcome)
+        return check_actors(remote, outcome, load_accepted(args.config))
     return result(path=relative, reason="PUSH_REFUSED", artifact_present=present, skipped_unsafe=skipped)
 
 
@@ -387,8 +454,12 @@ def append(args: argparse.Namespace, remote: Any) -> dict:
             commit=commit,
             reason=None if matches else "READ_BACK_MISMATCH",
         )
-        return check_actors(remote, outcome)
+        return check_actors(remote, outcome, load_accepted(args.config))
     return result(path=target, reason="PUSH_REFUSED")
+
+
+def check_only(args: argparse.Namespace, remote: Any) -> dict:
+    return actors_status(remote, load_accepted(args.config))
 
 
 def main(argv: list[str] | None = None) -> int:
@@ -401,6 +472,7 @@ def main(argv: list[str] | None = None) -> int:
         group.add_argument("--api-repo", help="OWNER/NAME on GitHub, written through the API")
         command.add_argument("--branch", required=True)
         command.add_argument("--out", required=True)
+        command.add_argument("--config", help="the configuration from the default branch")
 
     store_parser = commands.add_parser("store")
     where(store_parser)
@@ -417,21 +489,26 @@ def main(argv: list[str] | None = None) -> int:
     append_parser.add_argument("--path", required=True)
     append_parser.add_argument("--file", required=True)
 
+    check_parser = commands.add_parser("check-actors")
+    where(check_parser)
+
     args = parser.parse_args(argv)
     if args.remote and "github.com" in args.remote.lower():
         print("usage error: on GitHub use --api-repo, so that GitHub signs the commits", file=sys.stderr)
         return EXIT_USAGE
 
-    handler = store if args.command == "store" else append
+    handlers = {"store": store, "append": append, "check-actors": check_only}
     with tempfile.TemporaryDirectory(prefix="gate-archive-", ignore_cleanup_errors=True) as tmp:
         remote: Any = ApiRemote(args.api_repo, args.branch) if args.api_repo else GitRemote(args.remote, args.branch, Path(tmp))
         try:
-            outcome = handler(args, remote)
+            outcome = handlers[args.command](args, remote)
         except OSError as error:
             outcome = result(reason=f"REMOTE_ERROR: {error}")
     write_json(args.out, outcome)
     if outcome["reason"]:
         print(f"archive: {outcome['reason']}", file=sys.stderr)
+    if args.command == "check-actors":
+        return EXIT_OK if outcome["actors_ok"] else EXIT_RULE_FAILED
     good = outcome["stored"] and outcome["sha256sums_match"] and outcome["actors_ok"]
     return EXIT_OK if good else EXIT_RULE_FAILED
 

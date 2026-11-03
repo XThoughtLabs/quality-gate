@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import argparse
 import json
+import re
 import subprocess
 import sys
 from pathlib import Path
@@ -11,7 +12,10 @@ from pathlib import Path
 from gate.common import EXIT_OK, EXIT_RULE_FAILED, UsageError, fail_usage, popen_kwargs, write_json
 from gate.guard import Git
 
-_MARKERS = {"# nosec": "bandit", "gitleaks:allow": "gitleaks"}
+_MARKERS = (
+    ("bandit", re.compile(r"#\s*nosec\b", re.IGNORECASE)),
+    ("gitleaks", re.compile(r"gitleaks\s*:\s*allow\b", re.IGNORECASE)),
+)
 
 
 def clean_path(path: object) -> str:
@@ -101,8 +105,8 @@ def read_suppressions(args: argparse.Namespace, reviewed: set[tuple[str, str, st
         if status == "D":
             continue
         for number, text in git.added_lines(base, head, path):
-            for marker, tool in _MARKERS.items():
-                if marker in text:
+            for tool, marker in _MARKERS:
+                if marker.search(text):
                     found.append({"tool": tool, "path": path, "line": number, "has_entry": (tool, path) in entries})
     return found
 

@@ -22,6 +22,7 @@ commands = [[
   "--base", "{env:GATE_BASE_SHA}",
   "--head", "{env:GATE_HEAD_SHA}",
   "--branch", "{env:GATE_HEAD_REF}",
+  "--author", "{env:GATE_PR_AUTHOR}",
   "--config", "{env:GATE_CONFIG}",
   "--reports-dir", "{env:GATE_REPORTS_DIR}",
   "--pr", "{env:GATE_PR}",

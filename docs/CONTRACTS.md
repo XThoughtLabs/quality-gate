@@ -38,6 +38,15 @@ threshold_keys = ["fail_under"]       # added to the fixed list
 [feedback]
 judge_workflow_path = ".github/workflows/judge.yml"
 reviewer_app = "example-reviewer"     # login without the [bot] suffix
+executor_app = "example-executor"     # login without the [bot] suffix
+
+[acceptance]
+require_empty = false                 # the CEO sets it true before the final PR (A-10)
+
+[[archive.accepted_foreign_commits]]  # the recovery of reports (W-14). Usually absent
+sha = "<40 hex>"
+reason = "why this commit was accepted"
+date = "2026-11-03"
 
 [spec_tests]
 deny_read = ["src/**", "tests/**"]
@@ -104,14 +113,15 @@ Runs every command of one check, in order, in the working directory.
 - **R-8** Rows are appended, never rewritten: running two checks leaves both.
 - **R-9** `argv_json` holds the command as configured, with its placeholders, so that a rerun on another machine records the same text.
 - **R-10** With `--if-configured`, a check that is not configured exits 0 and records nothing.
+- **R-11 Each test of the base (decision W).** A check with `expected_tests_from_base = true` and `junit` also requires each test of the base in the JUnit file. The base is the merge base of `GATE_BASE_SHA` and `HEAD`, in the working directory's git repository. Its tests are read by parsing, without running, every file named `test_*.py` or `*_test.py`: top-level functions whose names start with `test`, and methods whose names start with `test` in classes whose names start with `Test` or that inherit from a `TestCase`. A test's ID is `<dotted path of the file without .py>[.<class>...]::<name>`, and a JUnit name's `[...]` part is ignored when comparing. A test that is absent appends a row with index `post` and exit code 1, the script exits non-zero, and `missing_tests.json` in the raw folder lists them. `GATE_BASE_SHA` not set, or a base that cannot be read, exits 2.
 
 ## 4. `gate.acceptance` (decision O)
 
-`python -P -m gate.acceptance --junit FILE --known-failing FILE [--mode subset|exact] [--require-empty] --out FILE`
+`python -P -m gate.acceptance --junit FILE --known-failing FILE [--mode subset|exact] [--require-empty] [--config FILE] [--tests-dir DIR] --out FILE`
 
 The test ID is `<classname>::<name>` from the JUnit file. The list holds one entry per line: `<test id> <map id>`. Blank lines and lines starting with `#` are ignored. A map ID is `PUB-<2 digits>`, `SPEC-6.1`, `SPEC-6.2` or `DEF-<letters, digits, dashes>`. A missing list file is an empty list.
 
-`--out` writes `{"ok", "mode", "list_size", "failing_not_listed", "listed_failing", "remove_from_list", "missing_listed", "passed", "reason_codes"}`, with sorted lists.
+`--out` writes `{"ok", "mode", "list_size", "failing_not_listed", "listed_failing", "remove_from_list", "missing_listed", "missing_tests", "passed", "reason_codes"}`, with sorted lists.
 
 - **A-1** A listed test that fails does not fail the check. A failing or erroring test not on the list does, code `FAILING_NOT_LISTED`.
 - **A-2** A skipped test not on the list counts as failing.
@@ -122,26 +132,37 @@ The test ID is `<classname>::<name>` from the JUnit file. The list holds one ent
 - **A-7** An entry without a valid map ID, a duplicate entry or an unreadable JUnit file exits 2.
 - **A-8** `list_size` and `remove_from_list` are always written.
 - **A-9** A command after `--` runs first, and its exit code goes into `test_command_exit_code`. Exit codes 0, 1 and 5 are what pytest gives for passed, failed and no tests; any other fails the check, code `TEST_COMMAND_ERROR`. This keeps one exit code for the check: a listed failure makes pytest exit 1 and must not turn the check red.
-- **A-10** `GATE_REQUIRE_EMPTY=1` in the environment acts as `--require-empty`. The workflow sets it from a trusted label on the final PR.
+- **A-10** `[acceptance] require_empty = true` in the file given by `--config` acts as `--require-empty`. The workflow gives the configuration from the default branch, which the executor cannot change. No label and no environment variable sets it.
+- **A-11 Each acceptance test (decision W).** With `--tests-dir DIR`, each test found under `DIR` by the parsing of R-11, not on the list and absent from the JUnit file, fails the check, code `MISSING_TEST`, and goes into `missing_tests`. IDs are as in R-11, with paths relative to the working folder.
 
 ## 5. `gate.guard`
 
-`python -P -m gate.guard --repo DIR --base SHA --head SHA --branch REF --config FILE --out FILE [--reports-dir DIR] [--pr N]`
+`python -P -m gate.guard --repo DIR --base SHA --head SHA --branch REF --author LOGIN --config FILE --out FILE [--reports-dir DIR] [--pr N]`
 
 Reads git objects only and runs no code from the repository, nor any command that the repository's git settings name (an external diff, a textconv, an fsmonitor). It compares the merge base of `--base` and `--head` with `--head`, with renames shown as a delete and an add.
 
-`--out` writes `{"kind", "head_sha", "violations": [{"rule", "path", "detail"}], "needs_code_owner": [path], "dependency_changes": [{"name", "old", "new", "changelog"}], "fingerprint": {"round", "cumulative"}, "repeated_fix"}`.
+`--out` writes `{"kind", "head_sha", "violations": [{"rule", "path", "detail"}], "needs_code_owner": [path], "marked_tests": [{"path", "name"}], "dependency_changes": [{"name", "old", "new", "changelog"}], "fingerprint": {"round", "cumulative"}, "repeated_fix"}`.
 
-Exit 1 when `violations` is non-empty, otherwise 0. `kind` is `ai` for a branch starting `ai/`, `spec` for `spec/`, and `other` for anything else.
+Exit 1 when `violations` is non-empty, otherwise 0.
+
+**The kind of a PR (decision V).** A branch name can only make the rules stricter, never looser.
+
+- A PR is **strict** when any of these holds: `--author` is `<feedback.executor_app>[bot]`, or any login ending in `[bot]`; a commit between the merge base and the head has an author name or a committer name equal to `<feedback.executor_app>[bot]` or `claude[bot]`; the branch starts with `ai/` or `spec/`, in any letter case.
+- A strict PR is `spec` when `--author` is `<feedback.executor_app>[bot]` and the branch starts with exactly `spec/`. Every other strict PR is `ai`.
+- Anything else is `other`, which is for people only.
 
 **Rules for `ai` PRs:**
 
-- **G-1 `PROTECTED_PATH`.** Touching any of these, added, changed or deleted, in any letter case: `.github/`, `acceptance/`, `quality.toml`, `CODEOWNERS`, `SPEC.md`, `TASK.md`, `BASELINE.md`, `OPEN-ISSUES.md`, `SOURCE-MANIFEST.json`, `evidence/`, and everything in `guard.extra_protected`. A renamed file is checked under both names.
-- **G-2 `TEST_DELETED`.** A test file (`test_*.py`, `*_test.py`, or any `.py` under a `tests/` folder) deleted, or a `test_*` function present in the base and absent in the head.
+- **G-1 `PROTECTED_PATH`.** Touching any of these, added, changed or deleted, in any letter case: `.github/`, `acceptance/`, `quality.toml`, `CODEOWNERS`, `SPEC.md`, `TASK.md`, `BASELINE.md`, `OPEN-ISSUES.md`, `SOURCE-MANIFEST.json`, `evidence/`, `security-review.md`, and everything in `guard.extra_protected`. A renamed file is checked under both names.
+- **G-1a What controls the tests and the security tools (decision W), also `PROTECTED_PATH`.** In any folder: `pytest.ini`, `.pytest.ini`, `.bandit`, `bandit.yaml`, `bandit.yml`, `.gitleaks.toml`, `.gitleaksignore`. In the root only: `conftest.py`.
+- **G-1b Sections, also `PROTECTED_PATH`.** A changed section, added, changed or removed, in the root's `pyproject.toml` (`[tool.*]`), `setup.cfg` (`[tool:*]`, `[coverage:*]`, `[bandit]`, `[flake8]`, `[mypy*]`) or `tox.ini` (`[pytest]`, `[tox*]`, `[testenv*]`, `[coverage:*]`, `[bandit]`, `[flake8]`, `[mypy*]`). A change to any other section of those files is allowed. A file that cannot be parsed counts as changed.
+- **G-1c** A change to any other `conftest.py` is no violation. Its path goes into `needs_code_owner`.
+- **G-2 `TEST_DELETED`.** A test file (`test_*.py`, `*_test.py`, or any `.py` under a `tests/` folder) deleted, or a test present in the base and absent in the head. A test is a function whose name starts with `test_`, or a method whose name starts with `test`.
 - **G-3 `TEST_SKIPPED`.** A `test_*` function present in the base that gains `pytest.mark.skip`, `pytest.mark.skipif`, `pytest.mark.xfail`, `unittest.skip`, a `pytest.skip(` call or a `pytest.xfail(` call. A reason line does not excuse this.
-- **G-4 `TEST_WEAKENED`.** A `test_*` function present in the base whose count of checks drops, or that gains an always-true assert (`assert True`, `assert 1`) or a `pytest.raises(Exception)`. A check is an `assert` statement, a `pytest.raises` call or a `self.assert*` call. Adding checks is allowed.
-- **G-5 `SUPPRESSION_NO_REASON`.** An added line holding `# noqa`, `type: ignore` or `pytest.skip(`, in code that G-3 does not cover, without `# reason: <text>` on the same line or the line above.
-- **G-6 `THRESHOLD_LOWERED`.** In a changed file, a numeric value lowered or removed for `fail_under`, `fail-under`, `cov-fail-under`, or a `guard.threshold_keys` entry, written as `key = value` or `key=value`.
+- **G-4 `TEST_WEAKENED`.** A test present in the base whose count of checks drops, or that gains any of these: an always-true assert (`assert True`, `assert 1`, `assert x == x` with both sides the same, `assert a or True`); a `pytest.raises(Exception)`; a `return` as a direct statement of its body ahead of a later check; fewer cases in a `pytest.mark.parametrize`. A check is an `assert` statement, a `pytest.raises` call, a `self.assert*` call or a call to a function whose name starts with `assert_`. Adding checks is allowed.
+- **G-4a Marked, not refused (decision U).** A test present in the base whose code changed in any other way, or any other changed function in a test file, is no violation. It goes into `marked_tests`, and its path into `needs_code_owner`. A changed expected value is a correction or a weakening that only a person can tell apart.
+- **G-5 `SUPPRESSION_NO_REASON`.** An added line in a `.py` or `.pyi` file holding any of these, in code that G-3 does not cover, without `# reason: <text>` on the same line or the line above. In any letter case, with any spacing: `# noqa`, `# type: ignore`, `# ruff: noqa`, `# flake8: noqa`, `# mypy: ignore-errors`, `# pylint: disable`, `# pragma: no cover`, `pytest.skip(`.
+- **G-6 `THRESHOLD_LOWERED`.** In a changed file, a numeric value lowered or removed for `fail_under`, `fail-under`, `cov-fail-under`, or a `guard.threshold_keys` entry. Letter case and `-` or `_` do not matter. The forms are `key = value`, `key=value`, `key: value`, `key value`, and a list form such as `"--key", "10"`. A key in a comment does not count, so commenting a threshold out removes it. With several values of one key, the lowest is compared. An added `--no-cov` also counts.
 - **G-7 `DEPENDENCY_NO_HASH`.** A changed `guard.dependency_files` file with a requirement line lacking `--hash=sha256:`, including across `\` line continuations. Also a changed `guard.dependency_sources` file with no change to a dependency file.
 - **G-8 Dependency approval.** A changed dependency file whose requirement lines all have hashes is no violation. Its path goes into `needs_code_owner`, and each changed package goes into `dependency_changes` with old and new versions (`null` when absent) and `changelog` as `https://pypi.org/project/<name>/<new or old version>/`.
 - **G-9 `REPEATED_FIX`.** See below. Also sets `repeated_fix` to true.
@@ -152,12 +173,15 @@ Exit 1 when `violations` is non-empty, otherwise 0. `kind` is `ai` for a branch 
 - The normalized diff drops `index` lines, reduces hunk headers to `@@`, strips trailing whitespace and carriage returns, and orders files by path. The fingerprint is its SHA-256.
 - `cumulative` covers the merge base to the head. `round` covers the previous stored head to the head, or the merge base when no earlier run is stored.
 - Earlier values come from `<reports-dir>/<pr>/*/guard.json`, using `head_sha` and `fingerprint`. Files with the same `head_sha` as this run are ignored, so a rerun of one commit is not a repeat.
-- A fix is repeated when `round` equals any earlier `round`, or `cumulative` equals any earlier `cumulative`.
+- A fix is repeated when `round` equals any earlier `round`, or `cumulative` equals any earlier `cumulative`. A round whose new commits are only merge commits, a merge from the base, is not a repeat.
+- A `.gitattributes` in the repository changes neither a fingerprint nor what G-5 sees.
 - Without `--reports-dir` or `--pr` nothing is repeated.
 
 **Rules for `spec` PRs:**
 
 - **G-11 `SPEC_OUTSIDE_ACCEPTANCE`.** Touching anything outside `acceptance/`.
+
+**Rules for `other` PRs:** only G-12 to G-14 apply.
 
 **The known-failing list, for every kind of PR (decision O).** Stored passes are the `passed` lists in `<reports-dir>/*/*/acceptance.json`.
 
@@ -165,7 +189,7 @@ Exit 1 when `violations` is non-empty, otherwise 0. `kind` is `ai` for a branch 
 - **G-13 `KNOWN_FAILING_ADD_NOT_ALLOWED`.** An entry added on a PR that is not `spec`. When the base already has a list, also: an added entry whose map ID is not `DEF-*`, or whose test function already exists in the base. A `spec` PR that introduces the first list may map entries to any valid ID.
 - **G-14 `KNOWN_FAILING_REMOVED_NOT_PASSED`.** An entry removed without a stored pass.
 
-The rules G-1 to G-11 do not apply to `other` PRs, and G-1 to G-10 do not apply to `spec` PRs, except G-10.
+G-1 to G-9 do not apply to `spec` PRs; G-10 does.
 
 ## 6. `gate.security_check`
 
@@ -177,8 +201,8 @@ The rules G-1 to G-11 do not apply to `other` PRs, and G-1 to G-10 do not apply 
 - **S-2** The review file holds a Markdown table with the columns `tool`, `rule`, `path`, `reason`. A finding is reviewed when a row matches its tool, rule and path and the reason is not blank.
 - **S-3** Any unreviewed finding exits 1, code `UNREVIEWED_FINDING`.
 - **S-4** A missing or unparsable tool output exits 1, code `MISSING_TOOL_OUTPUT`: absence is never a pass.
-- **S-5** An added line holding `# nosec` or `gitleaks:allow` with no row for that tool and path exits 1, code `SUPPRESSION_WITHOUT_ENTRY`.
-- **S-6** A missing review file means no reviewed findings.
+- **S-5** An added line holding `# nosec` or `gitleaks:allow`, in any letter case and with any spacing, with no row for that tool and path exits 1, code `SUPPRESSION_WITHOUT_ENTRY`.
+- **S-6** A missing review file means no reviewed findings. On GitHub the file is always the default branch's (Y-16, decision W). Only the CEO adds a row, through a maintenance PR; the executor may propose one as text in its PR comment.
 - **S-7** `--tool-command '<JSON list>'`, repeatable, runs a tool first and records its exit code in `tool_exit_codes`, a list of integers in the order given. A tool that finds something exits non-zero, so only its output decides.
 
 ## 7. `gate.concurrency_harness`
@@ -233,14 +257,19 @@ Exit 0 when the files were written, whatever the verdict. Exit 2 on a usage erro
 - **V-7** `gate/report` in `checks` is `success` only when no `MISSING_OUTPUT`, `NO_ARTIFACT` or `UNFINISHED_STAGE` reason exists.
 - **V-8** A diagnostic check that failed changes no verdict and is listed in the report with its numeric exit code.
 - **V-9** `extras.env_failures`, a list of job names whose own `env_check` failed, adds `FAILED_CHECK` and makes `gate/env` a failure.
+- **V-10 A failed setup (decision U).** A step named `setup` in the `run` job with a conclusion of `failure` adds `FAILED_CHECK`, and a verdict that would be ready is `blocked`.
 
 **`report.json`** validates against `gate/schema/report.schema.json` and holds:
 
-- `verification`: every field of the context;
+- `verification`: every field of the context, with `trusted_sha` and `execution_environment` when the context gives them, otherwise `"unknown"`;
+- `setup`: `{"conclusion", "exit_codes"}`, or `"not-configured"`;
+- `needs_code_owner`, `marked_tests`: from `guard.json`, or empty lists;
+- `accepted_foreign_commits`: the list in the configuration (W-14), shown on every report;
+- `independent_review`: from `extras`, or `"unknown"`;
 - `environment`: from `environment.json` in the artifact, or `"unknown"`;
 - `checks`: `[{"id", "class", "conclusion", "commands": [{"argv", "exit_code", "duration_seconds", "raw_path", "raw_sha256"}], "counts"}]`;
 - `coverage`, `mutation`: from `raw/diag-coverage/summary.json` and `raw/diag-mutation/summary.json`, or `"unknown"`;
-- `dependency_changes`, `findings`, `rounds`;
+- `dependency_changes`, `findings`, `rounds`. `rounds` holds this run's own fingerprint from `guard.json`, when `extras.rounds` lacks its head;
 - `resources`: every named cost, with `"unknown"` for one not given, never 0;
 - `human`: `{"interventions", "minutes"}`;
 - `bypass_merges`;
@@ -298,7 +327,7 @@ The GitHub side of the judge: `context`, `jobs`, `extras`, `post-checks`, `post-
 
 ## 9. `gate.archive`
 
-`python -P -m gate.archive store (--remote URL | --api-repo OWNER/NAME) --branch reports --pr N --run-id R --attempt A --artifact DIR --publish DIR --context FILE --out FILE [--max-bytes N]`
+`python -P -m gate.archive store (--remote URL | --api-repo OWNER/NAME) --branch reports --pr N --run-id R --attempt A --artifact DIR --publish DIR --context FILE --out FILE [--max-bytes N] [--config FILE]`
 
 Stores `reports/<pr>/<run_id>-<attempt>/` on the branch: `context.json`, the files of `--publish`, the artifact under `artifact/`, and `SHA256SUMS` over all of them as `<sha256>  <relative path>`, readable by `sha256sum -c`. For later runs `guard.json` and `acceptance.json` are also stored at the top of the attempt's folder, from the artifact, when present.
 
@@ -316,6 +345,7 @@ Stores `reports/<pr>/<run_id>-<attempt>/` on the branch: `context.json`, the fil
 | Move the branch | `PATCH /repos/{repo}/git/refs/heads/{branch}`: `sha`, `force` false. For a new branch, `POST /repos/{repo}/git/refs`: `ref`, `sha`. A 409 or 422 means it moved |
 | Read a file | `GET /repos/{repo}/git/blobs/{sha}`: `content` in base64 |
 | The commits | `GET /repos/{repo}/commits?sha={branch}&per_page=100&page={n}`: `sha`, `author.login`, `commit.verification.verified` |
+| One commit | `GET /repos/{repo}/commits/{sha}?per_page=100&page={n}`: `parents`, `files[].filename`, `files[].status` |
 
 - **W-1** The branch is created, with no parent, when missing.
 - **W-2** A missing artifact folder still stores the rest, with `artifact_present` false. This is the cancelled run.
@@ -328,34 +358,46 @@ Stores `reports/<pr>/<run_id>-<attempt>/` on the branch: `context.json`, the fil
 - **W-11** A `--remote` on `github.com` exits 2. A `git push` would leave the commits unsigned, so GitHub is written only with `--api-repo`.
 - **W-12 Another actor (HQ's addition to decision R).** The executor's app has Contents write, and the ruleset blocks only force pushes and deletion. With `--api-repo`, after each write every commit on the branch must have `author.login` `github-actions[bot]` and `commit.verification.verified` true. Otherwise `actors_ok` is false, `reason` is `reports written by another actor`, `foreign_commits` lists them, and the exit code is 1. The evidence stays stored. When the commits cannot be read, `actors_ok` is also false.
 - **W-13** A commit body holds no author, committer or signature: GitHub signs a commit only without them.
+- **W-14 Recovery (decision V).** A foreign commit whose full SHA is in `[[archive.accepted_foreign_commits]]` of the file given by `--config` is accepted only when it has one parent and every file in it has status `added` and a name under `reports/`. A commit that changes or deletes a record stays foreign even when listed. An entry without a full SHA, a reason and a date is ignored. No history is rewritten. Accepted commits go into `accepted_commits` in the result. The workflow gives the configuration from the default branch, and the list changes only through the CEO's maintenance PR.
+- **W-15** `python -P -m gate.archive check-actors --api-repo OWNER/NAME --branch reports [--config FILE] --out FILE` makes only the check of W-12 and W-14, and writes `{"actors_ok", "foreign_commits", "accepted_commits", "reason"}`. Exit 0 when `actors_ok`, otherwise 1. A branch that does not exist yet is `actors_ok` true.
 
 `python -P -m gate.archive append (--remote URL | --api-repo OWNER/NAME) --branch reports --path RELPATH --file FILE --out FILE` adds one file that does not yet exist to a stored folder, with a read-back, and writes the same result. `RELPATH` is the new file's own path from the branch's root, for example `reports/7/1001-1/final.json`. An existing file gives `stored` false, reason `ALREADY_EXISTS`.
 
 ## 10. `gate.feedback` (decisions N and R)
 
-`python -P -m gate.feedback decide --event-name NAME --event FILE --pulls FILE --reports-dir DIR --config FILE --out FILE [--statuses FILE] [--integration-branch candidate/a]`
+`python -P -m gate.feedback decide --event-name NAME --event FILE --pulls FILE --reports-dir DIR --actors FILE --config FILE --out FILE [--statuses FILE] [--integration-branch candidate/a]`
 
 The events are `workflow_run` and `issue_comment`. Any other event exits 2, `status` included. A missing `--reports-dir` folder exits 2: a lost read must never look like "no earlier rounds".
 
-`--pulls`, trusted, lists open PRs: `[{"number", "head_sha", "base_ref", "head_ref"}]`. `--statuses`, trusted, is the API's list of the commit's statuses, newest first: `[{"context", "state", "creator": {"login"}}]`.
+`--pulls`, trusted, lists open PRs: `[{"number", "head_sha", "base_ref", "head_ref", "head_repository", "repository"}]`. `--actors`, trusted, is the result of `gate.archive check-actors`. `--statuses`, trusted, is the API's list of the commit's statuses, newest first: `[{"context", "state", "creator": {"login"}}]`.
 
 Writes `{"act", "post", "pr", "head_sha", "round", "reason_code", "comment"}`. Exit 0 whether it acts or not. `act` is true only with `reason_code` null. `post` says whether the comment goes on the PR.
 
-**`workflow_run` events.** `workflow_run.path` must equal `feedback.judge_workflow_path` and `workflow_run.event` must be `pull_request_target`, otherwise `UNEXPECTED_SENDER`. The record is found at `<reports-dir>/*/<workflow_run.id>-<workflow_run.run_attempt>/`: `context.json` gives `pr` and `head_sha`, `final.json` gives the verdict. No record gives `NO_RECORD`. A verdict of `ready-for-human` gives `NOT_A_FAILURE`, and `needs-human` gives `NEEDS_HUMAN`.
+**`workflow_run` events.** In this order:
+
+- `workflow_run.path` must equal `feedback.judge_workflow_path` and `workflow_run.event` must be `pull_request_target`, otherwise `UNEXPECTED_SENDER`.
+- D-0 holds.
+- `workflow_run.conclusion` of `cancelled` gives `NOT_ACTIONABLE`.
+- The record is the one folder at `<reports-dir>/*/<workflow_run.id>-<workflow_run.run_attempt>/`: `context.json` gives `pr` and `head_sha`, `final.json` gives the verdict. No such folder, more than one, a `pr` that is not its folder's name, or a missing file gives `NO_RECORD`.
+- `blocked` goes on. `ready-for-human` gives `NOT_A_FAILURE`, `needs-human` gives `NEEDS_HUMAN`, and any other verdict gives `NOT_ACTIONABLE`: a cancelled or lost run starts no model.
 
 **`issue_comment` events (decision R).** In this order:
 
 - `action` must be `created` and `issue.pull_request` must be present, otherwise `NOT_A_REVIEW`.
 - `sender.login` must be `<feedback.reviewer_app>[bot]`, otherwise `UNEXPECTED_SENDER`. The sender decides, never the comment's text.
+- D-0 holds.
 - The comment's body must hold the marker `<!-- gate-review sha=<40 hex> verdict=<pass|changes_requested> -->`, otherwise `NO_MARKER`. Its SHA is the head. A verdict of `pass` gives `NOT_A_FAILURE`.
 - In `--statuses`, the newest status with `context` `independent-review` must have `state` `failure`, otherwise `STATUS_NOT_FAILURE`, and `creator.login` `<feedback.reviewer_app>[bot]`, otherwise `STATUS_WRONG_CREATOR`. A verdict in the comment alone starts nothing.
 - For a comment event, D-1 also requires that the listed PR with this head is `issue.number`.
+
+**D-0 (decision V).** `--actors` must say `actors_ok` true. Otherwise, or when it is missing or unreadable, the reason is `REPORTS_UNTRUSTED`: stored evidence is not read.
 
 **Both events, in this order:**
 
 - **D-1** `head_sha` must be the head of a listed PR, otherwise `SHA_NOT_CURRENT_HEAD`.
 - **D-2** That PR's `base_ref` must be the integration branch, otherwise `PR_NOT_INTO_INTEGRATION`.
-- **D-3** Done fix rounds are the distinct `head_sha` values in `<reports-dir>/<pr>/*/guard.json`, minus one. At or past `limits.max_fix_rounds` gives `ROUND_CAP`.
+- **D-2a** Its `head_repository` must equal its `repository`, otherwise `FORK_PR`. Its `head_ref` must start with `ai/`, otherwise `NOT_AN_EXECUTOR_PR`: a fix round never touches a spec or a maintenance PR.
+- **D-3** Done fix rounds are the distinct `head_sha` values in `<reports-dir>/<pr>/*/context.json`, minus one. At or past `limits.max_fix_rounds` gives `ROUND_CAP`.
 - **D-4** A stored `guard.json` for this head with `repeated_fix` true gives `REPEATED_FIX`.
 - **D-5** Otherwise `act` is true and `round` is the done rounds plus one.
 - **D-6** `comment` always says what happened and why, in plain text, obeys C-4 and C-5, and writes the mention as `` `@claude` ``.
@@ -384,8 +426,9 @@ Routes it uses:
 | Status | `POST /repos/{repo}/statuses/{sha}`: `state`, `context`, `description` |
 | Comment | `POST /repos/{repo}/issues/{pr}/comments`: `body` |
 
-- **L-1** The model gets only `SPEC.md`, the issue, the diff and the judge's report, on stdin, in an empty temporary folder. Its environment holds none of the `REVIEWER_*` variables.
-- **L-2** The default command is `codex exec --sandbox read-only --skip-git-repo-check --ephemeral --output-schema <file> -o <file> -`. `--codex "COMMAND"` replaces the program. The arguments `--output-schema <file>` and `-o <file>` are always passed. The result is the JSON written to the `-o` file: `{"verdict": "pass"|"changes_requested", "findings": [{"severity", "where", "what"}]}`.
+- **L-1** The model gets only `SPEC.md`, the issue, the diff and the judge's report, on stdin, in an empty temporary folder. Its environment holds only these variables, when set: `PATH`, `PATHEXT`, `SYSTEMROOT`, `SYSTEMDRIVE`, `WINDIR`, `COMSPEC`, `TEMP`, `TMP`, `TMPDIR`, `HOME`, `USERPROFILE`, `APPDATA`, `LOCALAPPDATA`, `CODEX_HOME`, `LANG`, `LC_ALL`.
+- **L-1a (decision V)** Before it reads the judge's report, it makes the check of W-12 and W-14 on the `reports` branch, with the list from `GET /repos/{repo}/contents/quality.toml` with the raw `Accept` on the default branch (a 404 means no list). Any foreign commit, or a failed read, runs no model, posts nothing and exits 1, code `REPORTS_UNTRUSTED`.
+- **L-2** The default command is `codex exec --sandbox read-only --skip-git-repo-check --ephemeral --ignore-user-config --ignore-rules --output-schema <file> -o <file> -`. `--codex "COMMAND"` replaces the program. The arguments `--output-schema <file>` and `-o <file>` are always passed. The result is the JSON written to the `-o` file: `{"verdict": "pass"|"changes_requested", "findings": [{"severity", "where", "what"}]}`.
 - **L-3** `pass` posts `success`, and `changes_requested` posts `failure`, with `context` `independent-review` on exactly `--sha`. **The status is posted first, then the comment (decision R)**: the comment can start a fix round, which checks the status. The comment carries the findings, obeys C-4 and C-5, and holds the marker `<!-- gate-review sha=<the SHA> verdict=<the verdict> -->`.
 - **L-4** When `--sha` is not the PR's head, before the model or again just before posting, nothing is posted and the exit code is 1, code `HEAD_MOVED`.
 - **L-5** A model result that is missing, is not valid JSON, or has another verdict posts nothing and exits 1, code `MODEL_OUTPUT_INVALID`. The gate then stays blocked: it fails closed.
@@ -409,4 +452,10 @@ Routes it uses:
 - **Y-12** In `feedback.yml` secrets are referenced only in the job that runs the executor. The decision job comes first and the executor job runs only when it says `act`. Its permissions are `contents: read` and `pull-requests: write`, and nothing more.
 - **Y-13 Self-test (decision T).** `self-test.yml` runs on `push` and `pull_request`, has `contents: read` and no secrets, and runs `make check` and actionlint, on Python given as an exact version, through `actions/setup-python` at a full SHA.
 - **Y-14** In `judge.yml`, `gate.archive` is called with `--api-repo`, never `--remote`.
+- **Y-16 (decision W)** In `judge.yml`'s `run` job, before any step that runs PR code and after `gate/guard`, the PR's `security-review.md` is replaced by the default branch's, or removed when that has none.
+- **Y-17** In `executor.yml` and `spec-tests.yml`, the step that runs the action has `CLAUDE_CODE_SUBPROCESS_ENV_SCRUB: "1"` in its `env`, and its allowed tools hold no `gh`. A later step, with the app's token, opens the PR: the model only pushes its branch.
+- **Y-18** In `executor.yml` and `spec-tests.yml`, the prompt file comes from the default branch's copy, never from the PR's branch, and the gate's note and the issue's text are kept outside the working folder.
+- **Y-19** In `judge.yml`, the guard gets the PR's author from the trusted context, and no label sets a requirement. As with every check, the `gate/guard` step runs `gate.run_checks`, so that its exit code is recorded, here with the gate's own `gate/builtin_checks.toml`. That file's guard command passes `--author {env:GATE_PR_AUTHOR}`, and the workflow's `env` sets `GATE_PR_AUTHOR` from `github.event.pull_request.user.login`.
+- **Y-20** In `judge.yml`, the `archive` job installs nothing: it runs on the standard library alone.
+- **Y-21** `feedback.yml`'s `fix` job has a `concurrency` group per PR, and `executor.yml` refuses to start the model when `expected-head` is given and the PR's head has moved.
 - **Y-15** `executor.yml` passes its `allowed-bots` input to the action's `allowed_bots`. At this action's pin, a bot's event is refused without it. It holds named apps, never `*`.

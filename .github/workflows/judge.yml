@@ -10,10 +10,6 @@ on:
         description: Path of the configuration on the default branch.
         type: string
         default: quality.toml
-      final-label:
-        description: The label that marks the final PR before delivery, when the known-failing list must be empty.
-        type: string
-        default: final-pr
 
 permissions: {}
 
@@ -31,6 +27,7 @@ env:
   GATE_BASE_SHA: ${{ github.event.pull_request.base.sha }}
   GATE_HEAD_SHA: ${{ github.event.pull_request.head.sha }}
   GATE_HEAD_REF: ${{ github.event.pull_request.head.ref }}
+  GATE_PR_AUTHOR: ${{ github.event.pull_request.user.login }}
   GATE_INTEGRATION_BRANCH: ${{ github.event.pull_request.base.ref }}
   # The default branch's commit at this run: the source of the configuration and the acceptance tests.
   GATE_TRUSTED_SHA: ${{ github.sha }}
@@ -48,7 +45,6 @@ jobs:
     env:
       GATE_PR_DIR: ${{ github.workspace }}/pr
       GATE_OUT: ${{ github.workspace }}/out
-      GATE_REQUIRE_EMPTY: ${{ contains(github.event.pull_request.labels.*.name, inputs.final-label) && '1' || '' }}
     steps:
       - name: Get the gate at its pinned commit
         uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
@@ -109,9 +105,11 @@ jobs:
         if: ${{ !cancelled() }}
         run: '"$GATE_PY" -P -m gate.run_checks --config "$GATE_HOME/gate/builtin_checks.toml" --check gate/guard --out "$GATE_OUT"'
 
-      - name: Take the acceptance tests from the default branch
+      - name: Take the acceptance tests and the security review from the default branch
         if: ${{ !cancelled() }}
         run: |
+          rm -f "$GATE_PR_DIR/security-review.md"
+          if [ -f .trusted/security-review.md ]; then cp .trusted/security-review.md "$GATE_PR_DIR/security-review.md"; fi
           case "$GATE_HEAD_REF" in
             spec/*)
               echo "GATE_ACCEPTANCE_MODE=exact" >> "$GITHUB_ENV"
@@ -253,7 +251,7 @@ jobs:
         run: |
           "$GATE_PY" -P -m gate.publish context --config "$GATE_CONFIG" --hash-root .trusted --hash quality.toml --hash CODEOWNERS --hash .github/workflows/judge.yml --hash .github/workflows/executor.yml --hash .github/workflows/spec-tests.yml --hash .github/workflows/feedback.yml --hash prompts/executor.md --hash prompts/spec-tests.md --hash security-review.md --out context.json
           "$GATE_PY" -P -m gate.publish jobs --run-id "$GATE_RUN_ID" --attempt "$GATE_RUN_ATTEMPT" --out jobs.json
-          "$GATE_PY" -P -m gate.publish extras --reports-dir "$GATE_REPORTS_DIR" --pr "$GATE_PR" --integration "$GATE_INTEGRATION_BRANCH" --env-result publish-env.json --out extras.json
+          "$GATE_PY" -P -m gate.publish extras --reports-dir "$GATE_REPORTS_DIR" --pr "$GATE_PR" --integration "$GATE_INTEGRATION_BRANCH" --env-result publish-env.json --context context.json --jobs jobs.json --config "$GATE_CONFIG" --out extras.json
           "$GATE_PY" -P -m gate.report generate --context context.json --jobs jobs.json --artifact evidence --config "$GATE_CONFIG" --extras extras.json --out publish-out
           cp extras.json publish-out/extras.json
           echo "verdict-sha256=$(sha256sum publish-out/verdict.json | cut -d' ' -f1)" >> "$GITHUB_OUTPUT"
@@ -308,12 +306,9 @@ jobs:
         with:
           python-version: "3.13.15"
 
-      - name: Install the gate, with hashes
+      - name: Find Python
         if: ${{ always() }}
-        run: |
-          python -m venv "$RUNNER_TEMP/gate-venv"
-          "$RUNNER_TEMP/gate-venv/bin/pip" install --quiet --require-hashes -r "$GATE_HOME/locks/gate.lock"
-          echo "GATE_PY=$RUNNER_TEMP/gate-venv/bin/python" >> "$GITHUB_ENV"
+        run: echo "GATE_PY=$(command -v python || command -v python3)" >> "$GITHUB_ENV"
 
       - name: Check this job's environment
         if: ${{ always() }}
@@ -344,10 +339,10 @@ jobs:
         run: |
           folder="reports/$GATE_PR/$GATE_RUN_ID-$GATE_RUN_ATTEMPT"
           "$GATE_PY" -P -m gate.publish context --config "$GATE_CONFIG" --hash-root .trusted --hash quality.toml --hash CODEOWNERS --hash .github/workflows/judge.yml --hash .github/workflows/executor.yml --hash .github/workflows/spec-tests.yml --hash .github/workflows/feedback.yml --hash prompts/executor.md --hash prompts/spec-tests.md --hash security-review.md --out context.json
-          "$GATE_PY" -P -m gate.archive store --api-repo "$GATE_REPOSITORY" --branch reports --pr "$GATE_PR" --run-id "$GATE_RUN_ID" --attempt "$GATE_RUN_ATTEMPT" --artifact evidence --publish publish-out --context context.json --out archive-result.json || true
+          "$GATE_PY" -P -m gate.archive store --api-repo "$GATE_REPOSITORY" --branch reports --pr "$GATE_PR" --run-id "$GATE_RUN_ID" --attempt "$GATE_RUN_ATTEMPT" --artifact evidence --publish publish-out --context context.json --config "$GATE_CONFIG" --out archive-result.json || true
           mkdir -p final
           "$GATE_PY" -P -m gate.report final --verdict publish-out/verdict.json --expect-verdict-sha256 "$GATE_EXPECT_VERDICT" --archive archive-result.json --env-result archive-env.json --out final/final.json
-          if ! "$GATE_PY" -P -m gate.archive append --api-repo "$GATE_REPOSITORY" --branch reports --path "$folder/final.json" --file final/final.json --out append-result.json; then
+          if ! "$GATE_PY" -P -m gate.archive append --api-repo "$GATE_REPOSITORY" --branch reports --path "$folder/final.json" --file final/final.json --config "$GATE_CONFIG" --out append-result.json; then
             # The final verdict could not be stored, so the evidence is not complete.
             "$GATE_PY" -P -m gate.report final --verdict publish-out/verdict.json --expect-verdict-sha256 "$GATE_EXPECT_VERDICT" --archive append-result.json --env-result archive-env.json --out final/final.json
           fi

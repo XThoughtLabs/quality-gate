@@ -25,6 +25,10 @@ judge_workflow_path = ".github/workflows/judge.yml"
 reviewer_app = "example-reviewer"
 executor_app = "example-executor"
 
+[acceptance]
+# The CEO sets this true, through a maintenance PR, before the final PR.
+require_empty = false
+
 [spec_tests]
 deny_read = ["src/**", "tests/**"]
 
@@ -37,6 +41,7 @@ class = "mandatory"
 commands = [["python", "-m", "pytest", "-q", "-p", "no:cacheprovider", "--ignore=acceptance", "--junitxml={raw}/junit.xml"]]
 junit = "junit.xml"
 forbid_skips = true
+expected_tests_from_base = true
 required_outputs = ["junit.xml"]
 
 [checks."gate/acceptance"]
@@ -46,6 +51,8 @@ commands = [[
   "--junit", "{raw}/junit.xml",
   "--known-failing", "{env:GATE_KNOWN_FAILING}",
   "--mode", "{env:GATE_ACCEPTANCE_MODE}",
+  "--config", "{env:GATE_CONFIG}",
+  "--tests-dir", "acceptance",
   "--out", "{raw}/acceptance.json",
   "--",
   "python", "-m", "pytest", "acceptance", "-q", "-p", "no:cacheprovider", "--junitxml={raw}/junit.xml",

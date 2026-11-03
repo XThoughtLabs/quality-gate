@@ -5,6 +5,11 @@
   "additionalProperties": false,
   "required": [
     "verification",
+    "setup",
+    "needs_code_owner",
+    "marked_tests",
+    "accepted_foreign_commits",
+    "independent_review",
     "environment",
     "checks",
     "coverage",
@@ -67,6 +72,16 @@
         }
       }
     },
+    "setup": {
+      "oneOf": [
+        { "type": "object", "required": ["conclusion", "exit_codes"] },
+        { "const": "not-configured" }
+      ]
+    },
+    "needs_code_owner": { "type": "array" },
+    "marked_tests": { "type": "array" },
+    "accepted_foreign_commits": { "type": "array" },
+    "independent_review": { "$ref": "#/$defs/unknownOrObject" },
     "environment": { "$ref": "#/$defs/unknownOrObject" },
     "checks": {
       "type": "array",

@@ -18,6 +18,7 @@ pytestmark = pytest.mark.req("V-1", "V-2", "V-4", "V-5", "X-2")
 
 HEAD_RUN = "1001"
 RUN_STEPS = ("gate/env", "gate/guard", "gate/tests", "gate/acceptance", "gate/security")
+DIAGNOSTIC_STEPS = ("diag/coverage", "diag/mypy", "diag/ruff", "diag/semgrep", "diag/schemathesis", "diag/mutation", "diag/benchmark")
 PASSING_TEST = "def test_ok():\n    assert 1 + 1 == 2\n"
 FAILING_TEST = "def test_ok():\n    assert 1 + 1 == 2\n\n\ndef test_new():\n    assert 1 + 1 == 3\n"
 
@@ -124,6 +125,7 @@ class World:
             GATE_BASE_SHA=self.base,
             GATE_HEAD_SHA=self.head,
             GATE_HEAD_REF="ai/1-change",
+            GATE_PR_AUTHOR="example-executor[bot]",
             GATE_PR="7",
             GATE_REPORTS_DIR=str(self.tmp / "no-reports"),
             GATE_KNOWN_FAILING=str(self.repo / "acceptance" / "known-failing.txt"),
@@ -148,6 +150,11 @@ class World:
             steps.append({"name": check, "status": "completed", "conclusion": "success" if process.returncode == 0 else "failure", "number": number})
             if check == stop_after:
                 finished = False
+        if not stop_after:
+            # As the judge does: every diagnostic step runs, configured or not.
+            for check in DIAGNOSTIC_STEPS:
+                process = self.gate.run("run_checks", "--config", self.config, "--check", check, "--if-configured", "--out", self.out, "--workdir", self.repo, env=self.env())
+                steps.append({"name": check, "status": "completed", "conclusion": "success" if process.returncode == 0 else "failure", "number": len(steps) + 1})
         conclusion = "cancelled" if stop_after else ("success" if all(s["conclusion"] == "success" for s in steps) else "failure")
         return {"jobs": [{"name": "judge / run", "status": "completed", "conclusion": conclusion, "steps": steps}]}
 
@@ -181,6 +188,7 @@ class World:
             "head_sha": self.head,
             "gate_sha": "1" * 40,
             "head_ref": "ai/1-change",
+            "author": "example-executor[bot]",
             "config_hashes": {"quality.toml": "2" * 64},
         }
         context_path = self.tmp / "context.json"

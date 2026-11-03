@@ -25,7 +25,7 @@ Add to the application's repository, on its default branch:
 - a `quality.toml`; see `docs/quality.example.toml` and section 1 of `docs/CONTRACTS.md`;
 - `CODEOWNERS`, the prompt files and the issue template.
 
-`pull_request_target`, `workflow_run` and `status` all run workflows from the default branch, so these files must be there.
+`pull_request_target`, `workflow_run` and `issue_comment` all run workflows from the default branch, so these files must be there. The thin `feedback` workflow should also set `concurrency` for the whole workflow, so that two events on one PR are decided in turn.
 
 ## 3. Commands
 
@@ -38,7 +38,7 @@ Add to the application's repository, on its default branch:
 
 AI steps are reproducible as a procedure (prompts, versions, limits), not as identical output.
 
-To run an independent review of a PR, on the laptop:
+To run an independent review of a PR, on the laptop, first install its one library, with hashes: `python -m pip install --require-hashes -r locks/review.lock`. Then:
 
 ```
 export REVIEWER_APP_ID=...

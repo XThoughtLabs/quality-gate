@@ -75,6 +75,7 @@ def test_the_archive_writes_to_github_only_through_the_api():
     script = next(step["run"] for step in jobs["archive"]["steps"] if step.get("name") == "Store the evidence and post the final verdict")
     assert script.count("gate.archive") == 2
     assert script.count("--api-repo") == 2
+    assert script.count('--config "$GATE_CONFIG"') >= 2
     assert "--remote" not in script
 
 
@@ -84,6 +85,49 @@ def test_a_fix_rounds_bots_are_named_exactly():
     steps = load("executor")["jobs"]["executor"]["steps"]
     action = next(step for step in steps if str(step.get("uses", "")).startswith("anthropics/claude-code-action@"))
     assert action["with"]["allowed_bots"] == "${{ inputs.allowed-bots }}"
+
+
+def test_the_archive_job_installs_nothing():
+    """Nothing it installs can lose the evidence."""
+    for step in load("judge")["jobs"]["archive"]["steps"]:
+        assert "pip install" not in step.get("run", "")
+
+
+def test_the_prompt_never_comes_from_the_prs_branch():
+    for name, job_name in (("executor", "executor"), ("spec-tests", "author")):
+        steps = load(name)["jobs"][job_name]["steps"]
+        trusted = next(step for step in steps if step.get("with", {}).get("path") == ".trusted")
+        assert trusted["with"]["ref"] == "${{ github.event.repository.default_branch }}"
+        scripts = "\n".join(step.get("run", "") for step in load(name)["jobs"][job_name]["steps"])
+        assert '--template "$RUNNER_TEMP/trusted/$GATE_PROMPT_FILE"' in scripts
+
+
+def test_the_model_holds_no_github_cli_and_its_tools_lose_the_tokens():
+    for name, job_name in (("executor", "executor"), ("spec-tests", "author")):
+        steps = load(name)["jobs"][job_name]["steps"]
+        action = next(step for step in steps if str(step.get("uses", "")).startswith("anthropics/claude-code-action@"))
+        assert action["env"]["CLAUDE_CODE_SUBPROCESS_ENV_SCRUB"] == "1"
+        assert "GH_TOKEN" not in action["env"]
+        assert "Bash(gh" not in action["with"]["claude_args"]
+        names = [step.get("name") for step in steps]
+        assert names.index("Open the PR for what was pushed") > steps.index(action)
+
+
+def test_a_fix_is_one_at_a_time_and_stops_when_the_head_moved():
+    fix = load("feedback")["jobs"]["fix"]
+    assert fix["concurrency"]["cancel-in-progress"] is False
+    assert fix["with"]["expected-head"] == "${{ needs.decide.outputs.head-sha }}"
+    steps = load("executor")["jobs"]["executor"]["steps"]
+    names = [step.get("name") for step in steps]
+    assert names.index("Stop if the PR has moved since the decision") < names.index("Run the executor")
+
+
+def test_the_security_review_is_the_default_branchs():
+    steps = load("judge")["jobs"]["run"]["steps"]
+    names = [step.get("name") for step in steps]
+    index = names.index("Take the acceptance tests and the security review from the default branch")
+    assert names.index("gate/guard") < index < names.index("setup")
+    assert "security-review.md" in steps[index]["run"]
 
 
 def test_status_is_no_longer_how_a_fix_round_starts():

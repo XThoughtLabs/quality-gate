@@ -3,14 +3,14 @@
 from __future__ import annotations
 
 import argparse
-import os
 import re
 import subprocess
 import sys
 import xml.etree.ElementTree as ElementTree
 from pathlib import Path
 
-from gate.common import EXIT_OK, EXIT_RULE_FAILED, UsageError, fail_usage, popen_kwargs, write_json
+from gate.collected import ids_under_folder, strip_parameters
+from gate.common import EXIT_OK, EXIT_RULE_FAILED, UsageError, fail_usage, load_config, popen_kwargs, write_json
 
 MAP_ID = re.compile(r"^(PUB-\d{2}|SPEC-6\.1|SPEC-6\.2|DEF-[A-Za-z0-9-]+)$")
 TEST_COMMAND_OK = (0, 1, 5)  # pytest: all passed, some failed, none collected
@@ -54,18 +54,23 @@ def read_results(path: Path) -> tuple[set[str], set[str]]:
 
 
 def compare(
-    listed: set[str], passed: set[str], failing: set[str], mode: str, require_empty: bool
+    listed: set[str], passed: set[str], failing: set[str], mode: str, require_empty: bool, expected: set[str]
 ) -> dict:
     failing_not_listed = failing - listed
     listed_failing = failing & listed
     remove_from_list = listed & passed
     missing_listed = listed - passed - failing
+    # A test that exists and did not run is never a pass, whatever narrowed the run.
+    seen = {strip_parameters(test_id) for test_id in passed | failing | listed}
+    missing_tests = expected - seen
 
     codes: list[str] = []
     if failing_not_listed:
         codes.append("FAILING_NOT_LISTED")
     if missing_listed:
         codes.append("MISSING_LISTED")
+    if missing_tests:
+        codes.append("MISSING_TEST")
     if not passed and not failing:
         codes.append("NO_TESTS")
     if mode == "exact" and failing != listed:
@@ -81,6 +86,7 @@ def compare(
         "listed_failing": sorted(listed_failing),
         "remove_from_list": sorted(remove_from_list),
         "missing_listed": sorted(missing_listed),
+        "missing_tests": sorted(missing_tests),
         "passed": sorted(passed),
         "reason_codes": codes,
     }
@@ -98,6 +104,8 @@ def main(argv: list[str] | None = None) -> int:
     parser.add_argument("--known-failing", required=True)
     parser.add_argument("--mode", choices=("subset", "exact"), default="subset")
     parser.add_argument("--require-empty", action="store_true")
+    parser.add_argument("--config", help="the configuration from the default branch")
+    parser.add_argument("--tests-dir", help="the folder whose tests must all appear in the JUnit file")
     parser.add_argument("--out", required=True)
     args = parser.parse_args(arguments)
 
@@ -113,11 +121,19 @@ def main(argv: list[str] | None = None) -> int:
     try:
         listed = read_list(Path(args.known_failing))
         passed, failing = read_results(Path(args.junit))
+        config = load_config(args.config) if args.config else {}
+        expected: set[str] = set()
+        if args.tests_dir:
+            folder = Path(args.tests_dir).resolve()
+            root = Path.cwd().resolve()
+            if not folder.is_relative_to(root):
+                raise UsageError("--tests-dir must be under the working folder")
+            expected = ids_under_folder(folder, root)
     except UsageError as error:
         return fail_usage(str(error))
 
-    require_empty = args.require_empty or os.environ.get("GATE_REQUIRE_EMPTY") == "1"
-    result = compare(set(listed), passed, failing, args.mode, require_empty)
+    require_empty = args.require_empty or config.get("acceptance", {}).get("require_empty") is True
+    result = compare(set(listed), passed, failing, args.mode, require_empty, expected)
     if command_code is not None:
         result["test_command_exit_code"] = command_code
         if command_code not in TEST_COMMAND_OK:

@@ -19,9 +19,11 @@ reproduce:
 	  -e PYTHONPATH=/gate \
 	  -e GATE_TOOLS=/tools/bin \
 	  -e GATE_TOOLS_BIN=/tools-bin \
+	  -e GATE_SEMGREP=/semgrep/bin \
 	  "$(IMAGE)" \
 	  sh -c 'apt-get update -qq && apt-get install -y -qq git curl >/dev/null \
 	    && pip install --quiet --require-hashes -r /gate/locks/gate.lock \
 	    && python -m venv /tools && /tools/bin/pip install --quiet --require-hashes -r /gate/locks/tools.lock \
+	    && python -m venv /semgrep && /semgrep/bin/pip install --quiet --require-hashes -r /gate/locks/semgrep.lock \
 	    && bash /gate/scripts/install_gitleaks.sh /tools-bin \
 	    && python -P -m gate.reproduce --repo "$(REPO)" --sha "$(SHA)" --out /out'

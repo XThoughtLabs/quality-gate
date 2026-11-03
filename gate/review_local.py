@@ -18,6 +18,7 @@ import subprocess
 import sys
 import tempfile
 import time
+import tomllib
 import urllib.error
 import urllib.request
 from pathlib import Path
@@ -26,10 +27,30 @@ from typing import Any
 from cryptography.hazmat.primitives import hashes, serialization
 from cryptography.hazmat.primitives.asymmetric import padding
 
+from gate.archive import ApiRemote, RemoteError, actors_status, parse_accepted
 from gate.common import EXIT_OK, EXIT_RULE_FAILED, EXIT_USAGE, neutralize, write_json
 
 DEFAULT_API = "https://api.github.com"
-DEFAULT_CODEX = "codex exec --sandbox read-only --skip-git-repo-check --ephemeral"
+DEFAULT_CODEX = "codex exec --sandbox read-only --skip-git-repo-check --ephemeral --ignore-user-config --ignore-rules"
+# The model's whole environment. Everything else on this machine stays out of its reach.
+MODEL_ENVIRONMENT = (
+    "PATH",
+    "PATHEXT",
+    "SYSTEMROOT",
+    "SYSTEMDRIVE",
+    "WINDIR",
+    "COMSPEC",
+    "TEMP",
+    "TMP",
+    "TMPDIR",
+    "HOME",
+    "USERPROFILE",
+    "APPDATA",
+    "LOCALAPPDATA",
+    "CODEX_HOME",
+    "LANG",
+    "LC_ALL",
+)
 STATUS_CONTEXT = "independent-review"
 MODEL_TIMEOUT = 1800
 RAW = "application/vnd.github.raw+json"
@@ -42,7 +63,7 @@ OUTPUT_SCHEMA = {
     "additionalProperties": False,
     "required": ["verdict", "findings"],
     "properties": {
-        "verdict": {"enum": ["pass", "changes_requested"]},
+        "verdict": {"type": "string", "enum": ["pass", "changes_requested"]},
         "findings": {
             "type": "array",
             "items": {
@@ -152,7 +173,25 @@ def find_report(api: Api, repo: str, pr: int, sha: str) -> str:
     raise Stop("MISSING_INPUT")
 
 
+def check_reports(api: Api, repo: str) -> None:
+    """Stored evidence is read only when everything on its branch came from the judge."""
+    try:
+        try:
+            text = api.call("GET", f"/repos/{repo}/contents/quality.toml", accept=RAW).decode("utf-8", "replace")
+        except urllib.error.HTTPError as error:
+            if error.code != 404:
+                raise
+            text = ""
+        accepted = parse_accepted(tomllib.loads(text))
+        status = actors_status(ApiRemote(repo, "reports", base=api.base, token=api.token), accepted)
+    except (urllib.error.URLError, OSError, ValueError, tomllib.TOMLDecodeError, RemoteError):
+        raise Stop("REPORTS_UNTRUSTED") from None
+    if not status["actors_ok"]:
+        raise Stop("REPORTS_UNTRUSTED")
+
+
 def collect_inputs(api: Api, repo: str, pr: int, issue: int, sha: str) -> dict[str, str]:
+    check_reports(api, repo)
     try:
         spec = api.call("GET", f"/repos/{repo}/contents/SPEC.md?ref={sha}", accept=RAW).decode("utf-8", "replace")
         diff = api.call("GET", f"/repos/{repo}/pulls/{pr}", accept=DIFF).decode("utf-8", "replace")
@@ -167,7 +206,7 @@ def collect_inputs(api: Api, repo: str, pr: int, issue: int, sha: str) -> dict[s
 
 
 def model_environment() -> dict[str, str]:
-    return {name: value for name, value in os.environ.items() if not name.startswith("REVIEWER_")}
+    return {name: os.environ[name] for name in MODEL_ENVIRONMENT if name in os.environ}
 
 
 def run_model(command: str, inputs: dict[str, str]) -> dict:

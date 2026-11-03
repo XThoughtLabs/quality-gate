@@ -6,10 +6,12 @@ import argparse
 import json
 import os
 import re
+import subprocess
 import sys
 import xml.etree.ElementTree as ElementTree
 from pathlib import Path
 
+from gate.collected import ids_in_source, is_collected_file, junit_ids
 from gate.common import (
     EXIT_OK,
     EXIT_RULE_FAILED,
@@ -64,9 +66,45 @@ def read_junit_counts(path: Path) -> dict[str, int]:
     return counts
 
 
-def post_checks(check: dict, raw_dir: Path) -> list[str]:
+def _git(workdir: str | None, *args: str) -> str:
+    process = subprocess.run(
+        ["git", "-c", "core.fsmonitor=false", "-c", "core.quotepath=off", *args],
+        cwd=workdir,
+        capture_output=True,
+        check=False,
+    )
+    if process.returncode != 0:
+        raise UsageError(f"git {args[0]} failed: {process.stderr.decode('utf-8', 'replace').strip()[:300]}")
+    return process.stdout.decode("utf-8", "replace")
+
+
+def tests_of_the_base(workdir: str | None) -> set[str]:
+    """Each test the base holds, read by parsing, before any of this check's commands run."""
+    base_sha = os.environ.get("GATE_BASE_SHA")
+    if not base_sha:
+        raise UsageError("expected_tests_from_base needs the variable GATE_BASE_SHA")
+    base = _git(workdir, "merge-base", base_sha, "HEAD").strip()
+    found: set[str] = set()
+    for path in _git(workdir, "ls-tree", "-r", "--name-only", base).splitlines():
+        if is_collected_file(path):
+            try:
+                found |= ids_in_source(_git(workdir, "show", f"{base}:{path}"), path)
+            except (SyntaxError, ValueError):
+                continue
+    return found
+
+
+def post_checks(check: dict, raw_dir: Path, expected: set[str] | None) -> list[str]:
     """Return the failures found after the commands ran."""
     failures = []
+    if expected is not None and check.get("junit"):
+        try:
+            missing = sorted(expected - junit_ids(raw_dir / check["junit"]))
+        except (OSError, ElementTree.ParseError):
+            missing = []  # the unreadable file is its own failure, below
+        write_json(raw_dir / "missing_tests.json", missing)
+        if missing:
+            failures.append(f"{len(missing)} tests of the base did not run")
     junit = check.get("junit")
     if junit:
         try:
@@ -129,6 +167,13 @@ def main(argv: list[str] | None = None) -> int:
     except UsageError as error:
         return fail_usage(str(error))
 
+    expected: set[str] | None = None
+    if check.get("expected_tests_from_base"):
+        try:
+            expected = tests_of_the_base(args.workdir)
+        except UsageError as error:
+            return fail_usage(str(error))
+
     first_failure = 0
     for index, command in enumerate(resolved):
         raw_rel = f"raw/{check_slug}/{index}.log"
@@ -138,7 +183,7 @@ def main(argv: list[str] | None = None) -> int:
         if code != 0 and first_failure == 0:
             first_failure = code
 
-    failures = post_checks(check, raw_dir)
+    failures = post_checks(check, raw_dir, expected)
     for failure in failures:
         append_row(tsv, args.check, "post", EXIT_RULE_FAILED, 0.0, "", [failure])
         print(f"{args.check}: {failure}", file=sys.stderr)

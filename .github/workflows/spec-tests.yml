@@ -1,6 +1,7 @@
 # The spec-test author. Reusable: a repository calls it on workflow_dispatch.
 # It writes tests from the specification into acceptance/ on a spec/* branch,
-# and it must not see the application's code.
+# and it must not see the application's code. The model only pushes its branch;
+# a later step, not the model, opens the PR.
 name: spec-tests
 
 on:
@@ -10,6 +11,7 @@ on:
         type: string
         default: quality.toml
       prompt-file:
+        description: The prompt file, read from the default branch's copy.
         type: string
         default: prompts/spec-tests.md
     secrets:
@@ -47,6 +49,7 @@ jobs:
       - name: Get the configuration from the default branch
         uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
+          ref: ${{ github.event.repository.default_branch }}
           path: .trusted
           persist-credentials: false
 
@@ -70,6 +73,7 @@ jobs:
       PYTHONPATH: ${{ github.workspace }}/.gate
       GATE_PROMPT_FILE: ${{ inputs.prompt-file }}
       GATE_CONFIG_PATH: ${{ inputs.config-path }}
+      GATE_INTEGRATION_BRANCH: ${{ needs.limits.outputs.integration-branch }}
     steps:
       - name: Get the gate at its pinned commit
         uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
@@ -77,6 +81,13 @@ jobs:
           repository: ${{ job.workflow_repository }}
           ref: ${{ job.workflow_sha }}
           path: .gate
+          persist-credentials: false
+
+      - name: Get the prompt and the configuration from the default branch
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          ref: ${{ github.event.repository.default_branch }}
+          path: .trusted
           persist-credentials: false
 
       - name: Set up Python
@@ -98,9 +109,10 @@ jobs:
           app-id: ${{ vars.EXECUTOR_APP_ID }}
           private-key: ${{ secrets.EXECUTOR_APP_PRIVATE_KEY }}
 
-      - name: Move the gate out of the working folder
+      - name: Move the gate and the prompt out of the working folder
         run: |
           mv .gate "$RUNNER_TEMP/gate"
+          mv .trusted "$RUNNER_TEMP/trusted"
           echo "PYTHONPATH=$RUNNER_TEMP/gate" >> "$GITHUB_ENV"
 
       - name: Get the repository
@@ -112,27 +124,39 @@ jobs:
       - name: Remove the paths of spec_tests.deny_read from the working folder
         run: |
           # Takes each path of spec_tests.deny_read out of the working folder.
-          python -P -m gate.publish hide-paths --config "$GATE_CONFIG_PATH" --repo .
+          python -P -m gate.publish hide-paths --config "$RUNNER_TEMP/trusted/$GATE_CONFIG_PATH" --repo .
 
       - name: Build the prompt
         id: prompt
-        run: |
-          {
-            echo 'text<<GATE_PROMPT_END'
-            cat "$GATE_PROMPT_FILE"
-            echo 'GATE_PROMPT_END'
-          } >> "$GITHUB_OUTPUT"
+        env:
+          GATE_TOKEN: ${{ steps.app-token.outputs.token }}
+        run: python -P -m gate.publish prompt --template "$RUNNER_TEMP/trusted/$GATE_PROMPT_FILE" --output "$GITHUB_OUTPUT"
+
+      - name: Read the app's identity
+        id: identity
+        env:
+          GATE_TOKEN: ${{ steps.app-token.outputs.token }}
+          GATE_APP_SLUG: ${{ steps.app-token.outputs.app-slug }}
+        run: python -P -m gate.publish bot-identity --slug "$GATE_APP_SLUG" --output "$GITHUB_OUTPUT"
 
       - name: Run the spec-test author
         uses: anthropics/claude-code-action@4845bacbb38b3c4b15d948f035349786f678e068 # v1.0.267
         env:
-          GH_TOKEN: ${{ steps.app-token.outputs.token }}
+          # The model's tools do not inherit the tokens. It pushes through git and opens nothing.
+          CLAUDE_CODE_SUBPROCESS_ENV_SCRUB: "1"
         with:
           github_token: ${{ steps.app-token.outputs.token }}
           claude_code_oauth_token: ${{ secrets.CLAUDE_CODE_OAUTH_TOKEN }}
           base_branch: ${{ needs.limits.outputs.integration-branch }}
+          bot_name: ${{ steps.identity.outputs.bot-name }}
+          bot_id: ${{ steps.identity.outputs.bot-id }}
           prompt: ${{ steps.prompt.outputs.text }}
           settings: ${{ needs.limits.outputs.spec-settings }}
           claude_args: >-
             --max-turns ${{ needs.limits.outputs.max-turns }}
-            --allowedTools "Read,Write,Edit,Glob,Grep,Bash(git add:*),Bash(git commit:*),Bash(git checkout -b:*),Bash(git push:*),Bash(gh pr create:*)"
+            --allowedTools "Read,Write,Edit,Glob,Grep,Bash(git add:*),Bash(git commit:*),Bash(git checkout -b:*),Bash(git push:*)"
+
+      - name: Open the PR for what was pushed
+        env:
+          GATE_TOKEN: ${{ steps.app-token.outputs.token }}
+        run: python -P -m gate.publish create-pull-request --prefix "spec/" --base "$GATE_INTEGRATION_BRANCH"

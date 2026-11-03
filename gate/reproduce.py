@@ -16,9 +16,8 @@ import sys
 from pathlib import Path
 
 from gate import report as report_module
-from gate.common import EXIT_OK, EXIT_RULE_FAILED, UsageError, fail_usage, read_json, read_json_or_none, slug, write_json
+from gate.common import DIAGNOSTIC_CHECKS, EXIT_OK, EXIT_RULE_FAILED, UsageError, fail_usage, read_json, read_json_or_none, write_json
 
-RUN_STEPS = report_module.RUN_STEPS
 GATE_ROOT = Path(__file__).resolve().parent.parent
 
 
@@ -65,9 +64,10 @@ def copy_earlier_runs(stored: Path, target: Path) -> Path:
     return target
 
 
-def run_step(check: str, config: Path, out: Path, workdir: Path, environment: dict[str, str]) -> str:
+def run_step(check: str, config: Path, out: Path, workdir: Path, environment: dict[str, str], optional: bool = False) -> str:
+    flags = ["--if-configured"] if optional else []
     process = subprocess.run(
-        [sys.executable, "-P", "-m", "gate.run_checks", "--config", str(config), "--check", check, "--out", str(out), "--workdir", str(workdir)],
+        [sys.executable, "-P", "-m", "gate.run_checks", "--config", str(config), "--check", check, *flags, "--out", str(out), "--workdir", str(workdir)],
         env=environment,
         check=False,
     )
@@ -84,13 +84,20 @@ def reproduce(args: argparse.Namespace) -> int:
 
     pr_dir = work / "pr"
     git("clone", "--quiet", args.repo, str(pr_dir))
-    git("checkout", "--quiet", "--detach", args.sha, cwd=pr_dir)
     git("fetch", "--quiet", "--no-tags", "origin", "+refs/heads/reports:refs/remotes/origin/reports", cwd=pr_dir)
     stored_tree = work / "stored"
     git("worktree", "add", "--quiet", "--detach", str(stored_tree), "origin/reports", cwd=pr_dir)
     stored = find_stored(stored_tree / "reports", args.sha)
 
     context = read_json(stored / "context.json")
+    # A closed PR's branch may be gone; GitHub keeps its head under refs/pull.
+    subprocess.run(
+        ["git", "fetch", "--quiet", "--no-tags", "origin", f"refs/pull/{context['pr']}/head"],
+        cwd=pr_dir,
+        capture_output=True,
+        check=False,
+    )
+    git("checkout", "--quiet", "--detach", args.sha, cwd=pr_dir)
     extras_path = stored / "extras.json"
     trusted_ref = context.get("trusted_sha") or git("symbolic-ref", "--short", "refs/remotes/origin/HEAD", cwd=pr_dir)
     trusted_tree = work / "trusted"
@@ -110,32 +117,38 @@ def reproduce(args: argparse.Namespace) -> int:
         "GATE_BASE_SHA": str(context["base_sha"]),
         "GATE_HEAD_SHA": str(context["head_sha"]),
         "GATE_HEAD_REF": str(context["head_ref"]),
+        "GATE_PR_AUTHOR": str(context.get("author", "unknown")),
         "GATE_PR": str(context["pr"]),
         "GATE_REPORTS_DIR": str(earlier_reports),
         "GATE_KNOWN_FAILING": str(pr_dir / "acceptance" / "known-failing.txt"),
         "GATE_ACCEPTANCE_MODE": "exact" if str(context["head_ref"]).startswith("spec/") else "subset",
     }
 
-    subprocess.run(
-        [sys.executable, "-P", "-m", "gate.run_checks", "--config", str(config), "--check", "setup", "--if-configured", "--out", str(artifact), "--workdir", str(pr_dir)],
-        env=environment,
-        check=False,
-    )
-
-    steps = []
+    # In the judge's own order: the two checks of the gate, the trusted files, then PR code.
     builtin = GATE_ROOT / "gate" / "builtin_checks.toml"
-    for number, check in enumerate(RUN_STEPS, start=1):
-        source = builtin if check in ("gate/env", "gate/guard") else config
-        if check == "gate/acceptance" and not str(context["head_ref"]).startswith("spec/"):
-            target = pr_dir / "acceptance"
-            if target.exists():
-                shutil.rmtree(target)
-            if (trusted_tree / "acceptance").is_dir():
-                shutil.copytree(trusted_tree / "acceptance", target)
-        conclusion = run_step(check, source, artifact, pr_dir, environment)
-        steps.append({"name": check, "status": "completed", "conclusion": conclusion, "number": number})
-        raw_dir = artifact / "raw" / slug(check)
-        raw_dir.mkdir(parents=True, exist_ok=True)
+    steps = []
+
+    def run_and_record(check: str, source: Path, optional: bool = False) -> None:
+        conclusion = run_step(check, source, artifact, pr_dir, environment, optional)
+        steps.append({"name": check, "status": "completed", "conclusion": conclusion, "number": len(steps) + 1})
+
+    run_and_record("gate/env", builtin)
+    run_and_record("gate/guard", builtin)
+    if not str(context["head_ref"]).startswith("spec/"):
+        target = pr_dir / "acceptance"
+        if target.exists():
+            shutil.rmtree(target)
+        if (trusted_tree / "acceptance").is_dir():
+            shutil.copytree(trusted_tree / "acceptance", target)
+    review = pr_dir / "security-review.md"
+    review.unlink(missing_ok=True)
+    if (trusted_tree / "security-review.md").is_file():
+        shutil.copyfile(trusted_tree / "security-review.md", review)
+    run_and_record("setup", config, optional=True)
+    for check in ("gate/tests", "gate/acceptance", "gate/security"):
+        run_and_record(check, config)
+    for check in DIAGNOSTIC_CHECKS:
+        run_and_record(check, config, optional=True)
 
     all_ok = all(step["conclusion"] == "success" for step in steps)
     jobs = {"jobs": [{"name": "run", "status": "completed", "conclusion": "success" if all_ok else "failure", "steps": steps}]}

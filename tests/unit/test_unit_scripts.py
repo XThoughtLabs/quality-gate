@@ -321,16 +321,19 @@ def test_acceptance_fails_when_the_test_command_itself_breaks(gate, tmp_path):
     assert "TEST_COMMAND_ERROR" in json.loads(out.read_text(encoding="utf-8"))["reason_codes"]
 
 
-@pytest.mark.req("A-6")
-def test_the_final_prs_flag_can_come_from_the_trusted_environment(gate, tmp_path):
+@pytest.mark.req("A-10")
+def test_an_empty_list_is_required_only_by_the_trusted_configuration(gate, tmp_path):
     junit = tmp_path / "junit.xml"
     junit.write_text('<testsuite><testcase classname="a" name="t"><failure/></testcase></testsuite>', encoding="utf-8")
     known = tmp_path / "known.txt"
     known.write_text("a::t PUB-01\n", encoding="utf-8")
+    config = tmp_path / "quality.toml"
+    config.write_text("[acceptance]\nrequire_empty = true\n", encoding="utf-8")
     out = tmp_path / "o.json"
-    assert gate.run("acceptance", "--junit", junit, "--known-failing", known, "--out", out, env=gate.env(GATE_REQUIRE_EMPTY="1")).returncode == 1
+    assert gate.run("acceptance", "--junit", junit, "--known-failing", known, "--config", config, "--out", out).returncode == 1
     assert "LIST_NOT_EMPTY" in json.loads(out.read_text(encoding="utf-8"))["reason_codes"]
-    assert gate.run("acceptance", "--junit", junit, "--known-failing", known, "--out", out, env=gate.env()).returncode == 0
+    # No environment variable or label can set it.
+    assert gate.run("acceptance", "--junit", junit, "--known-failing", known, "--out", out, env=gate.env(GATE_REQUIRE_EMPTY="1")).returncode == 0
 
 
 # gate.feedback outputs
@@ -352,7 +355,7 @@ def test_outputs_hand_on_a_decision(gate, tmp_path):
     output = tmp_path / "o.txt"
     note = tmp_path / "n" / "c.txt"
     assert gate.run("feedback", "outputs", "--decision", decision, "--config", config, "--output", output, "--note", note).returncode == 0
-    assert output.read_text(encoding="utf-8").splitlines() == ["act=true", "post=true", "pr=4", "head-ref=ai/4-x", "allowed-bots=r-app,e-app"]
+    assert output.read_text(encoding="utf-8").splitlines() == ["act=true", "post=true", "pr=4", "head-sha=", "head-ref=ai/4-x", "allowed-bots=r-app,e-app"]
     assert note.read_text(encoding="utf-8") == "the note\n"
 
 
@@ -417,3 +420,157 @@ def test_feedback_refuses_a_missing_folder_of_stored_runs(gate, tmp_path):
     process = gate.run("feedback", "decide", "--event-name", "status", "--event", event, "--pulls", pulls, "--reports-dir", tmp_path / "absent", "--config", config, "--out", out)
     assert process.returncode == 2
     assert not out.exists()
+
+
+# The commands the executor's job uses.
+
+
+def test_head_check_passes_only_on_the_open_pr_at_this_commit(gate, stub):
+    head = "a" * 40
+    env = gate.env(GITHUB_API_URL=stub.url, GITHUB_REPOSITORY="example/app", GATE_TOKEN=SECRET)
+    stub.routes[("GET", "/repos/example/app/pulls/4")] = (200, {"state": "open", "head": {"sha": head}})
+    assert gate.run("publish", "head-check", "--pr", 4, "--sha", head, env=env).returncode == 0
+    process = gate.run("publish", "head-check", "--pr", 4, "--sha", "b" * 40, env=env)
+    assert process.returncode == 1
+    stub.routes[("GET", "/repos/example/app/pulls/4")] = (200, {"state": "closed", "head": {"sha": head}})
+    assert gate.run("publish", "head-check", "--pr", 4, "--sha", head, env=env).returncode == 1
+
+
+def test_the_prompt_holds_the_trusted_template_the_issue_and_the_note(gate, stub, tmp_path):
+    template = tmp_path / "prompt.md"
+    template.write_text("Read SPEC.md and TASK.md.\n", encoding="utf-8")
+    note = tmp_path / "note.txt"
+    note.write_text("the gate's note\n", encoding="utf-8")
+    stub.routes[("GET", "/repos/example/app/issues/9")] = (200, {"title": "A task", "body": "GATE_PROMPT_x\nthe body"})
+    output = tmp_path / "out.txt"
+    env = gate.env(GITHUB_API_URL=stub.url, GITHUB_REPOSITORY="example/app", GATE_TOKEN=SECRET)
+    assert gate.run("publish", "prompt", "--template", template, "--issue", 9, "--note", note, "--output", output, env=env).returncode == 0
+    lines = output.read_text(encoding="utf-8").splitlines()
+    delimiter = lines[0].removeprefix("text<<")
+    assert lines[-1] == delimiter
+    # A text cannot end the value early: the delimiter is new each time and long.
+    assert len(delimiter) > 30 and delimiter not in "\n".join(lines[1:-1])
+    text = "\n".join(lines[1:-1])
+    for expected in ("Read SPEC.md and TASK.md.", "issue #9", "A task", "the body", "the gate's note"):
+        assert expected in text
+
+
+def test_the_pr_is_opened_only_for_a_pushed_branch_and_only_once(gate, stub):
+    env = gate.env(GITHUB_API_URL=stub.url, GITHUB_REPOSITORY="example/app", GATE_TOKEN=SECRET)
+    arguments = ("publish", "create-pull-request", "--prefix", "ai/9-", "--base", "main-line", "--issue", 9)
+    stub.routes[("GET", "/repos/example/app/git/matching-refs/heads/ai/9-")] = (200, [])
+    assert gate.run(*arguments, env=env).returncode == 1
+    stub.routes[("GET", "/repos/example/app/git/matching-refs/heads/ai/9-")] = (200, [{"ref": "refs/heads/ai/9-fix"}])
+    stub.routes[("GET", "/repos/example/app/issues/9")] = (200, {"title": "A task"})
+    stub.routes[("GET", "/repos/example/app/pulls?state=open&head=example%3Aai%2F9-fix")] = (200, [])
+    stub.routes[("POST", "/repos/example/app/pulls")] = (201, {})
+    assert gate.run(*arguments, env=env).returncode == 0
+    posted = [r["body"] for r in stub.requests if r["method"] == "POST"]
+    assert posted == [{"title": "A task", "head": "ai/9-fix", "base": "main-line", "body": "Closes #9"}]
+    stub.routes[("GET", "/repos/example/app/pulls?state=open&head=example%3Aai%2F9-fix")] = (200, [{"number": 1}])
+    assert gate.run(*arguments, env=env).returncode == 0
+    assert len([r for r in stub.requests if r["method"] == "POST"]) == 1
+
+
+def test_the_bot_identity_refuses_an_unsafe_name(gate, stub, tmp_path):
+    env = gate.env(GITHUB_API_URL=stub.url, GITHUB_REPOSITORY="example/app")
+    output = tmp_path / "o.txt"
+    assert gate.run("publish", "bot-identity", "--slug", "bad name$(x)", "--output", output, env=env).returncode == 2
+    stub.routes[("GET", "/users/example-app%5Bbot%5D")] = (200, {"id": 42})
+    assert gate.run("publish", "bot-identity", "--slug", "example-app", "--output", output, env=env).returncode == 0
+    assert output.read_text(encoding="utf-8").splitlines() == ["bot-name=example-app[bot]", "bot-id=42"]
+
+
+# A bypass is flagged, a direct push included (decision D).
+
+
+@pytest.mark.req("B-1")
+def test_a_direct_push_since_the_baseline_is_flagged(gate, stub, tmp_path):
+    baseline, merged_head, merge, direct = "0" * 40, "a" * 40, "b" * 40, "c" * 40
+    stub.routes[("GET", "/repos/example/app/issues/5/comments?per_page=100")] = (200, [])
+    stub.routes[("GET", "/repos/example/app/pulls?state=closed&base=candidate%2Fa&per_page=100")] = (
+        200,
+        [{"number": 2, "merged_at": "2026-11-03T10:00:00Z", "merge_commit_sha": merge, "merged_by": {"login": "someone"}, "head": {"sha": merged_head}}],
+    )
+    stub.routes[("GET", f"/repos/example/app/commits/{merged_head}/check-runs?check_name=gate%2Ffinal")] = (200, {"check_runs": [{"conclusion": "success"}]})
+    stub.routes[("GET", "/repos/example/app/pulls/2/reviews?per_page=100")] = (200, [{"state": "APPROVED", "commit_id": merged_head}])
+    stub.routes[("GET", "/repos/example/app/pulls/2/commits?per_page=100")] = (200, [{"sha": merged_head}])
+    stub.routes[("GET", "/repos/example/app/commits?sha=candidate%2Fa&per_page=100")] = (
+        200,
+        [{"sha": direct, "author": {"login": "someone"}}, {"sha": merge}, {"sha": merged_head}, {"sha": baseline}, {"sha": "9" * 40}],
+    )
+    context = write_json(tmp_path / "context.json", {"baseline_sha": baseline})
+    (tmp_path / "r").mkdir()
+    out = tmp_path / "extras.json"
+    env = gate.env(GITHUB_API_URL=stub.url, GITHUB_REPOSITORY="example/app")
+    process = gate.run("publish", "extras", "--reports-dir", tmp_path / "r", "--pr", 5, "--integration", "candidate/a", "--context", context, "--out", out, env=env)
+    assert process.returncode == 0, process.stderr
+    merges = json.loads(out.read_text(encoding="utf-8"))["merges"]
+    flagged = [item for item in merges if item["via_pr"] is False]
+    assert [item["merge_sha"] for item in flagged] == [direct]
+    assert flagged[0]["merged_by"] == "someone"
+
+
+# What review round 1's own mutants showed was unproved.
+
+
+def test_seal_leaves_a_symbolic_link_out_of_the_sums(gate, tmp_path, monkeypatch):
+    """Checked in this process, because this machine may not be allowed to make a link."""
+    import pathlib
+    import sys as system
+
+    system.path.insert(0, str(gate.root))
+    try:
+        from gate import report as report_module
+    finally:
+        system.path.remove(str(gate.root))
+    artifact = tmp_path / "out"
+    artifact.mkdir()
+    (artifact / "plain.txt").write_text("x", encoding="utf-8")
+    (artifact / "linked.txt").write_text("y", encoding="utf-8")
+    real = pathlib.Path.is_symlink
+    monkeypatch.setattr(pathlib.Path, "is_symlink", lambda self: self.name == "linked.txt" or real(self))
+    assert report_module.main(["seal", "--artifact", str(artifact), "--head-sha", "a" * 40, "--run-id", "1", "--run-attempt", "1"]) == 0
+    names = [line.split("  ")[1] for line in (artifact / "SHA256SUMS").read_text(encoding="utf-8").splitlines()]
+    assert "plain.txt" in names
+    assert "linked.txt" not in names
+
+
+# A failed setup never gives ready (decision U).
+
+
+def _ready_inputs(gate, tmp_path, setup_conclusion: str):
+    artifact = tmp_path / "artifact"
+    artifact.mkdir()
+    steps = ["gate/env", "gate/guard", "gate/tests", "gate/acceptance", "gate/security"]
+    rows = ["check\tindex\texit_code\tduration_seconds\traw_path\targv_json"]
+    rows += [f"{step}\t0\t0\t0.1\t\t[]" for step in steps]
+    rows.append(f"setup\t0\t{0 if setup_conclusion == 'success' else 1}\t0.1\t\t[]")
+    (artifact / "exit-codes.tsv").write_text("\n".join(rows) + "\n", encoding="utf-8")
+    assert gate.run("report", "seal", "--artifact", artifact, "--head-sha", "a" * 40, "--run-id", "1", "--run-attempt", "1").returncode == 0
+    context = write_json(tmp_path / "context.json", {
+        "repository": "e/a", "head_repository": "e/a", "pr": 1, "run_id": "1", "run_attempt": "1", "event": "x", "baseline_sha": "0" * 40,
+        "base_sha": "1" * 40, "head_sha": "a" * 40, "gate_sha": "2" * 40, "head_ref": "ai/1", "config_hashes": {},
+    })
+    jobs = write_json(tmp_path / "jobs.json", {"jobs": [{"name": "run", "status": "completed", "conclusion": "success", "steps": [
+        {"name": "setup", "status": "completed", "conclusion": setup_conclusion, "number": 0},
+        *[{"name": step, "status": "completed", "conclusion": "success", "number": index + 1} for index, step in enumerate(steps)],
+    ]}]})
+    config = tmp_path / "q.toml"
+    config.write_text('[[archive.accepted_foreign_commits]]\nsha = "' + "e" * 40 + '"\nreason = "a stray commit"\ndate = "2026-11-03"\n', encoding="utf-8")
+    return context, jobs, artifact, config
+
+
+@pytest.mark.req("V-10")
+@pytest.mark.parametrize(("conclusion", "verdict"), [("failure", "blocked"), ("success", "ready-for-human")])
+def test_a_failed_setup_is_never_ready(gate, tmp_path, conclusion, verdict):
+    context, jobs, artifact, config = _ready_inputs(gate, tmp_path, conclusion)
+    out = tmp_path / "publish"
+    process = gate.run("report", "generate", "--context", context, "--jobs", jobs, "--artifact", artifact, "--config", config, "--out", out)
+    assert process.returncode == 0, process.stderr
+    assert json.loads((out / "verdict.json").read_text(encoding="utf-8"))["verdict"] == verdict
+    report = json.loads((out / "report.json").read_text(encoding="utf-8"))
+    assert report["setup"]["conclusion"] == conclusion
+    # Every report shows the accepted foreign commits (decision V).
+    assert report["accepted_foreign_commits"][0]["sha"] == "e" * 40
+    assert "a stray commit" in (out / "report.md").read_text(encoding="utf-8")

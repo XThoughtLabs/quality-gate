@@ -333,6 +333,36 @@ def test_append_adds_one_file_and_refuses_a_second(gate, github, inputs, tmp_pat
     assert github.refs["refs/heads/reports"] == head
 
 
+def test_append_also_checks_the_actors(gate, github, inputs, tmp_path):
+    store(gate, github, inputs)
+    github.add_commit({"reports/7/99-1/x": b"forged"}, "someone-else[bot]", True, github.refs["refs/heads/reports"])
+    final = tmp_path / "final.json"
+    final.write_text("{}", encoding="utf-8")
+    env = gate.env(GITHUB_API_URL=github.url, GATE_TOKEN=SECRET)
+    process = gate.run("archive", "append", "--api-repo", "example/app", "--branch", "reports", "--path", "reports/7/11-1/final.json", "--file", final, "--out", inputs["out"], env=env)
+    assert process.returncode == 1
+    assert json.loads(inputs["out"].read_text(encoding="utf-8"))["reason"] == "reports written by another actor"
+
+
+def test_more_commits_than_the_pages_can_hold_are_not_trusted(gate, github, inputs, monkeypatch):
+    """An unending list of commits is never read as an all-clear."""
+    store(gate, github, inputs)
+    import sys as system
+
+    system.path.insert(0, str(gate.root))
+    try:
+        from gate import archive as archive_module
+    finally:
+        system.path.remove(str(gate.root))
+    remote = archive_module.ApiRemote("example/app", "reports", base=github.url, token=SECRET)
+    full_page = [{"sha": "a" * 40, "author": {"login": BOT}, "commit": {"verification": {"verified": True}}}] * 100
+    real_call = remote._call
+    monkeypatch.setattr(remote, "_call", lambda method, route, body=None: full_page if route.startswith("/commits?") else real_call(method, route, body))
+    status = archive_module.actors_status(remote, {})
+    assert status["actors_ok"] is False
+    assert status["reason"] == "the authors of reports could not be checked"
+
+
 def test_a_git_remote_on_github_is_refused(gate, inputs):
     """A git push would leave commits unsigned, so GitHub is written only through the API."""
     process = gate.run(
