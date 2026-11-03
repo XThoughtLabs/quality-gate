@@ -27,13 +27,13 @@ SKIP = {".git", ".venv", "__pycache__", ".pytest_cache", "reproduce-out"}
 UNIT = "tests/unit/test_unit_scripts.py"
 E2E = "tests/unit/test_unit_end_to_end.py"
 TESTS_FOR = {
-    "GUARD": ["tests/spec/test_guard.py", E2E],
+    "GUARD": ["tests/spec/test_guard.py", "tests/spec/test_guard_v.py", E2E],
     "ENV": ["tests/spec/test_env_check.py", UNIT],
-    "RUN": ["tests/spec/test_run_checks.py", "tests/spec/test_common.py", UNIT],
+    "RUN": ["tests/spec/test_run_checks.py", "tests/spec/test_run_checks_base.py", "tests/spec/test_common.py", UNIT],
     "ACC": ["tests/spec/test_acceptance.py", UNIT],
-    "REP": ["tests/spec/test_report_generate.py", "tests/spec/test_report_final_compare.py", "tests/unit/test_unit_archive_api.py", E2E],
+    "REP": ["tests/spec/test_report_generate.py", "tests/spec/test_report_final_compare.py", "tests/spec/test_report_seal.py", "tests/unit/test_unit_archive_api.py", UNIT, E2E],
     "COMMON": ["tests/spec/test_report_generate.py", "tests/spec/test_common.py"],
-    "ARC": ["tests/spec/test_archive.py", "tests/unit/test_unit_archive_api.py"],
+    "ARC": ["tests/spec/test_archive.py", "tests/spec/test_archive_api.py", "tests/unit/test_unit_archive_api.py"],
     "FB": ["tests/spec/test_feedback.py", UNIT],
     "REV": ["tests/spec/test_review_local.py"],
     "HAR": ["tests/spec/test_concurrency_harness.py"],
@@ -228,9 +228,11 @@ def main() -> int:
     parser.add_argument("--out", required=True)
     parser.add_argument("--only", default="", help="only mutants whose ID starts with this")
     parser.add_argument("--jobs", type=int, default=6, help="mutants run at once, each in its own copy")
+    parser.add_argument("--ids", default="", help="only these mutants, by ID, separated by commas")
     args = parser.parse_args()
 
-    selected = [mutant for mutant in MUTANTS if mutant[0].startswith(args.only)]
+    wanted = set(filter(None, args.ids.split(",")))
+    selected = [mutant for mutant in MUTANTS if mutant[0].startswith(args.only) and (not wanted or mutant[0] in wanted)]
     results = []
     with tempfile.TemporaryDirectory(prefix="gate-mut-", ignore_cleanup_errors=True) as tmp:
         with concurrent.futures.ThreadPoolExecutor(max_workers=args.jobs) as pool:
