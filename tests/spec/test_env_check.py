@@ -104,15 +104,16 @@ def api_env(stub_url, role, **extra):
     return env
 
 
-def perm_item(data, perm):
-    """The item that reports one permission probe. The suffix (allowed/denied) is not relied on."""
-    want = re.sub(r"[^a-z]", "", f"{perm[0]}{perm[1]}")
-    found = []
-    for it in data["items"]:
-        m = re.fullmatch(r"permission:(.+):(allowed|denied)", it["item"])
-        if m and re.sub(r"[^a-z]", "", m.group(1).lower()) == want:
-            found.append(it)
-    assert len(found) == 1, f"expected exactly one permission item for {perm}, got {[i['item'] for i in data['items']]}"
+def perm_name(role, perm):
+    """The exact item name of E-3: permission:<name>-<read|write>:<the state that is required>."""
+    state = "denied" if perm in ROLE_PERMS[role]["denied"] else "allowed"
+    return f"permission:{perm[0]}-{perm[1]}:{state}"
+
+
+def perm_item(data, role, perm):
+    name = perm_name(role, perm)
+    found = [it for it in data["items"] if it["item"] == name]
+    assert len(found) == 1, f"expected exactly one item {name!r}, got {[i['item'] for i in data['items']]}"
     return found[0]
 
 
@@ -243,8 +244,8 @@ def test_e3_correct_permissions_are_ok_and_probes_are_the_documented_ones(tmp_pa
     assert data["role"] == role and data["ok"] is True
     perms = ROLE_PERMS[role]["allowed"] + ROLE_PERMS[role]["denied"]
     for perm in perms:
-        item = perm_item(data, perm)
-        assert item["ok"] is True, f"{perm} should be fine for role {role}"
+        assert perm_item(data, role, perm)["ok"] is True, f"{perm} should be fine for role {role}"
+        assert_item(res, data, perm_name(role, perm), True)  # printed as: OK permission:<name>-<read|write>:<state>
     seen = {(r.method, r.path) for r in stub.requests}
     for perm in perms:
         method, template = ROUTES[perm]
@@ -276,7 +277,8 @@ def test_e3_wrong_permission_breaks_exactly_that_item(tmp_path, stub, role, perm
     assert_rc(res, 1)
     assert_no_traceback(res)
     assert data["ok"] is False
-    assert perm_item(data, perm)["ok"] is False
+    assert perm_item(data, role, perm)["ok"] is False
+    assert_item(res, data, perm_name(role, perm), False)
     broken = [i for i in data["items"] if not i["ok"]]
     assert len(broken) == 1, f"only {perm} should be broken, got {[b['item'] for b in broken]}"
     assert any(line.startswith("BROKEN permission:") for line in res.both.splitlines())
@@ -288,7 +290,7 @@ def test_e3_write_expected_denied_other_statuses_are_broken(tmp_path, stub, stat
     configure_stub(stub, "run", {("contents", "write"): status})
     res, data, _ = run_env(tmp_path, "run", api_env(stub.url, "run"))
     assert_rc(res, 1)
-    assert perm_item(data, ("contents", "write"))["ok"] is False
+    assert perm_item(data, "run", ("contents", "write"))["ok"] is False
 
 
 @pytest.mark.req("E-3")
@@ -297,7 +299,7 @@ def test_e3_write_expected_allowed_other_statuses_are_broken(tmp_path, stub, sta
     configure_stub(stub, "archive", {("contents", "write"): status})
     res, data, _ = run_env(tmp_path, "archive", api_env(stub.url, "archive"))
     assert_rc(res, 1)
-    assert perm_item(data, ("contents", "write"))["ok"] is False
+    assert perm_item(data, "archive", ("contents", "write"))["ok"] is False
 
 
 @pytest.mark.req("E-3")
@@ -306,7 +308,7 @@ def test_e3_read_probe_expects_exactly_200(tmp_path, stub, status):
     configure_stub(stub, "run", {("contents", "read"): status})
     res, data, _ = run_env(tmp_path, "run", api_env(stub.url, "run"))
     assert_rc(res, 1)
-    assert perm_item(data, ("contents", "read"))["ok"] is False
+    assert perm_item(data, "run", ("contents", "read"))["ok"] is False
 
 
 @pytest.mark.req("E-3")
@@ -320,7 +322,7 @@ def test_e3_no_token_is_broken_never_a_pass(tmp_path, stub, role):
     assert_no_traceback(res)
     assert data["ok"] is False
     for perm in ROLE_PERMS[role]["allowed"] + ROLE_PERMS[role]["denied"]:
-        assert perm_item(data, perm)["ok"] is False
+        assert perm_item(data, role, perm)["ok"] is False
 
 
 @pytest.mark.req("E-3")
@@ -331,7 +333,7 @@ def test_e3_network_error_is_broken_never_a_pass(tmp_path, role):
     assert_no_traceback(res)
     assert data["ok"] is False
     for perm in ROLE_PERMS[role]["allowed"] + ROLE_PERMS[role]["denied"]:
-        assert perm_item(data, perm)["ok"] is False
+        assert perm_item(data, role, perm)["ok"] is False
 
 
 # ----------------------------------------------------------------------------- E-4
@@ -393,13 +395,73 @@ def test_e4_without_environment_section_no_environment_items(tmp_path):
     assert not [i for i in data["items"] if i["item"].startswith("environment:")]
 
 
-@pytest.mark.req("E-4")
-def test_e4_default_config_is_quality_toml_in_the_working_folder(tmp_path):
-    # Assumption (CONTRACTS.md shows `[--config quality.toml]`): the default is ./quality.toml.
-    make_config(tmp_path / "quality.toml", environment={"python": "3.12"})
-    res, data, _ = run_env(tmp_path, "executor", executor_env(), cwd=tmp_path)
+@pytest.mark.req("E-6", "E-4")
+@pytest.mark.parametrize("role", ["executor", "spec-tests", "reproduce"])
+def test_e6_without_config_a_quality_toml_in_the_working_folder_is_never_read(tmp_path, role):
+    # The working folder can be a judged repository's: its quality.toml is untrusted and must not be read.
+    make_config(tmp_path / "quality.toml", environment={"python": "3.12", "image_os": "ubuntu99"})
+    env = {"ImageOS": "ubuntu24"} if role == "reproduce" else executor_env(ImageOS="ubuntu24")  # reproduce runs E-2
+    res, data, _ = run_env(tmp_path, role, env, cwd=tmp_path)
+    assert_rc(res, 0)
+    assert not [i for i in data["items"] if i["item"].startswith("environment:")],         "no environment:* item may appear without --config"
+    assert "3.12" not in res.both and "ubuntu99" not in res.both, "the file in the working folder was read"
+
+
+@pytest.mark.req("E-6", "E-4")
+def test_e6_control_the_same_file_given_with_config_is_used(tmp_path):
+    cfg = make_config(tmp_path / "quality.toml", environment={"python": "3.12", "image_os": "ubuntu99"})
+    res, data, _ = run_env(tmp_path, "executor", executor_env(ImageOS="ubuntu24"), config=cfg, cwd=tmp_path)
     assert_rc(res, 1)
     assert_item(res, data, "environment:python", False)
+    assert_item(res, data, "environment:image_os", False)
+
+
+# ----------------------------------------------------------------------------- E-4a (role reproduce)
+
+
+def py_version():
+    return f"{sys.version_info.major}.{sys.version_info.minor}"
+
+
+@pytest.mark.req("E-4a")
+def test_e4a_reproduce_checks_python_but_not_image_os_and_needs_no_api(tmp_path):
+    cfg = env_config(tmp_path, python=py_version(), image_os="ubuntu99")
+    res, data, _ = run_env(tmp_path, "reproduce", {"ImageOS": "ubuntu24"}, config=cfg)
+    assert_rc(res, 0)
+    assert data["role"] == "reproduce" and data["ok"] is True
+    assert_item(res, data, "environment:python", True)
+    names = [i["item"] for i in data["items"]]
+    assert "environment:image_os" not in names, "of E-4 the role reproduce runs only environment:python"
+    assert not [n for n in names if n.startswith("permission:")], "reproduce probes no permission"
+
+
+@pytest.mark.req("E-4a", "E-4")
+def test_e4a_reproduce_python_mismatch_names_both_values(tmp_path):
+    cfg = env_config(tmp_path, python="3.12")
+    res, data, _ = run_env(tmp_path, "reproduce", {}, config=cfg)
+    assert_rc(res, 1)
+    assert_item(res, data, "environment:python", False)
+    reason = items_by_name(data)["environment:python"]["reason"]
+    assert "3.12" in reason and py_version() in reason
+
+
+@pytest.mark.req("E-4a", "E-2", "E-5")
+def test_e4a_reproduce_runs_the_secret_check_of_e2(tmp_path):
+    res, data, out = run_env(tmp_path, "reproduce", {"DEPLOY_TOKEN": "SENTINEL-VALUE-7001", "PUBLIC_KEY": "x",
+                                                      "GATE_PROBE_TOKEN": "SENTINEL-VALUE-7002"})
+    assert_rc(res, 1)
+    assert_item(res, data, "secret-present:DEPLOY_TOKEN", False)
+    flagged = [i["item"] for i in data["items"] if i["item"].startswith("secret-present:")]
+    assert flagged == ["secret-present:DEPLOY_TOKEN"], "GATE_PROBE_TOKEN stays exempt, PUBLIC_KEY is not a listed word"
+    for where, text in all_outputs(res, out).items():
+        assert SENTINEL_PREFIX not in text, f"a value leaked into {where}"
+
+
+@pytest.mark.req("E-4a")
+def test_e4a_control_reproduce_with_a_clean_environment_is_ok(tmp_path):
+    res, data, _ = run_env(tmp_path, "reproduce", {})
+    assert_rc(res, 0)
+    assert data["ok"] is True
 
 
 # ----------------------------------------------------------------------------- E-5 and C-3
@@ -466,6 +528,9 @@ def test_e5_api_roles_never_print_the_probe_token_or_other_values(tmp_path, stub
     assert data["role"] == role
     for where, text in all_outputs(res, out).items():
         assert SENTINEL_PREFIX not in text, f"a value leaked into {where} ({role}, {state})"
+        # E-5: no value of any variable; the only exception is E-4 (the Python version and ImageOS)
+        assert REPO not in text, f"the value of GITHUB_REPOSITORY appears in {where}"
+        assert url not in text, f"the value of GITHUB_API_URL appears in {where}"
 
 
 # ----------------------------------------------------------------------------- C-2, Q-2

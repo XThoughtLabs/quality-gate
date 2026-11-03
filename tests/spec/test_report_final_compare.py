@@ -1,4 +1,4 @@
-"""gate.report final (F-1 to F-3) and gate.report compare (K-1), and the end-to-end chain generate -> final."""
+"""gate.report final (F-1, F-1a, F-2, F-2a, F-3, F-4) and compare (K-1), and the chain generate -> final."""
 from __future__ import annotations
 
 import copy
@@ -6,12 +6,12 @@ import json
 
 import pytest
 
-from gatekit import assert_no_traceback, assert_rc, load_out, run_gate, write_json, write_text
+from gatekit import assert_no_traceback, assert_rc, load_out, run_gate, sha256_file, write_json, write_text
 from reportkit import MANDATORY, World
 
 SIX = MANDATORY + ["gate/report"]
 ARCH_OK = {"stored": True, "sha256sums_match": True, "path": "reports/7/1001-1", "commit": "a" * 40, "reason": None,
-           "artifact_present": True, "skipped_unsafe": []}
+           "artifact_present": True, "skipped_unsafe": [], "actors_ok": True}
 REASONS = {
     "ready-for-human": [],
     "blocked": [{"code": "FAILED_CHECK", "detail": "gate/tests failed"}],
@@ -32,8 +32,15 @@ def verdict_obj(verdict, **extra):
     return obj
 
 
-def final(tmp_path, verdict, archive):
-    v = write_json(tmp_path / "verdict.json", verdict)
+def final(tmp_path, verdict, archive, *, extra=(), verdict_text=None):
+    """verdict: a dict, or MISSING for a verdict file that does not exist; verdict_text: raw (unreadable) content."""
+    v = tmp_path / "verdict.json"
+    if verdict is MISSING:
+        pass
+    elif verdict_text is not None:
+        write_text(v, verdict_text)
+    else:
+        write_json(v, verdict)
     a = tmp_path / "archive.json"
     if archive is MISSING:
         pass
@@ -42,8 +49,8 @@ def final(tmp_path, verdict, archive):
     else:
         write_json(a, archive)
     out = tmp_path / "final.json"
-    res = run_gate("report", "final", "--verdict", v, "--archive", a, "--out", out, cwd=tmp_path)
-    assert res.rc != 2, f"final must not treat a missing or unreadable archive result as a usage error (F-2)\n{res.describe()}"
+    res = run_gate("report", "final", "--verdict", v, "--archive", a, "--out", out, *extra, cwd=tmp_path)
+    assert res.rc != 2, f"final must not treat a missing or unreadable input as a usage error (F-2, F-2a)\n{res.describe()}"
     assert_no_traceback(res)
     return res, load_out(res, out)
 
@@ -97,15 +104,23 @@ def test_f1_text_that_says_ready_changes_nothing(tmp_path):
     assert d["verdict"] == "incomplete" and d["conclusions"]["gate/final"] == "failure"
 
 
-@pytest.mark.req("F-1", "V-6")
-def test_f1_a_preliminary_that_says_ready_over_a_failed_mandatory_check_is_not_ready(tmp_path):
-    # Assumption: defence in depth. The task says gate/final is never ready-for-human with a failed mandatory
-    # check; generate cannot produce this input, so this guards against a hand-edited or tampered verdict file.
+@pytest.mark.req("F-1a", "V-6")
+@pytest.mark.parametrize("value", ["failure", "neutral", "skipped", "cancelled", "", None, True])
+def test_f1a_a_preliminary_whose_own_checks_hold_anything_but_success_never_becomes_ready(tmp_path, value):
     bad = verdict_obj("ready-for-human")
-    bad["checks"]["gate/tests"] = "failure"
+    bad["checks"]["gate/tests"] = value
     res, d = final(tmp_path, bad, ARCH_OK)
     assert d["verdict"] != "ready-for-human"
     assert d["conclusions"]["gate/final"] == "failure"
+
+
+@pytest.mark.req("F-1a")
+@pytest.mark.parametrize("check_id", SIX)
+def test_f1a_any_one_check_is_enough(tmp_path, check_id):
+    bad = verdict_obj("ready-for-human")
+    bad["checks"][check_id] = "failure"
+    res, d = final(tmp_path, bad, ARCH_OK)
+    assert d["verdict"] != "ready-for-human"
 
 
 # ----------------------------------------------------------------------------- F-2
@@ -244,19 +259,29 @@ def test_k1_two_runs_on_the_same_inputs_are_equal(tmp_path):
 
 
 @pytest.mark.req("K-1")
-def test_k1_the_four_excluded_fields_may_differ(tmp_path):
+def test_k1_the_excluded_fields_may_differ(tmp_path):
     a, b = two_reports(tmp_path)
 
     def fn(r):
         r["generated_at"] = "1999-01-01T00:00:00Z"
         r["verification"]["run_id"] = 999999
         r["verification"]["run_attempt"] = 9
+        r["verification"]["execution_environment"] = "the pinned container"
+        r["environment"] = {"python": "3.99.0", "image_os": "somewhere else"}
         for check in r["checks"]:
             for c in check["commands"]:
                 c["duration_seconds"] = 12345.678
                 c["raw_sha256"] = "f" * 64
 
     assert_rc(compare(a, tweak(a, tmp_path / "b2.json", fn)), 0)
+
+
+@pytest.mark.req("K-1")
+def test_k1_execution_environment_may_differ_between_two_runs(tmp_path):
+    a, b = two_reports(tmp_path)
+    a2 = tweak(a, tmp_path / "a2.json", lambda r: r["verification"].__setitem__("execution_environment", "runner"))
+    b2 = tweak(b, tmp_path / "b2.json", lambda r: r["verification"].__setitem__("execution_environment", "container"))
+    assert_rc(compare(a2, b2), 0)
 
 
 @pytest.mark.req("K-1")
@@ -305,3 +330,117 @@ def test_k1_a_difference_hidden_next_to_an_excluded_field_is_still_found(tmp_pat
     res = compare(a, tweak(a, tmp_path / "b2.json", fn))
     assert_rc(res, 1)
     assert "argv" in res.both
+
+
+# ----------------------------------------------------------------------------- F-2a
+
+
+@pytest.mark.req("F-2a")
+@pytest.mark.parametrize("name,kw", [
+    ("file-missing", {"verdict": MISSING}),
+    ("not-json", {"verdict": {}, "verdict_text": "this is not json {"}),
+    ("empty-file", {"verdict": {}, "verdict_text": ""}),
+])
+def test_f2a_a_missing_or_unreadable_preliminary_verdict_gives_incomplete(tmp_path, name, kw):
+    res, d = final(tmp_path, kw["verdict"], ARCH_OK, verdict_text=kw.get("verdict_text"))
+    assert d["verdict"] == "incomplete"
+    assert "NO_PRELIMINARY" in codes(d)
+    assert d["conclusions"]["gate/final"] == "failure"
+
+
+def hashed_verdict(tmp_path, obj):
+    path = write_json(tmp_path / "verdict.json", obj)
+    return sha256_file(path)
+
+
+@pytest.mark.req("F-2a")
+def test_f2a_a_verdict_file_that_matches_the_publish_jobs_hash_is_trusted(tmp_path):
+    obj = verdict_obj("ready-for-human")
+    digest = hashed_verdict(tmp_path, obj)
+    res, d = final(tmp_path, obj, ARCH_OK, extra=["--expect-verdict-sha256", digest])
+    assert d["verdict"] == "ready-for-human" and d["conclusions"]["gate/final"] == "success"
+    assert "PUBLISH_OUTPUT_MISMATCH" not in codes(d)
+
+
+@pytest.mark.req("F-2a")
+@pytest.mark.parametrize("name,value", [("another-hash", "0" * 64), ("empty-value", ""), ("not-a-hash", "nonsense")])
+def test_f2a_a_difference_or_an_empty_value_gives_blocked(tmp_path, name, value):
+    res, d = final(tmp_path, verdict_obj("ready-for-human"), ARCH_OK, extra=["--expect-verdict-sha256", value])
+    assert d["verdict"] == "blocked"
+    assert "PUBLISH_OUTPUT_MISMATCH" in codes(d)
+    assert d["conclusions"]["gate/final"] == "failure"
+
+
+@pytest.mark.req("F-2a")
+def test_f2a_a_verdict_edited_after_the_hash_was_taken_is_caught(tmp_path):
+    original = verdict_obj("blocked")
+    digest = hashed_verdict(tmp_path, original)
+    forged = verdict_obj("ready-for-human")  # what a job that ran PR code might have written instead
+    res, d = final(tmp_path, forged, ARCH_OK, extra=["--expect-verdict-sha256", digest])
+    assert d["verdict"] == "blocked" and "PUBLISH_OUTPUT_MISMATCH" in codes(d)
+
+
+@pytest.mark.req("F-2a")
+def test_f2a_env_result_that_is_not_ok_adds_failed_check_and_a_ready_verdict_becomes_blocked(tmp_path):
+    env_result = write_json(tmp_path / "env-result.json", {"role": "publish", "ok": False, "items": []})
+    res, d = final(tmp_path, verdict_obj("ready-for-human"), ARCH_OK, extra=["--env-result", env_result])
+    assert d["verdict"] == "blocked" and "FAILED_CHECK" in codes(d)
+    assert d["conclusions"]["gate/final"] == "failure"
+
+
+@pytest.mark.req("F-2a")
+def test_f2a_env_result_without_ok_true_counts_as_not_ok(tmp_path):
+    env_result = write_json(tmp_path / "env-result.json", {"role": "publish", "items": []})
+    res, d = final(tmp_path, verdict_obj("ready-for-human"), ARCH_OK, extra=["--env-result", env_result])
+    assert d["verdict"] == "blocked" and "FAILED_CHECK" in codes(d)
+
+
+@pytest.mark.req("F-2a")
+def test_f2a_env_result_that_is_ok_changes_nothing(tmp_path):
+    env_result = write_json(tmp_path / "env-result.json", {"role": "publish", "ok": True, "items": []})
+    res, d = final(tmp_path, verdict_obj("ready-for-human"), ARCH_OK, extra=["--env-result", env_result])
+    assert d["verdict"] == "ready-for-human" and "FAILED_CHECK" not in codes(d)
+
+
+@pytest.mark.req("F-2a")
+@pytest.mark.parametrize("prelim", ["needs-human", "incomplete"])
+def test_f2a_a_bad_env_result_adds_the_reason_to_another_verdict_and_leaves_the_verdict(tmp_path, prelim):
+    env_result = write_json(tmp_path / "env-result.json", {"role": "publish", "ok": False, "items": []})
+    res, d = final(tmp_path, verdict_obj(prelim), ARCH_OK, extra=["--env-result", env_result])
+    assert d["verdict"] == prelim and "FAILED_CHECK" in codes(d)
+
+
+# ----------------------------------------------------------------------------- F-4
+
+
+@pytest.mark.req("F-4", "F-3")
+def test_f4_actors_not_ok_fails_the_archive_and_turns_a_ready_verdict_into_blocked(tmp_path):
+    res, d = final(tmp_path, verdict_obj("ready-for-human"), dict(ARCH_OK, actors_ok=False))
+    assert d["verdict"] == "blocked"
+    assert "REPORTS_WRITTEN_BY_ANOTHER_ACTOR" in codes(d)
+    assert d["conclusions"] == {"gate/archive": "failure", "gate/final": "failure"}
+
+
+@pytest.mark.req("F-4")
+@pytest.mark.parametrize("prelim", NOT_READY)
+def test_f4_for_any_other_verdict_the_code_is_added_and_the_verdict_stays(tmp_path, prelim):
+    res, d = final(tmp_path, verdict_obj(prelim), dict(ARCH_OK, actors_ok=False))
+    assert d["verdict"] == prelim
+    assert "REPORTS_WRITTEN_BY_ANOTHER_ACTOR" in codes(d)
+    assert d["conclusions"]["gate/archive"] == "failure"
+    for r in REASONS[prelim]:
+        assert r["code"] in codes(d)
+
+
+@pytest.mark.req("F-4")
+def test_f4_control_actors_ok_true_is_no_reason(tmp_path):
+    res, d = final(tmp_path, verdict_obj("ready-for-human"), dict(ARCH_OK, actors_ok=True))
+    assert d["verdict"] == "ready-for-human"
+    assert "REPORTS_WRITTEN_BY_ANOTHER_ACTOR" not in codes(d)
+
+
+@pytest.mark.req("F-4", "F-1")
+def test_f4_a_stored_and_matching_archive_is_still_not_enough_when_another_actor_wrote(tmp_path):
+    res, d = final(tmp_path, verdict_obj("ready-for-human"), dict(ARCH_OK, stored=True, sha256sums_match=True,
+                                                               actors_ok=False, foreign_commits=["f" * 40]))
+    assert d["verdict"] != "ready-for-human"

@@ -1,9 +1,12 @@
-"""gate.acceptance: rules A-1 to A-8 (decision O)."""
+"""gate.acceptance: rules A-1 to A-10 (decision O)."""
 from __future__ import annotations
+
+import sys
 
 import pytest
 
-from gatekit import assert_no_traceback, assert_rc, assert_refused, junit_xml, load_out, run_gate, write_text
+from gatekit import (assert_no_traceback, assert_rc, assert_refused, base_env, junit_xml, load_out, run_gate,
+                     write_script, write_text)
 
 T1 = "acceptance.test_status::test_history"
 T2 = "acceptance.test_status::test_permissions"
@@ -14,7 +17,8 @@ OUT_KEYS = {"ok", "mode", "list_size", "failing_not_listed", "listed_failing", "
             "missing_listed", "passed", "reason_codes"}
 
 
-def acc(tmp_path, cases, listed=None, *, mode=None, require_empty=False, list_missing=False, raw_junit=None):
+def acc(tmp_path, cases, listed=None, *, mode=None, require_empty=False, list_missing=False, raw_junit=None,
+        env_extra=None, command=None):
     junit = tmp_path / "junit.xml"
     if raw_junit is not None:
         write_text(junit, raw_junit)
@@ -29,7 +33,9 @@ def acc(tmp_path, cases, listed=None, *, mode=None, require_empty=False, list_mi
         args += ["--mode", mode]
     if require_empty:
         args.append("--require-empty")
-    res = run_gate("acceptance", *args, cwd=tmp_path)
+    if command:
+        args += ["--", *command]
+    res = run_gate("acceptance", *args, cwd=tmp_path, env=base_env(env_extra))
     return res, load_out(res, out), out
 
 
@@ -257,15 +263,16 @@ def test_all_lists_are_sorted(tmp_path):
     listed = [f"{T4} PUB-01", f"{T2} PUB-04", f"{T3} PUB-03", f"{T1} PUB-02"]
     res, d, _ = acc(tmp_path, cases, listed)
     assert_rc(res, 0)
-    assert d["listed_failing"] == [T2, T4], "sorted, not in file or JUnit order"
-    assert d["remove_from_list"] == [T1, T3] and d["passed"] == [T1, T3]
+    # The constants are not in lexical order (T4 and T3 sort before T1 and T2), so the expectation is sorted([...]).
+    assert d["listed_failing"] == sorted([T2, T4]), "sorted, not in file or JUnit order"
+    assert d["remove_from_list"] == sorted([T1, T3]) and d["passed"] == sorted([T1, T3])
     # a failing run, with several unlisted failures and several missing entries, also gives sorted lists
     other = tmp_path / "second"
     other.mkdir()
     res, d, _ = acc(other, [(T4, "fail"), (T2, "fail")], [f"{T3} PUB-03", f"{T1} PUB-02"])
     assert_rc(res, 1)
-    assert d["failing_not_listed"] == [T2, T4]
-    assert d["missing_listed"] == [T1, T3]
+    assert d["failing_not_listed"] == sorted([T2, T4])
+    assert d["missing_listed"] == sorted([T1, T3])
     for key in ("failing_not_listed", "listed_failing", "remove_from_list", "missing_listed", "passed"):
         assert d[key] == sorted(d[key]), f"{key} must be sorted"
 
@@ -283,3 +290,86 @@ def test_missing_list_file_is_an_empty_list(tmp_path):
     res, d, _ = acc(tmp_path, [(T1, "pass")], None, list_missing=True)
     assert_rc(res, 0)
     assert d["list_size"] == 0 and d["ok"] is True and d["remove_from_list"] == []
+
+
+# ----------------------------------------------------------------------------- A-9 and A-10
+
+MAKE_JUNIT = """
+import shutil, sys
+shutil.copyfile(sys.argv[1], sys.argv[2])
+sys.exit(int(sys.argv[3]))
+"""
+
+
+def acc_with_command(tmp_path, cases, listed, code, **kw):
+    """The JUnit file does not exist until the command after `--` has run and written it."""
+    prepared = write_text(tmp_path / "prepared.xml", junit_xml([(t.split("::")[0], t.split("::")[1], s) for t, s in cases]))
+    script = write_script(tmp_path / "make_junit.py", MAKE_JUNIT)
+    junit = tmp_path / "junit.xml"
+    assert not junit.exists()
+    cmd = [sys.executable, script, prepared, junit, code]
+    return acc(tmp_path, None, listed, raw_junit=None, command=cmd, **kw)
+
+
+@pytest.mark.req("A-9")
+def test_a9_the_command_runs_first_and_its_exit_code_is_recorded(tmp_path):
+    res, d, _ = acc_with_command(tmp_path, [(T1, "pass")], [], 0)
+    assert_rc(res, 0)
+    assert d["test_command_exit_code"] == 0 and type(d["test_command_exit_code"]) is int
+    assert d["ok"] is True
+
+
+@pytest.mark.req("A-9", "A-1")
+def test_a9_a_listed_failure_makes_pytest_exit_1_and_must_not_turn_the_check_red(tmp_path):
+    res, d, _ = acc_with_command(tmp_path, [(T1, "fail"), (T2, "pass")], [f"{T1} PUB-01"], 1)
+    assert_rc(res, 0)
+    assert d["test_command_exit_code"] == 1
+    assert d["ok"] is True and d["listed_failing"] == [T1] and d["reason_codes"] == []
+
+
+@pytest.mark.req("A-9", "A-1")
+def test_a9_an_unlisted_failure_still_fails_through_the_junit_not_through_the_exit_code(tmp_path):
+    res, d, _ = acc_with_command(tmp_path, [(T1, "fail")], [], 1)
+    assert_rc(res, 1)
+    assert d["test_command_exit_code"] == 1
+    assert "FAILING_NOT_LISTED" in d["reason_codes"] and "TEST_COMMAND_ERROR" not in d["reason_codes"]
+
+
+@pytest.mark.req("A-9")
+def test_a9_exit_code_5_no_tests_collected_is_accepted_as_the_commands_own_code(tmp_path):
+    res, d, _ = acc_with_command(tmp_path, [(T1, "pass")], [], 5)
+    assert_rc(res, 0)
+    assert d["test_command_exit_code"] == 5 and "TEST_COMMAND_ERROR" not in d["reason_codes"]
+
+
+@pytest.mark.req("A-9")
+@pytest.mark.parametrize("code", [2, 3, 4, 6, 124, 127, 255])
+def test_a9_any_other_exit_code_fails_the_check_even_when_the_junit_looks_fine(tmp_path, code):
+    res, d, _ = acc_with_command(tmp_path, [(T1, "pass")], [], code)
+    assert_rc(res, 1)
+    assert_no_traceback(res)
+    assert d["test_command_exit_code"] == code
+    assert "TEST_COMMAND_ERROR" in d["reason_codes"] and d["ok"] is False
+
+
+@pytest.mark.req("A-10")
+def test_a10_gate_require_empty_acts_as_the_flag(tmp_path):
+    res, d, _ = acc(tmp_path, [(T1, "fail")], [f"{T1} PUB-01"], env_extra={"GATE_REQUIRE_EMPTY": "1"})
+    assert_rc(res, 1)
+    assert "LIST_NOT_EMPTY" in d["reason_codes"] and d["ok"] is False
+
+
+@pytest.mark.req("A-10")
+@pytest.mark.parametrize("env_extra", [None, {"GATE_REQUIRE_EMPTY": "0"}, {"GATE_REQUIRE_EMPTY": ""}],
+                         ids=["unset", "zero", "empty"])
+def test_a10_control_without_the_variable_set_to_1_a_non_empty_list_is_allowed(tmp_path, env_extra):
+    res, d, _ = acc(tmp_path, [(T1, "fail")], [f"{T1} PUB-01"], env_extra=env_extra)
+    assert_rc(res, 0)
+    assert d["ok"] is True
+
+
+@pytest.mark.req("A-10")
+def test_a10_gate_require_empty_with_an_empty_list_passes(tmp_path):
+    res, d, _ = acc(tmp_path, [(T1, "pass")], [], env_extra={"GATE_REQUIRE_EMPTY": "1"})
+    assert_rc(res, 0)
+    assert d["ok"] is True

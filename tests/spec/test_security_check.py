@@ -1,11 +1,12 @@
-"""gate.security_check: rules S-1 to S-6."""
+"""gate.security_check: rules S-1 to S-7."""
 from __future__ import annotations
 
 import json
 
 import pytest
 
-from gatekit import Repo, assert_no_traceback, assert_rc, assert_refused, load_out, run_gate, write_json, write_text
+from gatekit import (Repo, assert_no_traceback, assert_rc, assert_refused, load_out, run_gate, write_json,
+                     write_script, write_text)
 
 EMPTY_BANDIT = {"errors": [], "metrics": {}, "results": []}
 EMPTY_PIP = {"dependencies": [], "fixes": []}
@@ -266,3 +267,70 @@ def test_usage_error_exits_2(tmp_path):
     out = tmp_path / "o.json"
     res = run_gate("security_check", "--out", out, cwd=tmp_path)
     assert_refused(res, 2, out)
+
+
+# ----------------------------------------------------------------------------- S-7
+
+MK_TOOL = """
+import shutil, sys
+shutil.copyfile(sys.argv[1], sys.argv[2])
+sys.exit(int(sys.argv[3]))
+"""
+
+
+def sec_tools(tmp_path, tools):
+    """tools: list of (prepared content, output file name, exit code). Each is run through --tool-command; the
+    tool's own output file does not exist until its command has written it."""
+    import sys as _sys
+
+    repo, base, head = make_repo(tmp_path)
+    script = write_script(tmp_path / "mk_tool.py", MK_TOOL)
+    out = tmp_path / "security.json"
+    args = []
+    flags = {"bandit.json": "--bandit", "pip-audit.json": "--pip-audit", "gitleaks.json": "--gitleaks"}
+    by_name = {name: (content, code) for content, name, code in tools}
+    for i, (name, flag) in enumerate(flags.items()):
+        target = tmp_path / name
+        assert not target.exists()
+        if name in by_name:
+            content, code = by_name[name]
+            prepared = write_json(tmp_path / f"prepared-{i}.json", content)
+            args += ["--tool-command", json.dumps([_sys.executable, str(script), str(prepared), str(target), str(code)])]
+        args += [flag, target]   # a tool without a command has no output file: S-4 applies to it
+    res = run_gate("security_check", *args, "--review", tmp_path / "none.md", "--repo", repo.path, "--base", base,
+                   "--head", head, "--out", out, cwd=tmp_path)
+    return res, load_out(res, out)
+
+
+def exit_codes(d):
+    got = d["tool_exit_codes"]
+    return list(got.values()) if isinstance(got, dict) else list(got)
+
+
+@pytest.mark.req("S-7")
+def test_s7_a_tool_that_finds_nothing_but_exits_non_zero_does_not_decide_only_its_output_does(tmp_path):
+    res, d = sec_tools(tmp_path, [(EMPTY_BANDIT, "bandit.json", 1), (EMPTY_PIP, "pip-audit.json", 0),
+                                  (EMPTY_LEAKS, "gitleaks.json", 1)])
+    assert_rc(res, 0)
+    assert_no_traceback(res)
+    assert d["ok"] is True and d["reason_codes"] == []
+    assert exit_codes(d) == [1, 0, 1] or sorted(exit_codes(d)) == [0, 1, 1], "each tool's exit code is recorded"
+
+
+@pytest.mark.req("S-7", "S-3")
+def test_s7_a_tool_that_finds_something_is_judged_by_its_output(tmp_path):
+    res, d = sec_tools(tmp_path, [(BANDIT_ONE, "bandit.json", 1), (EMPTY_PIP, "pip-audit.json", 0),
+                                  (EMPTY_LEAKS, "gitleaks.json", 0)])
+    assert_rc(res, 1)
+    assert "UNREVIEWED_FINDING" in d["reason_codes"]
+    assert finding(d, "bandit", "B608")[0]["path"] == "workflow/store.py"
+    assert 1 in exit_codes(d)
+
+
+@pytest.mark.req("S-7")
+def test_s7_the_flag_is_repeatable_and_the_tool_runs_before_its_output_is_read(tmp_path):
+    res, d = sec_tools(tmp_path, [(EMPTY_BANDIT, "bandit.json", 0), (EMPTY_PIP, "pip-audit.json", 0)])
+    # the gitleaks output was never produced, so S-4 still applies to it, but the other two were read after their commands ran
+    assert_rc(res, 1)
+    assert d["reason_codes"].count("MISSING_TOOL_OUTPUT") >= 1
+    assert len(exit_codes(d)) == 2

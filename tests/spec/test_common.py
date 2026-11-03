@@ -11,7 +11,7 @@ from gatekit import (Repo, assert_no_traceback, assert_rc, assert_refused, base_
                      write_text)
 
 MODULES = ["env_check", "run_checks", "acceptance", "guard", "security_check", "concurrency_harness", "report",
-           "archive", "feedback", "review_local"]
+           "archive", "feedback", "review_local", "publish", "reproduce"]
 
 
 # ----------------------------------------------------------------------------- C-1
@@ -119,8 +119,15 @@ def scenario_archive(tmp):
                        "--out", tmp / "o.json"], base_env(), 0
 
 
+def scenario_reproduce(tmp):
+    repo = Repo(tmp / "app")
+    repo.write("a.py", "x = 1\n")
+    sha = repo.commit("app")
+    return "reproduce", ["--repo", repo.path, "--sha", sha, "--out", tmp / "rerun"], base_env(), 2  # no evidence is stored
+
+
 SCENARIOS = [scenario_acceptance, scenario_env_check, scenario_run_checks, scenario_security_check,
-             scenario_concurrency, scenario_feedback, scenario_guard, scenario_archive]
+             scenario_concurrency, scenario_feedback, scenario_guard, scenario_archive, scenario_reproduce]
 
 
 @pytest.mark.req("C-6")

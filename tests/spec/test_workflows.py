@@ -8,7 +8,8 @@ import yaml
 
 from gatekit import GATE_ROOT
 
-WORKFLOWS = ["judge", "executor", "spec-tests", "feedback"]
+WORKFLOWS = ["judge", "executor", "spec-tests", "feedback"]       # the four reusable workflows (Y-1)
+ALL_WORKFLOWS = WORKFLOWS + ["self-test"]                           # self-test.yml is not workflow_call (Y-13)
 MANDATORY_STEPS = ["gate/env", "gate/guard", "gate/tests", "gate/acceptance", "gate/security"]
 SHA40 = re.compile(r"[0-9a-f]{40}")
 
@@ -66,7 +67,7 @@ def walk(node):
 
 def all_uses():
     found = []
-    for name in WORKFLOWS:
+    for name in ALL_WORKFLOWS:
         for job_id, job in jobs(load(name)).items():
             if "uses" in job:
                 found.append((name, job_id, str(job["uses"])))
@@ -102,7 +103,7 @@ def test_y1_each_workflow_is_on_workflow_call_only(name):
 
 
 @pytest.mark.req("Y-1")
-@pytest.mark.parametrize("name", WORKFLOWS)
+@pytest.mark.parametrize("name", ALL_WORKFLOWS)
 def test_y1_runners_are_exactly_ubuntu_24_04(name):
     found = 0
     for job_id, job in jobs(load(name)).items():
@@ -152,7 +153,7 @@ def test_y3_judge_permissions_are_exactly_the_documented_ones():
 
 
 @pytest.mark.req("Y-4")
-@pytest.mark.parametrize("name", WORKFLOWS)
+@pytest.mark.parametrize("name", ALL_WORKFLOWS)
 def test_y4_no_actions_write_and_no_write_all(name):
     wf = load(name)
     for where, perms in permission_blocks(wf):
@@ -261,7 +262,7 @@ def test_y7_the_run_job_does_not_run_for_a_fork():
 
 
 @pytest.mark.req("Y-8")
-@pytest.mark.parametrize("name", WORKFLOWS)
+@pytest.mark.parametrize("name", ALL_WORKFLOWS)
 def test_y8_no_run_script_holds_event_or_inputs_expressions(name):
     wf = load(name)
     scripts = [st["run"] for job in jobs(wf).values() for st in steps(job) if "run" in st]
@@ -379,3 +380,98 @@ def test_y12_the_decision_job_comes_first_and_the_executor_runs_only_when_it_say
         cond = str(job.get("if", ""))
         assert "act" in cond and decision_id in cond, f"{jid}: its `if:` must test the decision's `act` output: {cond!r}"
     assert jobs(wf)[decision_id].get("outputs"), "the decision job must publish its decision (`act`) as an output"
+
+
+@pytest.mark.req("Y-1")
+def test_y1_every_workflow_file_in_the_folder_runs_on_ubuntu_24_04_and_the_five_exist():
+    folder = GATE_ROOT / ".github" / "workflows"
+    files = sorted([*folder.glob("*.yml"), *folder.glob("*.yaml")])
+    assert {f.stem for f in files} >= set(ALL_WORKFLOWS), f"expected at least {ALL_WORKFLOWS}, found {[f.name for f in files]}"
+    for f in files:
+        wf = yaml.safe_load(f.read_text(encoding="utf-8"))
+        for job_id, job in jobs(wf).items():
+            if "uses" not in job:
+                assert job.get("runs-on") == "ubuntu-24.04", f"{f.name} job {job_id}: runs-on is {job.get('runs-on')!r}"
+
+
+# ----------------------------------------------------------------------------- Y-12 permissions, Y-13, Y-14, Y-15
+
+
+@pytest.mark.req("Y-12")
+def test_y12_feedback_permissions_are_contents_read_and_pull_requests_write_and_nothing_more():
+    wf = load("feedback")
+    blocks = permission_blocks(wf)
+    assert blocks, "feedback.yml must declare its permissions"
+    if "permissions" not in wf:
+        for job_id, job in jobs(wf).items():
+            assert "permissions" in job, f"job {job_id} has no permissions of its own and no workflow-level block"
+    allowed = {"contents": "read", "pull-requests": "write"}
+    granted = {}
+    for where, perms in blocks:
+        assert isinstance(perms, dict), f"{where}: permissions must be a mapping, got {perms!r}"
+        for key, value in perms.items():
+            assert allowed.get(key) == value, f"{where}: {key}: {value} is more than contents: read and pull-requests: write"
+            granted[key] = value
+    assert granted == allowed, "both permissions are granted somewhere: the fix round comments on the PR and reads the code"
+
+
+@pytest.mark.req("Y-13")
+def test_y13_self_test_runs_on_push_and_pull_request_with_contents_read_and_no_secrets():
+    wf = load("self-test")
+    assert {"push", "pull_request"} <= set(triggers(wf)), f"triggers: {list(triggers(wf))}"
+    blocks = permission_blocks(wf)
+    assert blocks, "self-test.yml must declare its permissions"
+    if "permissions" not in wf:
+        for job_id, job in jobs(wf).items():
+            assert "permissions" in job, f"job {job_id} has no permissions"
+    for where, perms in blocks:
+        assert perms == {"contents": "read"}, f"{where}: permissions are {perms!r}, not contents: read"
+    for path, _ in walk(wf):
+        assert path[-1] != "secrets", f"a `secrets` key at {'.'.join(map(str, path))}"
+    for text in strings(wf):
+        assert not re.search(r"\bsecrets\.", text), f"self-test.yml refers to secrets.*: {text!r}"
+
+
+@pytest.mark.req("Y-13")
+def test_y13_self_test_runs_make_check_and_actionlint_on_python_given_as_an_exact_version():
+    wf = load("self-test")
+    all_steps = [st for job in jobs(wf).values() for st in steps(job)]
+    scripts = "\n".join(str(st.get("run", "")) for st in all_steps)
+    assert re.search(r"\bmake check\b", scripts), "a step must run `make check`"
+    assert "actionlint" in scripts or any("actionlint" in str(st.get("uses", "")) for st in all_steps), \
+        "a step must run actionlint"
+    setups = [st for st in all_steps if str(st.get("uses", "")).startswith("actions/setup-python@")]
+    assert setups, "Python comes through actions/setup-python"
+    for st in setups:
+        assert re.fullmatch(r"actions/setup-python@[0-9a-f]{40}", str(st["uses"])), f"not a full SHA: {st['uses']}"
+        version = (st.get("with") or {}).get("python-version")
+        assert isinstance(version, str) and re.fullmatch(r"\d+\.\d+\.\d+", version), \
+            f"python-version must be an exact version such as 3.13.7, got {version!r}"
+
+
+@pytest.mark.req("Y-14")
+def test_y14_judge_calls_gate_archive_with_api_repo_and_never_with_remote():
+    wf = load("judge")
+    scripts = [str(st["run"]) for job in jobs(wf).values() for st in steps(job) if "run" in st]
+    archive = [t for t in scripts if "gate.archive" in t]
+    assert archive, "the judge's archive job must call gate.archive"
+    for t in archive:
+        assert "--api-repo" in t, f"gate.archive is called without --api-repo:\n{t}"
+        assert "--remote" not in t, f"gate.archive is called with --remote:\n{t}"
+    assert "--remote" not in text_of("judge")
+
+
+@pytest.mark.req("Y-15")
+def test_y15_executor_passes_its_allowed_bots_input_to_the_action_and_never_allows_every_bot():
+    wf = load("executor")
+    call = triggers(wf)["workflow_call"] or {}
+    inputs = call.get("inputs") or {}
+    assert "allowed-bots" in inputs, f"executor.yml needs an `allowed-bots` input, has {list(inputs)}"
+    default = inputs["allowed-bots"].get("default")
+    assert default is None or "*" not in str(default), "the default must name apps, never *"
+    claude = [st for job in jobs(wf).values() for st in steps(job) if "claude-code-action@" in str(st.get("uses", ""))]
+    assert claude, "executor.yml must run claude-code-action"
+    for st in claude:
+        allowed = str((st.get("with") or {}).get("allowed_bots", ""))
+        assert "inputs.allowed-bots" in allowed, f"allowed_bots is {allowed!r}"
+        assert "*" not in allowed

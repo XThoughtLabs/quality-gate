@@ -675,3 +675,43 @@ def test_usage_error_exits_2_and_writes_nothing(tmp_path):
     assert_refused(res, 2, out / "report.json")
     res = run_gate("report", "no-such-subcommand", cwd=tmp_path)
     assert_refused(res, 2)
+
+
+# ----------------------------------------------------------------------------- V-9
+
+
+@pytest.mark.req("V-9", "V-4")
+def test_v9_a_job_whose_own_env_check_failed_adds_failed_check_and_fails_gate_env(tmp_path):
+    w = world(tmp_path)
+    w.extras = {"env_failures": ["publish"]}
+    o = w.run()
+    done(o, "blocked", "FAILED_CHECK")
+    assert o.verdict["checks"]["gate/env"] == "failure"
+    assert all(o.verdict["checks"][c] == "success" for c in SIX if c != "gate/env"), \
+        "only gate/env is made a failure"
+
+
+@pytest.mark.req("V-9")
+def test_v9_several_jobs_still_give_the_reason_and_the_failure(tmp_path):
+    w = world(tmp_path)
+    w.extras = {"env_failures": ["publish", "archive"]}
+    o = w.run()
+    done(o, "blocked", "FAILED_CHECK")
+    assert o.verdict["checks"]["gate/env"] == "failure"
+
+
+@pytest.mark.req("V-9")
+def test_v9_control_an_empty_list_changes_nothing(tmp_path):
+    w = world(tmp_path)
+    w.extras = {"env_failures": []}
+    o = w.run()
+    done(o, "ready-for-human")
+    assert o.verdict["checks"]["gate/env"] == "success"
+
+
+@pytest.mark.req("V-9", "V-1")
+def test_v9_comes_after_the_contradictions(tmp_path):
+    w = world(tmp_path)
+    w.extras = {"env_failures": ["publish"]}
+    m_head_sha(w)
+    done(w.run(), "blocked", "SHA_MISMATCH")

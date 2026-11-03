@@ -1,4 +1,4 @@
-"""gate.run_checks: rules R-1 to R-8, Q-1, Q-2."""
+"""gate.run_checks: rules R-1 to R-10, Q-1, Q-1a, Q-2."""
 from __future__ import annotations
 
 import json
@@ -8,8 +8,8 @@ from pathlib import Path
 
 import pytest
 
-from gatekit import (assert_no_traceback, assert_rc, assert_refused, junit_xml, make_config, py_cmd, read_json,
-                     run_gate, write_script, write_text)
+from gatekit import (assert_no_traceback, assert_rc, assert_refused, base_env, junit_xml, make_config, py_cmd,
+                     read_json, run_gate, write_script, write_text)
 
 HEADER = "check\tindex\texit_code\tduration_seconds\traw_path\targv_json"
 
@@ -21,6 +21,7 @@ SCRIPTS = {
     "copy.py": "import shutil, sys\nshutil.copyfile(sys.argv[1], sys.argv[2])",
     "argvprint.py": "import sys\nprint('ARG=' + sys.argv[1])",
     "touch.py": "import sys, pathlib\npathlib.Path(sys.argv[1]).write_text('x')",
+    "envprint.py": "import json, os\nprint(json.dumps({k: os.environ.get(k) for k in ('MY_EXTRA', 'FROM_OUTER', 'PYTHONPATH')}))",
 }
 
 
@@ -38,12 +39,13 @@ def script(world, name, *args):
     return py_cmd(world.scripts / name, *args)
 
 
-def run_rc(world, checks, check_id, *, workdir=None, cwd=None, out=None, extra_toml=""):
-    cfg = make_config(world.tmp / "quality.toml", checks=checks, raw_text=extra_toml)
-    args = ["--config", cfg, "--check", check_id, "--out", out or world.out]
+def run_rc(world, checks, check_id, *, workdir=None, cwd=None, out=None, extra_toml="", env_extra=None, flags=(),
+           setup=None):
+    cfg = make_config(world.tmp / "quality.toml", checks=checks, raw_text=extra_toml, setup=setup)
+    args = ["--config", cfg, "--check", check_id, "--out", out or world.out, *flags]
     if workdir:
         args += ["--workdir", workdir]
-    return run_gate("run_checks", *args, cwd=cwd or world.work)
+    return run_gate("run_checks", *args, cwd=cwd or world.work, env=base_env(env_extra))
 
 
 def check(commands, **kw):
@@ -81,7 +83,7 @@ def test_logs_and_rows_for_each_command(world):
         assert len(row) == 6
         assert float(row[3]) >= 0, "duration_seconds is a number"
         assert row[4].replace("\\", "/").endswith(f"raw/gate-tests/{i}.log")
-        assert json.loads(row[5]) == cmds[i] or json.loads(row[5])[0] == cmds[i][0]
+        assert json.loads(row[5]) == cmds[i], "argv_json is the command as configured (R-9)"
 
 
 @pytest.mark.req("R-1")
@@ -349,3 +351,117 @@ def test_commands_run_in_the_workdir_when_given_and_in_the_current_folder_otherw
     assert_rc(res, 0)
     printed = (out2 / "raw" / "gate-tests" / "0.log").read_text(encoding="utf-8").strip()
     assert Path(printed).resolve() == world.work.resolve()
+
+
+# ----------------------------------------------------------------------------- R-9
+
+
+@pytest.mark.req("R-9", "Q-1")
+def test_r9_argv_json_holds_the_command_as_configured_with_its_placeholders(world):
+    cmds = [script(world, "argvprint.py", "{raw}/x.txt"), script(world, "argvprint.py", "--v={env:MY_TRUSTED_VAR}")]
+    res = run_rc(world, {"gate/tests": check(cmds)}, "gate/tests", env_extra={"MY_TRUSTED_VAR": "value-123"})
+    assert_rc(res, 0)
+    r = rows(world.out)
+    assert [json.loads(x[5]) for x in r] == cmds, "the placeholders stay in argv_json so that a rerun records the same text"
+    assert "{raw}" in r[0][5] and "{env:MY_TRUSTED_VAR}" in r[1][5]
+    assert "value-123" not in r[1][5]
+    log = (world.out / "raw" / "gate-tests" / "1.log").read_text(encoding="utf-8")
+    assert "ARG=--v=value-123" in log, "while the command that really ran got the value"
+
+
+# ----------------------------------------------------------------------------- Q-1 {env:NAME} and Q-1a
+
+
+@pytest.mark.req("Q-1")
+def test_q1_env_placeholder_is_replaced_by_the_variable_of_the_trusted_context(world):
+    cmds = [script(world, "argvprint.py", "{env:MY_TRUSTED_VAR}/sub")]
+    res = run_rc(world, {"gate/tests": check(cmds)}, "gate/tests", env_extra={"MY_TRUSTED_VAR": "value-456"})
+    assert_rc(res, 0)
+    assert "ARG=value-456/sub" in (world.out / "raw" / "gate-tests" / "0.log").read_text(encoding="utf-8")
+
+
+@pytest.mark.req("Q-1")
+def test_q1_a_variable_that_is_not_set_exits_2_and_runs_nothing(world):
+    marker = world.tmp / "must-not-exist.txt"
+    cmds = [script(world, "argvprint.py", "{env:SURELY_NOT_SET_VARIABLE_XYZ}"), script(world, "mark.py", marker)]
+    res = run_rc(world, {"gate/tests": check(cmds)}, "gate/tests")
+    assert_refused(res, 2, marker)
+    assert "SURELY_NOT_SET_VARIABLE_XYZ" in res.both, "the message names the variable"
+
+
+@pytest.mark.req("Q-1a")
+def test_q1a_the_env_table_gives_a_checks_commands_more_variables_and_the_gates_pythonpath_never_reaches_them(world):
+    body = check([script(world, "envprint.py")], env={"MY_EXTRA": "value-{raw}", "FROM_OUTER": "{env:OUTER_VAR}"})
+    res = run_rc(world, {"gate/tests": body}, "gate/tests", env_extra={"OUTER_VAR": "outer-123"})
+    assert_rc(res, 0)
+    seen = json.loads((world.out / "raw" / "gate-tests" / "0.log").read_text(encoding="utf-8").strip().splitlines()[-1])
+    raw = (world.out / "raw" / "gate-tests").resolve()
+    assert seen["MY_EXTRA"].startswith("value-") and Path(seen["MY_EXTRA"][len("value-"):]).resolve() == raw
+    assert seen["FROM_OUTER"] == "outer-123"
+    assert seen["PYTHONPATH"] is None, "the gate's own PYTHONPATH must not reach the checks' commands"
+
+
+@pytest.mark.req("Q-1a")
+def test_q1a_the_pythonpath_reaches_a_command_only_when_the_env_table_gives_it(world):
+    body = check([script(world, "envprint.py")], env={"PYTHONPATH": "."})
+    res = run_rc(world, {"gate/tests": body}, "gate/tests")
+    assert_rc(res, 0)
+    seen = json.loads((world.out / "raw" / "gate-tests" / "0.log").read_text(encoding="utf-8").strip().splitlines()[-1])
+    assert seen["PYTHONPATH"] == "."
+
+
+@pytest.mark.req("Q-1a")
+def test_q1a_the_setup_table_is_run_as_the_check_setup_outside_the_fixed_classes(world):
+    # Assumption: [setup] takes `commands` (and `timeout_seconds`) like a check does.
+    setup = {"commands": [script(world, "emit.py", "SETUP-OUT", "SETUP-ERR", 0)], "timeout_seconds": 60}
+    res = run_rc(world, {"gate/tests": check([script(world, "emit.py", "a", "b", 0)])}, "setup", setup=setup)
+    assert_rc(res, 0)
+    assert "SETUP-OUT" in (world.out / "raw" / "setup" / "0.log").read_text(encoding="utf-8")
+    assert [(x[0], x[1], x[2]) for x in rows(world.out)] == [("setup", "0", "0")]
+
+
+@pytest.mark.req("Q-1a", "R-3")
+def test_q1a_a_failing_setup_command_is_reported_like_any_other_check(world):
+    setup = {"commands": [script(world, "emit.py", "a", "b", 4)], "timeout_seconds": 60}
+    res = run_rc(world, {"gate/tests": check([script(world, "emit.py", "a", "b", 0)])}, "setup", setup=setup)
+    assert_rc(res, 4)
+    assert [(x[0], x[2]) for x in rows(world.out)] == [("setup", "4")]
+
+
+# ----------------------------------------------------------------------------- R-10
+
+
+@pytest.mark.req("R-10")
+@pytest.mark.parametrize("cid", ["diag/mypy", "gate/security", "setup"])
+def test_r10_if_configured_a_check_that_is_not_configured_exits_0_and_records_nothing(world, cid):
+    res = run_rc(world, {"gate/tests": check([script(world, "emit.py", "a", "b", 0)])}, cid, flags=["--if-configured"])
+    assert_rc(res, 0)
+    assert_no_traceback(res)
+    tsv = world.out / "exit-codes.tsv"
+    assert not tsv.exists() or rows(world.out) == [], "nothing is recorded"
+    assert not (world.out / "raw" / cid.replace("/", "-")).exists()
+
+
+@pytest.mark.req("R-10")
+def test_r10_control_without_the_flag_a_check_that_is_not_configured_is_not_a_success(world):
+    # Assumption: without the flag, a known check with no configuration is an error, not an empty success.
+    res = run_rc(world, {"gate/tests": check([script(world, "emit.py", "a", "b", 0)])}, "diag/mypy")
+    assert res.rc != 0
+    assert_no_traceback(res)
+    assert "diag/mypy" in res.both, "the refusal names the check that is not configured"
+
+
+@pytest.mark.req("R-10")
+def test_r10_control_a_configured_check_runs_normally_with_the_flag(world):
+    res = run_rc(world, {"gate/tests": check([script(world, "emit.py", "OUT", "ERR", 3)])}, "gate/tests",
+                 flags=["--if-configured"])
+    assert_rc(res, 3)
+    assert [(x[0], x[2]) for x in rows(world.out)] == [("gate/tests", "3")]
+
+
+@pytest.mark.req("R-10", "Q-2")
+def test_r10_the_flag_does_not_excuse_a_refused_configuration(world):
+    marker = world.tmp / "must-not-exist.txt"
+    res = run_rc(world, {"gate/tests": check([script(world, "mark.py", marker)], **{"class": "diagnostic"})},
+                 "gate/tests", flags=["--if-configured"])
+    assert_refused(res, 2, marker)

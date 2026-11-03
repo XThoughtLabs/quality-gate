@@ -185,8 +185,9 @@ class World:
         for name, data in self.tamper_after_sums.items():
             write_bytes(art / name, data)
 
-    def run(self, extra_args=()) -> Outcome:
-        self.build()
+    def run(self, extra_args=(), build=True) -> Outcome:
+        if build:
+            self.build()
         out = self.tmp / "report-out"
         if out.exists():
             shutil.rmtree(out)

@@ -1,4 +1,4 @@
-"""gate.archive store and append: rules W-1 to W-8. The remote is a real local bare repository."""
+"""gate.archive store and append through --remote: rules W-1 to W-8, W-11. The remote is a real local bare repository."""
 from __future__ import annotations
 
 import json
@@ -11,43 +11,10 @@ from pathlib import Path
 
 import pytest
 
+from archivekit import ART, CTX, PUB, RESULT_KEYS, Inputs, folder, make_inputs, sums_of
 from gatekit import (Repo, assert_no_traceback, assert_rc, base_env, branch_files, branch_tip, git, make_bare,
                      load_out, parents_of, push_to, read_json, remote_url, rev_list, run_gate, run_git, sha256_bytes,
                      write_bytes, write_json, write_script, write_text)
-
-CTX = {"repository": "example-org/gate-app", "pr": 7, "run_id": 1001, "run_attempt": 1, "head_sha": "3" * 40}
-ART = {
-    "exit-codes.tsv": b"check\tindex\texit_code\n",
-    "meta.json": b'{"head_sha": "' + b"3" * 40 + b'", "run_id": 1001, "run_attempt": 1}',
-    "SHA256SUMS": b"deadbeef  raw/gate-tests/0.log\n",
-    "raw/gate-tests/0.log": b"line one\r\nline two\n\x00\x01\xff binary tail\n",
-    "guard.json": b'{"head_sha": "' + b"3" * 40 + b'", "repeated_fix": false}',
-    "acceptance.json": b'{"passed": ["acceptance.test_status::test_history"]}',
-}
-PUB = {"report.json": b'{"report": 1}\n', "report.md": b"# Report\n", "verdict.json": b'{"verdict": "ready-for-human"}\n'}
-RESULT_KEYS = {"stored", "sha256sums_match", "path", "commit", "reason", "artifact_present", "skipped_unsafe"}
-
-
-class Inputs:
-    pass
-
-
-def make_inputs(tmp_path, *, artifact=True, artifact_files=None, publish_files=None, tag="in"):
-    inp = Inputs()
-    root = Path(tmp_path) / tag
-    inp.artifact, inp.publish, inp.context = root / "artifact", root / "publish", root / "context.json"
-    inp.art_files = dict(ART if artifact_files is None else artifact_files)
-    inp.pub_files = dict(PUB if publish_files is None else publish_files)
-    if artifact:
-        inp.artifact.mkdir(parents=True, exist_ok=True)
-        for name, data in inp.art_files.items():
-            write_bytes(inp.artifact / name, data)
-    inp.publish.mkdir(parents=True, exist_ok=True)
-    for name, data in inp.pub_files.items():
-        write_bytes(inp.publish / name, data)
-    write_json(inp.context, CTX)
-    inp.has_artifact = artifact
-    return inp
 
 
 @pytest.fixture
@@ -79,19 +46,6 @@ def store(tmp_path, remote, inp, *, out_name="archive-out.json", **kw):
     return res, load_out(res, out)
 
 
-def folder(files, pr=7, run_id=1001, attempt=1):
-    prefix = f"reports/{pr}/{run_id}-{attempt}/"
-    return {p[len(prefix):]: data for p, data in files.items() if p.startswith(prefix)}
-
-
-def sums_of(folder_files):
-    listed = {}
-    for line in folder_files["SHA256SUMS"].decode("utf-8").splitlines():
-        m = re.fullmatch(r"([0-9a-f]{64})  (\S.*)", line)
-        assert m, f"SHA256SUMS line is not '<sha256>  <relative path>': {line!r}"
-        listed[m.group(2)] = m.group(1)
-    return listed
-
 
 # ----------------------------------------------------------------------------- the layout
 
@@ -105,6 +59,7 @@ def test_store_writes_the_documented_layout_and_a_checkable_sha256sums(tmp_path,
     assert RESULT_KEYS <= set(d)
     assert d["stored"] is True and d["sha256sums_match"] is True and d["artifact_present"] is True
     assert d["skipped_unsafe"] == []
+    assert d["actors_ok"] is True, "nothing is wrong with the actors of a plain remote that holds only our commit"
     assert d["path"].replace("\\", "/").strip("/").endswith("reports/7/1001-1")
     assert d["commit"] == branch_tip(remote, "reports")
     f = folder(branch_files(remote, "reports"))
@@ -484,3 +439,58 @@ def test_append_to_an_existing_file_is_refused_and_changes_nothing(tmp_path, rem
     assert_no_traceback(res)
     assert d["stored"] is False and d["reason"] == "ALREADY_EXISTS"
     assert branch_tip(remote, "reports") == tip and branch_files(remote, "reports") == files
+
+
+# ----------------------------------------------------------------------------- W-11 and the choice of target
+
+GITHUB_REMOTES = [
+    "https://github.com/example-org/example-app.git",
+    "https://github.com/example-org/example-app",
+    "https://user@github.com/example-org/example-app.git",
+    "http://github.com/example-org/example-app.git",
+    "https://GitHub.com/example-org/example-app.git",
+    "git@github.com:example-org/example-app.git",
+    "ssh://git@github.com/example-org/example-app.git",
+]
+
+
+def no_network_env():
+    """Even if the gate wrongly tried a GitHub remote, git would refuse every transport but a local one."""
+    return base_env({"GIT_ALLOW_PROTOCOL": "file", "HTTPS_PROXY": "http://127.0.0.1:9", "HTTP_PROXY": "http://127.0.0.1:9",
+                     "https_proxy": "http://127.0.0.1:9", "http_proxy": "http://127.0.0.1:9"})
+
+
+@pytest.mark.req("W-11")
+@pytest.mark.parametrize("url", GITHUB_REMOTES)
+def test_w11_a_remote_on_github_exits_2_and_writes_nothing(tmp_path, url):
+    inp = make_inputs(tmp_path)
+    out = tmp_path / "archive-out.json"
+    args = store_args(url, inp, out)
+    args[args.index("--remote") + 1] = url
+    res = run_gate("archive", *args, env=no_network_env(), cwd=tmp_path)
+    assert res.rc == 2, res.describe()
+    assert_no_traceback(res)
+    assert res.both.strip(), "a refusal prints a short message"
+    assert not out.exists()
+
+
+@pytest.mark.req("W-11", "C-2")
+def test_w11_one_target_is_required_and_only_one(tmp_path, remote):
+    inp = make_inputs(tmp_path)
+    out = tmp_path / "archive-out.json"
+    both = store_args(remote, inp, out) + ["--api-repo", "example-org/example-app"]
+    res = run_gate("archive", *both, env=no_network_env(), cwd=tmp_path)
+    assert res.rc == 2, res.describe()
+    neither = [a for a in store_args(remote, inp, out)]
+    i = neither.index("--remote")
+    del neither[i:i + 2]
+    res = run_gate("archive", *neither, env=no_network_env(), cwd=tmp_path)
+    assert res.rc == 2, res.describe()
+    assert branch_tip(remote, "reports") is None and not out.exists()
+
+
+@pytest.mark.req("W-11")
+def test_w11_control_a_local_remote_is_not_refused(tmp_path, remote):
+    res, d = store(tmp_path, remote, make_inputs(tmp_path))
+    assert_rc(res, 0)
+    assert d["stored"] is True

@@ -231,7 +231,7 @@ def _table(name: str, mapping: dict) -> str:
 def make_config(path, *, baseline_sha: str = "a" * 40, integration_branch: str = "candidate/a",
                 environment: dict | None = None, limits: dict | None = None, guard: dict | None = None,
                 feedback: dict | None = None, spec_tests: dict | None = None,
-                checks: dict | None = None, raw_text: str = "") -> Path:
+                checks: dict | None = None, setup: dict | None = None, raw_text: str = "") -> Path:
     parts = [_table("project", {"baseline_sha": baseline_sha, "integration_branch": integration_branch})]
     if environment is not None:
         parts.append(_table("environment", environment))
@@ -242,7 +242,15 @@ def make_config(path, *, baseline_sha: str = "a" * 40, integration_branch: str =
                         {"judge_workflow_path": ".github/workflows/judge.yml", "reviewer_app": "example-reviewer"}))
     parts.append(_table("spec_tests", spec_tests if spec_tests is not None else {"deny_read": ["src/**", "tests/**"]}))
     for cid, body in (checks or {}).items():
-        parts.append(_table(f'checks."{cid}"', body))
+        parts.append(_table(f'checks."{cid}"', {k: v for k, v in body.items() if not isinstance(v, dict)}))
+        for key, sub in body.items():
+            if isinstance(sub, dict):  # for example the optional `env` table of a check
+                parts.append(_table(f'checks."{cid}".{key}', sub))
+    if setup is not None:
+        parts.append(_table("setup", {k: v for k, v in setup.items() if not isinstance(v, dict)}))
+        for key, sub in setup.items():
+            if isinstance(sub, dict):
+                parts.append(_table(f"setup.{key}", sub))
     if raw_text:
         parts.append(raw_text if raw_text.endswith("\n") else raw_text + "\n")
     return write_text(path, "\n".join(parts))
