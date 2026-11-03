@@ -9,6 +9,7 @@ repository. The real files are never changed. Writes the results to a JSON file.
 from __future__ import annotations
 
 import argparse
+import concurrent.futures
 import json
 import os
 import shutil
@@ -20,6 +21,24 @@ from pathlib import Path
 
 ROOT = Path(__file__).resolve().parents[2]
 SKIP = {".git", ".venv", "__pycache__", ".pytest_cache", "reproduce-out"}
+
+# The tests that should notice a broken script. A mutant is judged by these only, so that
+# a mutant left alive costs minutes and not the whole suite; a broader run can only kill more.
+UNIT = "tests/unit/test_unit_scripts.py"
+E2E = "tests/unit/test_unit_end_to_end.py"
+TESTS_FOR = {
+    "GUARD": ["tests/spec/test_guard.py", E2E],
+    "ENV": ["tests/spec/test_env_check.py", UNIT],
+    "RUN": ["tests/spec/test_run_checks.py", "tests/spec/test_common.py", UNIT],
+    "ACC": ["tests/spec/test_acceptance.py", UNIT],
+    "REP": ["tests/spec/test_report_generate.py", "tests/spec/test_report_final_compare.py", "tests/unit/test_unit_archive_api.py", E2E],
+    "COMMON": ["tests/spec/test_report_generate.py", "tests/spec/test_common.py"],
+    "ARC": ["tests/spec/test_archive.py", "tests/unit/test_unit_archive_api.py"],
+    "FB": ["tests/spec/test_feedback.py", UNIT],
+    "REV": ["tests/spec/test_review_local.py"],
+    "HAR": ["tests/spec/test_concurrency_harness.py"],
+    "SEC": ["tests/spec/test_security_check.py"],
+}
 
 # id, file, the exact text, what it becomes, the rule it should break.
 MUTANTS: list[tuple[str, str, str, str, str]] = [
@@ -46,6 +65,7 @@ MUTANTS: list[tuple[str, str, str, str, str]] = [
     ("GUARD-G13-def", "gate/guard.py", 'if not map_id.startswith("DEF-"):', "if False:", "G-13 add without a defect ID"),
     ("GUARD-G13-new", "gate/guard.py", "if function_exists_in_base(git, base, test_id):", "if False:", "G-13 add an old test"),
     ("GUARD-G14", "gate/guard.py", "if test_id not in passes:", "if False:", "G-14 remove without a pass"),
+    ("GUARD-no-ext-diff", "gate/guard.py", '"--no-ext-diff", "--no-textconv")', '"--no-textconv")', "the guard starts an external diff"),
     # env_check: names the broken part, per role, never a value
     ("ENV-E1", "gate/env_check.py", 'items.append(Item("secret:EXECUTOR_APP_PRIVATE_KEY", False, "missing or empty"))', 'items.append(Item("secret:EXECUTOR_APP_PRIVATE_KEY", True))', "E-1 missing key"),
     ("ENV-E1-pem", "gate/env_check.py", 'items.append(Item("secret:EXECUTOR_APP_PRIVATE_KEY", False, "has no PEM header line"))', 'items.append(Item("secret:EXECUTOR_APP_PRIVATE_KEY", True))', "E-1 malformed key"),
@@ -113,7 +133,7 @@ MUTANTS: list[tuple[str, str, str, str, str]] = [
     ("FB-pr", "gate/feedback.py", 'if pull is None or (event_name == "issue_comment" and pull.get("number") != pr):', "if pull is None:", "R: the marker's SHA on another PR"),
     ("FB-silent", "gate/feedback.py", '"post": code not in SILENT,', '"post": True,', "R: the gate answers every comment"),
     ("FB-path", "gate/feedback.py", 'if run.get("path") != feedback.get("judge_workflow_path") or run.get("event") != "pull_request_target":', "if False:", "the expected workflow"),
-    ("FB-mention", "gate/common.py", 'MENTION = "`@claude`"', 'MENTION = "@claude"', "C-5 a bare mention of the executor"),
+    ("COMMON-C5", "gate/common.py", 'MENTION = "`@claude`"', 'MENTION = "@claude"', "C-5 a bare mention of the executor"),
     # review_local
     ("REV-L1", "gate/review_local.py", 'if not name.startswith("REVIEWER_")', "if True", "L-1 the key's path reaches the model"),
     ("REV-R-marker", "gate/review_local.py", 'f"<!-- gate-review sha={sha} verdict={answer[\'verdict\']} -->",', '"",', "R: no marker in the comment"),
@@ -140,6 +160,7 @@ def run_mutant(mutant: tuple[str, str, str, str, str], base: Path) -> dict:
     mutant_id, relative, old, new, rule = mutant
     tree = base / mutant_id
     copy_tree(tree)
+    selection = TESTS_FOR[mutant_id.split("-", 1)[0]]
     target = tree / relative
     source = target.read_text(encoding="utf-8")
     if source.count(old) < 1:
@@ -149,7 +170,7 @@ def run_mutant(mutant: tuple[str, str, str, str, str], base: Path) -> dict:
     started = time.monotonic()
     env = {**os.environ, "GATE_ROOT": str(tree), "PYTHONPATH": str(tree)}
     process = subprocess.run(
-        [sys.executable, "-m", "pytest", "tests", "-x", "-q", "--no-header", "--basetemp", str(base / f"{mutant_id}-t")],
+        [sys.executable, "-m", "pytest", *selection, "-x", "-q", "--no-header", "--basetemp", str(base / f"{mutant_id}-t")],
         cwd=tree,
         env=env,
         capture_output=True,
@@ -174,15 +195,16 @@ def main() -> int:
     parser = argparse.ArgumentParser()
     parser.add_argument("--out", required=True)
     parser.add_argument("--only", default="", help="only mutants whose ID starts with this")
+    parser.add_argument("--jobs", type=int, default=6, help="mutants run at once, each in its own copy")
     args = parser.parse_args()
 
     selected = [mutant for mutant in MUTANTS if mutant[0].startswith(args.only)]
     results = []
     with tempfile.TemporaryDirectory(prefix="gate-mut-", ignore_cleanup_errors=True) as tmp:
-        for mutant in selected:
-            result = run_mutant(mutant, Path(tmp))
-            results.append(result)
-            print(f"{result['id']}: {result['outcome']} {result.get('killed_by', '')}", flush=True)
+        with concurrent.futures.ThreadPoolExecutor(max_workers=args.jobs) as pool:
+            for result in pool.map(lambda mutant: run_mutant(mutant, Path(tmp)), selected):
+                results.append(result)
+                print(f"{result['id']}: {result['outcome']} {result.get('killed_by', '')}", flush=True)
     target = Path(args.out)
     target.parent.mkdir(parents=True, exist_ok=True)
     target.write_text(json.dumps(results, indent=2) + "\n", encoding="utf-8", newline="\n")

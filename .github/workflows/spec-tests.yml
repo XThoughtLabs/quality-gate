@@ -110,7 +110,9 @@ jobs:
           fetch-depth: 1
 
       - name: Remove the paths of spec_tests.deny_read from the working folder
-        run: python -P -m gate.publish hide-paths --config "$GATE_CONFIG_PATH" --repo .
+        run: |
+          # Takes each path of spec_tests.deny_read out of the working folder.
+          python -P -m gate.publish hide-paths --config "$GATE_CONFIG_PATH" --repo .
 
       - name: Build the prompt
         id: prompt

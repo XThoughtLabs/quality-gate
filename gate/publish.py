@@ -89,7 +89,13 @@ def cmd_context(args: argparse.Namespace) -> int:
     context["pr"] = int(context["pr"])
     config = load_config(args.config)
     context["baseline_sha"] = str(config.get("project", {}).get("baseline_sha", ""))
-    context["config_hashes"] = {Path(path).name: sha256_file(Path(path)) for path in args.hash}
+    root = Path(args.hash_root) if args.hash_root else None
+    context["config_hashes"] = {}
+    for given in args.hash:
+        path = root / given if root else Path(given)
+        key = given if root else path.name
+        # A missing file is written down as missing: it is never left out silently.
+        context["config_hashes"][key] = sha256_file(path) if path.is_file() else "missing"
     if os.environ.get("GATE_TRUSTED_SHA"):
         context["trusted_sha"] = os.environ["GATE_TRUSTED_SHA"]
     context["execution_environment"] = {
@@ -304,6 +310,7 @@ def main(argv: list[str] | None = None) -> int:
     context = commands.add_parser("context")
     context.add_argument("--config", required=True)
     context.add_argument("--hash", action="append", default=[])
+    context.add_argument("--hash-root")
     context.add_argument("--out", required=True)
     context.set_defaults(handler=cmd_context)
 

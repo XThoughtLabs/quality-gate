@@ -251,7 +251,7 @@ jobs:
         env:
           GATE_SHA: ${{ job.workflow_sha }}
         run: |
-          "$GATE_PY" -P -m gate.publish context --config "$GATE_CONFIG" --hash "$GATE_CONFIG" --out context.json
+          "$GATE_PY" -P -m gate.publish context --config "$GATE_CONFIG" --hash-root .trusted --hash quality.toml --hash CODEOWNERS --hash .github/workflows/judge.yml --hash .github/workflows/executor.yml --hash .github/workflows/spec-tests.yml --hash .github/workflows/feedback.yml --hash prompts/executor.md --hash prompts/spec-tests.md --hash security-review.md --out context.json
           "$GATE_PY" -P -m gate.publish jobs --run-id "$GATE_RUN_ID" --attempt "$GATE_RUN_ATTEMPT" --out jobs.json
           "$GATE_PY" -P -m gate.publish extras --reports-dir "$GATE_REPORTS_DIR" --pr "$GATE_PR" --integration "$GATE_INTEGRATION_BRANCH" --env-result publish-env.json --out extras.json
           "$GATE_PY" -P -m gate.report generate --context context.json --jobs jobs.json --artifact evidence --config "$GATE_CONFIG" --extras extras.json --out publish-out
@@ -343,7 +343,7 @@ jobs:
           GATE_SHA: ${{ job.workflow_sha }}
         run: |
           folder="reports/$GATE_PR/$GATE_RUN_ID-$GATE_RUN_ATTEMPT"
-          "$GATE_PY" -P -m gate.publish context --config "$GATE_CONFIG" --hash "$GATE_CONFIG" --out context.json
+          "$GATE_PY" -P -m gate.publish context --config "$GATE_CONFIG" --hash-root .trusted --hash quality.toml --hash CODEOWNERS --hash .github/workflows/judge.yml --hash .github/workflows/executor.yml --hash .github/workflows/spec-tests.yml --hash .github/workflows/feedback.yml --hash prompts/executor.md --hash prompts/spec-tests.md --hash security-review.md --out context.json
           "$GATE_PY" -P -m gate.archive store --api-repo "$GATE_REPOSITORY" --branch reports --pr "$GATE_PR" --run-id "$GATE_RUN_ID" --attempt "$GATE_RUN_ATTEMPT" --artifact evidence --publish publish-out --context context.json --out archive-result.json || true
           mkdir -p final
           "$GATE_PY" -P -m gate.report final --verdict publish-out/verdict.json --expect-verdict-sha256 "$GATE_EXPECT_VERDICT" --archive archive-result.json --env-result archive-env.json --out final/final.json

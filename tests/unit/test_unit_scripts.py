@@ -74,6 +74,25 @@ def test_context_holds_every_sha_and_config_hash(gate, tmp_path):
     assert context["execution_environment"] == {"image_os": "ubuntu24", "image_version": "20261101.1.0"}
 
 
+def test_context_hashes_each_configuration_file_and_names_a_missing_one(gate, tmp_path):
+    (tmp_path / "quality.toml").write_text("", encoding="utf-8")
+    (tmp_path / "CODEOWNERS").write_text("* @example\n", encoding="utf-8")
+    out = tmp_path / "context.json"
+    env = gate.env(
+        GATE_REPOSITORY="example/app", GATE_HEAD_REPOSITORY="example/app", GATE_PR="3", GATE_RUN_ID="9", GATE_RUN_ATTEMPT="2",
+        GATE_EVENT="pull_request_target", GATE_BASE_SHA="d" * 40, GATE_HEAD_SHA="e" * 40, GATE_SHA="f" * 40, GATE_HEAD_REF="ai/3-x",
+    )
+    process = gate.run(
+        "publish", "context", "--config", tmp_path / "quality.toml", "--hash-root", tmp_path,
+        "--hash", "quality.toml", "--hash", "CODEOWNERS", "--hash", "prompts/executor.md", "--out", out, env=env,
+    )
+    assert process.returncode == 0, process.stderr
+    hashes = json.loads(out.read_text(encoding="utf-8"))["config_hashes"]
+    assert len(hashes["quality.toml"]) == 64
+    assert len(hashes["CODEOWNERS"]) == 64
+    assert hashes["prompts/executor.md"] == "missing"
+
+
 def test_context_refuses_a_missing_trusted_value(gate, tmp_path):
     config = tmp_path / "quality.toml"
     config.write_text("", encoding="utf-8")
