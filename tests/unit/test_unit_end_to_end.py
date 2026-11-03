@@ -328,8 +328,9 @@ def test_reproduce_finds_a_closed_prs_head_after_its_branch_is_gone(world, short
     assert world.judge(world.run_job())["verdict"] == "ready-for-human"
     world.gate.git(world.remote, "update-ref", "refs/pull/7/head", head)
     world.gate.git(world.remote, "update-ref", "-d", "refs/heads/ai/1-change")
-    # Nothing else in the remote holds that commit now but refs/pull.
-    process = world.gate.run("reproduce", "--repo", world.remote, "--sha", head, "--out", short_tmp / "rerun", env=reproduce_env(world))
+    # Nothing else in the remote holds that commit now but refs/pull. Through file:// a clone
+    # receives only what its refs reach, as from a real server; a plain path copies everything.
+    process = world.gate.run("reproduce", "--repo", world.remote.as_uri(), "--sha", head, "--out", short_tmp / "rerun", env=reproduce_env(world))
     assert process.returncode == 0, process.stdout + process.stderr
 
 
