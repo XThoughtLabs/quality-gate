@@ -133,7 +133,9 @@ def test_kind_a_person_on_spec_slash_cannot_use_the_spec_rules_to_touch_acceptan
 
 # ----------------------------------------------------------------------------- G-1, G-1a, G-1b, G-1c
 
-G1A_NAMES = ["pytest.ini", ".pytest.ini", ".bandit", "bandit.yaml", "bandit.yml", ".gitleaks.toml", ".gitleaksignore"]
+G1A_NAMES = ["pytest.toml", ".pytest.toml", "pytest.ini", ".pytest.ini", ".bandit", "bandit.yaml", "bandit.yml",
+             ".gitleaks.toml", ".gitleaksignore"]
+G1A_ROOT_ONLY = ["pytest.py", "pytest/plugin.py", "_pytest/plugin.py"]   # a file and two folders of the root
 
 
 @pytest.mark.req("G-1a")
@@ -148,7 +150,8 @@ def test_g1a_files_that_control_the_tests_and_the_security_tools_are_protected_i
 
 @pytest.mark.req("G-1a")
 @pytest.mark.parametrize("action", ["changed", "deleted"])
-@pytest.mark.parametrize("path", ["pytest.ini", "sub/.bandit", ".gitleaksignore"])
+@pytest.mark.parametrize("path", ["pytest.ini", "sub/.bandit", ".gitleaksignore", "pytest.toml", "pkg/.pytest.toml",
+                                  "pytest.py", "pytest/plugin.py", "_pytest/plugin.py"])
 def test_g1a_changed_and_deleted_count_too(tmp_path, baseline, path, action):
     case = Case(tmp_path, baseline, base_edits={path: "original\n"})
     case.change({path: "edited\n" if action == "changed" else None})
@@ -157,7 +160,28 @@ def test_g1a_changed_and_deleted_count_too(tmp_path, baseline, path, action):
 
 
 @pytest.mark.req("G-1a")
-@pytest.mark.parametrize("path", ["docs/pytest.ini.md", "src/pytest_ini.py", "bandit.txt", "gitleaks.toml", "src/bandit_notes.md"])
+@pytest.mark.parametrize("path", G1A_ROOT_ONLY)
+def test_g1a_pytest_py_and_the_pytest_folders_are_protected_in_the_root(tmp_path, baseline, path):
+    case = Case(tmp_path, baseline)
+    case.change({path: "x = 1\n"})
+    res, d = case.run()
+    assert_fires(res, d, "PROTECTED_PATH", path)
+
+
+@pytest.mark.req("G-1a")
+@pytest.mark.parametrize("path", ["sub/pytest.py", "sub/pytest/plugin.py", "sub/_pytest/plugin.py",
+                                  "pkg/deep/pytest.py", "tests/pytest/plugin.py"])
+def test_g1a_control_pytest_py_and_the_pytest_folders_are_only_watched_in_the_root(tmp_path, baseline, path):
+    case = Case(tmp_path, baseline)
+    case.change({path: "x = 1\n"})
+    res, d = case.run()
+    assert_clean(res, d)
+
+
+@pytest.mark.req("G-1a")
+@pytest.mark.parametrize("path", ["docs/pytest.ini.md", "src/pytest_ini.py", "bandit.txt", "gitleaks.toml", "src/bandit_notes.md",
+                                  "docs/pytest.toml.md", "pytest_plugin.py", "pytestx/plugin.py", "_pytest_notes.md",
+                                  "src/pytest_toml.py", "pytest.tom"])
 def test_g1a_control_names_that_only_look_alike_are_clean(tmp_path, baseline, path):
     case = Case(tmp_path, baseline)
     case.change({path: "x\n"})
@@ -245,14 +269,65 @@ def test_g1b_control_a_change_to_any_other_section_is_allowed(tmp_path, baseline
     assert_clean(res, d)
 
 
+SUBFOLDER_FILES = {"sub/pyproject.toml": PYPROJECT, "sub/setup.cfg": SETUP_CFG, "sub/tox.ini": TOX_INI}
+
+
 @pytest.mark.req("G-1b")
-@pytest.mark.parametrize("path", ["sub/pyproject.toml", "sub/setup.cfg", "sub/tox.ini"])
-def test_g1b_control_only_the_root_files_are_watched_by_section(tmp_path, baseline, path):
-    original = {"sub/pyproject.toml": PYPROJECT, "sub/setup.cfg": SETUP_CFG, "sub/tox.ini": TOX_INI}[path]
+@pytest.mark.parametrize("path", list(SUBFOLDER_FILES))
+def test_g1b_the_three_files_are_watched_by_section_in_any_folder(tmp_path, baseline, path):
+    # pytest reads these three in every folder from a test's path upwards, so a subfolder's file counts like the root's
+    original = SUBFOLDER_FILES[path]
     changed = original.replace("-q", "-x").replace("fail_under = 90", "fail_under = 95").replace("branch = True", "branch = False")
     assert changed != original
     case = Case(tmp_path, baseline, base_edits={path: original})
     case.change({path: changed})
+    res, d = case.run()
+    assert_fires(res, d, "PROTECTED_PATH", path)
+
+
+SUBFOLDER_OTHER_SECTIONS = {
+    "sub/pyproject.toml": ('name = "example"', 'name = "example-two"'),
+    "sub/setup.cfg": ("name = example", "name = example-two"),
+    "sub/tox.ini": ("note = nothing", "note = something"),
+}
+
+
+@pytest.mark.req("G-1b")
+@pytest.mark.parametrize("path", list(SUBFOLDER_OTHER_SECTIONS))
+def test_g1b_control_another_section_of_the_same_files_in_a_subfolder_stays_allowed(tmp_path, baseline, path):
+    original = SUBFOLDER_FILES[path]
+    old, new = SUBFOLDER_OTHER_SECTIONS[path]
+    case = Case(tmp_path, baseline, base_edits={path: original})
+    case.change({path: sub(original, old, new)})
+    res, d = case.run()
+    assert_clean(res, d)
+
+
+ENTRY_POINTS = '\n[project.entry-points.pytest11]\nexample = "example.plugin"\n'
+WITH_PYTEST11 = PYPROJECT.replace('name = "example"\n', 'name = "example"\n' + ENTRY_POINTS, 1)
+assert WITH_PYTEST11 != PYPROJECT
+
+
+@pytest.mark.req("G-1b")
+@pytest.mark.parametrize("action", ["added", "changed", "removed"])
+@pytest.mark.parametrize("path", ["pyproject.toml", "sub/pyproject.toml"], ids=["root", "subfolder"])
+def test_g1b_the_pytest11_entry_points_section_is_watched(tmp_path, baseline, path, action):
+    # a plugin registered under pytest11 is loaded by every pytest run
+    before = PYPROJECT if action == "added" else WITH_PYTEST11
+    after = {"added": WITH_PYTEST11, "changed": WITH_PYTEST11.replace("example.plugin", "example.other"),
+             "removed": PYPROJECT}[action]
+    case = Case(tmp_path, baseline, base_edits={path: before} if path.startswith("sub/") or action != "added" else None)
+    case.change({path: after})
+    res, d = case.run()
+    assert_fires(res, d, "PROTECTED_PATH", path)
+
+
+@pytest.mark.req("G-1b")
+@pytest.mark.parametrize("section", ["[project.entry-points.other]", "[project.scripts]", "[project.entry-points.console_scripts]"])
+def test_g1b_control_another_entry_points_group_or_scripts_is_allowed(tmp_path, baseline, section):
+    text = PYPROJECT.replace('name = "example"\n', f'name = "example"\n\n{section}\nexample = "example.plugin:main"\n', 1)
+    case = Case(tmp_path, baseline)
+    case.change({"pyproject.toml": text})
     res, d = case.run()
     assert_clean(res, d)
 
