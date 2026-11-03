@@ -1,0 +1,650 @@
+"""Generate the report and the verdict. No model writes or edits any of this.
+
+Trusted inputs (the context, the jobs from the API, the extras) decide the verdict.
+The artifact comes from the job that ran the PR's code, so it is untrusted data: it
+can only move a verdict away from ready, never towards it.
+"""
+
+from __future__ import annotations
+
+import argparse
+import csv
+import datetime
+import io
+import json
+import os
+import platform
+import sys
+from pathlib import Path, PurePosixPath
+from typing import Any
+
+import jsonschema
+
+from gate.common import (
+    DIAGNOSTIC_CHECKS,
+    EXIT_OK,
+    EXIT_RULE_FAILED,
+    FIXED_CLASSES,
+    UsageError,
+    fail_usage,
+    load_config,
+    neutralize,
+    read_json,
+    read_json_or_none,
+    sha256_file,
+    slug,
+    write_json,
+)
+
+READY = "ready-for-human"
+BLOCKED = "blocked"
+NEEDS_HUMAN = "needs-human"
+INCOMPLETE = "incomplete"
+
+RUN_STEPS = ("gate/env", "gate/guard", "gate/tests", "gate/acceptance", "gate/security")
+CONTRADICTIONS = {"FORK_PR", "SHA_MISMATCH", "EXIT_CODE_MISMATCH", "CHECKSUM_MISMATCH", "CLAIM_MISMATCH"}
+GAPS = {"UNFINISHED_STAGE", "NO_ARTIFACT", "MISSING_OUTPUT"}
+CONTEXT_FIELDS = (
+    "repository",
+    "head_repository",
+    "pr",
+    "run_id",
+    "run_attempt",
+    "event",
+    "baseline_sha",
+    "base_sha",
+    "head_sha",
+    "gate_sha",
+    "head_ref",
+    "config_hashes",
+)
+RESOURCES = ("executor_runs", "executor_turns", "codex_runs", "codex_tokens", "actions_minutes")
+VOLATILE_KEYS = {"generated_at", "duration_seconds", "raw_sha256"}
+VOLATILE_PATHS = {
+    "verification.run_id",
+    "verification.run_attempt",
+    "verification.execution_environment",
+    "environment",
+}
+SCHEMA_PATH = Path(__file__).parent / "schema" / "report.schema.json"
+
+
+def conclusion_for(verdict: str) -> str:
+    """Only ready passes. GitHub counts neutral and skipped as success, so neither is ever used."""
+    return "success" if verdict == READY else "failure"
+
+
+def find_run_job(jobs: dict) -> dict | None:
+    for job in jobs.get("jobs", []):
+        name = str(job.get("name", ""))
+        if name == "run" or name.endswith(" / run"):
+            return job
+    return None
+
+
+def read_rows(path: Path) -> list[dict[str, str]] | None:
+    try:
+        text = path.read_text(encoding="utf-8")
+    except (OSError, UnicodeDecodeError):
+        return None
+    reader = csv.DictReader(io.StringIO(text), delimiter="\t", quoting=csv.QUOTE_NONE)
+    if reader.fieldnames is None or "check" not in reader.fieldnames or "exit_code" not in reader.fieldnames:
+        return None
+    return [row for row in reader if row.get("check")]
+
+
+def parse_exit_code(value: Any) -> int | None:
+    text = str(value).strip()
+    if text.lstrip("-").isdigit():
+        return int(text)
+    return None
+
+
+def safe_member(root: Path, relative: str) -> Path | None:
+    """Resolve a path named by the artifact, refusing any that leaves the artifact."""
+    pure = PurePosixPath(relative.replace("\\", "/"))
+    if pure.is_absolute() or ".." in pure.parts or (pure.parts and ":" in pure.parts[0]):
+        return None
+    return root.joinpath(*pure.parts)
+
+
+def read_sums(path: Path) -> list[tuple[str, str]] | None:
+    try:
+        lines = path.read_text(encoding="utf-8").splitlines()
+    except (OSError, UnicodeDecodeError):
+        return None
+    pairs = []
+    for line in lines:
+        if not line.strip():
+            continue
+        digest, _, name = line.partition("  ")
+        if not name:
+            return None
+        pairs.append((digest.strip().lower(), name.strip().lstrip("*")))
+    return pairs
+
+
+def judge(context: dict, jobs: dict, artifact: Path, config: dict, extras: dict) -> tuple[str, list[dict], dict, dict]:
+    """Apply the rules V-1 to V-5. Returns the verdict, reasons, the checks and the facts found."""
+    reasons: list[dict] = []
+
+    def reason(code: str, detail: str) -> None:
+        reasons.append({"code": code, "detail": detail})
+
+    # The trusted facts: which steps ran and how they ended.
+    job = find_run_job(jobs)
+    steps = {str(step.get("name")): step for step in (job or {}).get("steps", [])}
+    step_success: dict[str, bool] = {}
+    if job is None:
+        reason("UNFINISHED_STAGE", "the run job is absent")
+    elif job.get("status") != "completed" or job.get("conclusion") not in ("success", "failure"):
+        reason("UNFINISHED_STAGE", "the run job did not finish")
+    for check in RUN_STEPS:
+        step = steps.get(check)
+        if step is None:
+            reason("UNFINISHED_STAGE", f"the step {check} is absent")
+            step_success[check] = False
+        elif step.get("status") != "completed" or step.get("conclusion") not in ("success", "failure"):
+            reason("UNFINISHED_STAGE", f"the step {check} did not finish")
+            step_success[check] = False
+        else:
+            step_success[check] = step.get("conclusion") == "success"
+
+    if context.get("head_repository") != context.get("repository"):
+        reason("FORK_PR", "the PR comes from a fork; its code was not run")
+
+    # The untrusted facts: what the artifact says.
+    rows_by_check: dict[str, list[dict[str, str]]] = {}
+    meta: Any = None
+    sums: list[tuple[str, str]] | None = None
+    if not artifact.is_dir():
+        reason("NO_ARTIFACT", "the artifact is missing")
+    else:
+        meta = read_json_or_none(artifact / "meta.json")
+        if not isinstance(meta, dict):
+            reason("MISSING_OUTPUT", "meta.json is missing or unreadable")
+            meta = None
+        else:
+            for key, field in (("head_sha", "head_sha"), ("run_id", "run_id"), ("run_attempt", "run_attempt")):
+                if key not in meta:
+                    reason("MISSING_OUTPUT", f"meta.json has no {key}")
+                elif str(meta[key]) != str(context.get(field)):
+                    reason("SHA_MISMATCH", f"meta.json gives another {key} than the trusted context")
+
+        rows = read_rows(artifact / "exit-codes.tsv")
+        if rows is None:
+            reason("MISSING_OUTPUT", "exit-codes.tsv is missing or unreadable")
+        else:
+            for row in rows:
+                rows_by_check.setdefault(row["check"], []).append(row)
+
+        sums = read_sums(artifact / "SHA256SUMS")
+        if sums is None:
+            reason("MISSING_OUTPUT", "SHA256SUMS is missing or unreadable")
+        else:
+            for digest, name in sums:
+                member = safe_member(artifact, name)
+                if member is None:
+                    reason("CHECKSUM_MISMATCH", f"SHA256SUMS names a path outside the artifact: {name}")
+                elif not member.is_file():
+                    reason("MISSING_OUTPUT", f"{name} is named in SHA256SUMS and is missing")
+                elif sha256_file(member) != digest:
+                    reason("CHECKSUM_MISMATCH", f"{name} does not match SHA256SUMS")
+
+        # Cross-check each step's trusted conclusion against its exit codes.
+        if rows is not None:
+            for check in (*RUN_STEPS, *DIAGNOSTIC_CHECKS):
+                check_rows = rows_by_check.get(check)
+                step = steps.get(check)
+                if not check_rows:
+                    if check in RUN_STEPS:
+                        reason("MISSING_OUTPUT", f"{check} has no exit code")
+                    continue
+                codes = [parse_exit_code(row.get("exit_code")) for row in check_rows]
+                if any(code is None for code in codes):
+                    reason("EXIT_CODE_MISMATCH", f"{check} has an exit code that is not an integer")
+                    continue
+                if step is None or step.get("status") != "completed":
+                    continue
+                any_failed = any(code != 0 for code in codes)
+                if step.get("conclusion") == "success" and any_failed:
+                    reason("EXIT_CODE_MISMATCH", f"{check} succeeded with a non-zero exit code")
+                elif step.get("conclusion") == "failure" and not any_failed:
+                    reason("EXIT_CODE_MISMATCH", f"{check} failed with every exit code zero")
+
+    # A claim of ready can only hurt: when a mandatory step failed it is a contradiction.
+    if isinstance(meta, dict) and meta.get("claimed_verdict") == READY:
+        if not all(step_success.get(check) for check in RUN_STEPS):
+            reason("CLAIM_MISMATCH", "the artifact claims ready while a mandatory step did not succeed")
+
+    failed_checks = [
+        check
+        for check in RUN_STEPS
+        if steps.get(check, {}).get("status") == "completed" and steps[check].get("conclusion") == "failure"
+    ]
+    guard = read_json_or_none(artifact / "guard.json") if artifact.is_dir() else None
+    guard = guard if isinstance(guard, dict) else {}
+    if guard.get("repeated_fix") is True:
+        reason("REPEATED_FIX", "this round repeats an earlier round's fix")
+
+    limits = config.get("limits", {})
+    cap = limits.get("max_fix_rounds", 3)
+    heads = {str(item.get("head_sha")) for item in extras.get("rounds", []) if isinstance(item, dict)}
+    heads.add(str(context.get("head_sha")))
+    if failed_checks and len(heads) - 1 >= cap:
+        reason("ROUND_CAP", f"{len(heads) - 1} fix rounds were used; the cap is {cap}")
+
+    for check in failed_checks:
+        reason("FAILED_CHECK", f"{check} failed")
+    env_failures = extras.get("env_failures", [])
+    for role in env_failures if isinstance(env_failures, list) else []:
+        reason("FAILED_CHECK", f"gate/env failed in the {role} job")
+
+    codes = {item["code"] for item in reasons}
+    if codes & CONTRADICTIONS:
+        verdict = BLOCKED
+    elif codes & GAPS:
+        verdict = INCOMPLETE
+    elif codes & {"REPEATED_FIX", "ROUND_CAP"}:
+        verdict = NEEDS_HUMAN
+    elif "FAILED_CHECK" in codes:
+        verdict = BLOCKED
+    else:
+        verdict = READY
+
+    checks: dict[str, str] = {}
+    for check in RUN_STEPS:
+        check_rows = rows_by_check.get(check, [])
+        codes_for = [parse_exit_code(row.get("exit_code")) for row in check_rows]
+        passed = bool(step_success.get(check)) and bool(check_rows) and all(code == 0 for code in codes_for)
+        checks[check] = "success" if passed else "failure"
+    if env_failures:
+        checks["gate/env"] = "failure"
+    checks["gate/report"] = "failure" if codes & GAPS else "success"
+
+    facts = {"steps": steps, "rows": rows_by_check, "guard": guard, "sums": sums}
+    return verdict, reasons, checks, facts
+
+
+def build_checks(artifact: Path, facts: dict) -> list[dict]:
+    steps = facts["steps"]
+    rows_by_check = facts["rows"]
+    entries = []
+    for check in (*RUN_STEPS, *DIAGNOSTIC_CHECKS):
+        step = steps.get(check)
+        commands = []
+        for row in rows_by_check.get(check, []):
+            raw_path = str(row.get("raw_path") or "")
+            member = safe_member(artifact, raw_path) if raw_path else None
+            digest = sha256_file(member) if member is not None and member.is_file() else None
+            code = parse_exit_code(row.get("exit_code"))
+            duration: Any = row.get("duration_seconds")
+            try:
+                duration = float(duration)
+            except (TypeError, ValueError):
+                duration = "unknown"
+            try:
+                argv = json.loads(row.get("argv_json") or "[]")
+                argv = [str(part) for part in argv] if isinstance(argv, list) else []
+            except ValueError:
+                argv = []
+            commands.append(
+                {
+                    "argv": argv,
+                    "exit_code": code if code is not None else str(row.get("exit_code")),
+                    "duration_seconds": duration,
+                    "raw_path": raw_path,
+                    "raw_sha256": digest,
+                }
+            )
+        counts = read_json_or_none(artifact / "raw" / slug(check) / "counts.json") if artifact.is_dir() else None
+        entries.append(
+            {
+                "id": check,
+                "class": FIXED_CLASSES[check],
+                "conclusion": str(step.get("conclusion")) if step else "not-run",
+                "commands": commands,
+                "counts": counts if isinstance(counts, dict) else None,
+            }
+        )
+    return entries
+
+
+def bypass_merges(merges: list[Any]) -> list[dict]:
+    flagged = []
+    for merge in merges:
+        if not isinstance(merge, dict):
+            continue
+        if merge.get("via_pr") is not True or not merge.get("approvals") or merge.get("final_conclusion") != "success":
+            flagged.append(merge)
+    return flagged
+
+
+def build_report(
+    context: dict, artifact: Path, extras: dict, verdict: str, reasons: list[dict], facts: dict
+) -> dict:
+    def artifact_json(*parts: str) -> Any:
+        return read_json_or_none(artifact.joinpath(*parts)) if artifact.is_dir() else None
+
+    def object_or_unknown(value: Any) -> Any:
+        return value if isinstance(value, dict) else "unknown"
+
+    guard = facts["guard"]
+    findings: list[dict] = []
+    for violation in guard.get("violations", []) if isinstance(guard.get("violations"), list) else []:
+        if isinstance(violation, dict):
+            findings.append({"tool": "guard", **violation})
+    security = artifact_json("raw", "gate-security", "security.json")
+    if isinstance(security, dict) and isinstance(security.get("findings"), list):
+        findings += [item for item in security["findings"] if isinstance(item, dict)]
+
+    acceptance = artifact_json("acceptance.json")
+    known_failing: Any = "unknown"
+    if (
+        isinstance(acceptance, dict)
+        and isinstance(acceptance.get("list_size"), int)
+        and isinstance(acceptance.get("remove_from_list"), list)
+    ):
+        known_failing = {
+            "size": acceptance["list_size"],
+            "remove_from_list": [str(item) for item in acceptance["remove_from_list"]],
+        }
+
+    given = extras.get("resources", {}) if isinstance(extras.get("resources"), dict) else {}
+    resources = {name: given.get(name, "unknown") for name in RESOURCES}
+
+    human_entries = extras.get("human")
+    if isinstance(human_entries, list):
+        human: dict[str, Any] = {
+            "interventions": len(human_entries),
+            "minutes": sum(item.get("minutes", 0) for item in human_entries if isinstance(item, dict)),
+        }
+    else:
+        human = {"interventions": "unknown", "minutes": "unknown"}
+
+    rounds = extras.get("rounds")
+    if not isinstance(rounds, list):
+        rounds = []
+    dependency_changes = guard.get("dependency_changes")
+
+    return {
+        "verification": {
+            **{field: context.get(field) for field in CONTEXT_FIELDS},
+            "execution_environment": context.get("execution_environment", "unknown"),
+        },
+        "environment": object_or_unknown(artifact_json("environment.json")),
+        "checks": build_checks(artifact, facts),
+        "coverage": object_or_unknown(artifact_json("raw", "diag-coverage", "summary.json")),
+        "mutation": object_or_unknown(artifact_json("raw", "diag-mutation", "summary.json")),
+        "dependency_changes": dependency_changes if isinstance(dependency_changes, list) else [],
+        "findings": findings,
+        "rounds": rounds,
+        "resources": resources,
+        "human": human,
+        "bypass_merges": bypass_merges(extras.get("merges", []) if isinstance(extras.get("merges"), list) else []),
+        "known_failing": known_failing,
+        "verdicts": {"preliminary": verdict, "final": None, "reasons": reasons},
+        "semi_automatic_steps": extras.get("semi_automatic_steps", [])
+        if isinstance(extras.get("semi_automatic_steps"), list)
+        else [],
+        "generated_at": datetime.datetime.now(datetime.UTC).isoformat(timespec="seconds"),
+    }
+
+
+def cell(value: Any) -> str:
+    return neutralize(value).replace("|", "\\|").replace("\n", " ")
+
+
+def render_markdown(report: dict) -> str:
+    """Render the Markdown from the JSON only."""
+    verification = report["verification"]
+    lines = [
+        "# Quality gate report",
+        "",
+        f"**Preliminary verdict: {cell(report['verdicts']['preliminary'])}**",
+        "",
+        "## Verification record",
+        "",
+        "| Field | Value |",
+        "|---|---|",
+    ]
+    for field in CONTEXT_FIELDS:
+        if field != "config_hashes":
+            lines.append(f"| {field} | {cell(verification.get(field))} |")
+    for path, digest in sorted((verification.get("config_hashes") or {}).items()):
+        lines.append(f"| config {cell(path)} | {cell(digest)} |")
+
+    lines += ["", "## Reasons", ""]
+    reasons = report["verdicts"]["reasons"]
+    lines += [f"- {cell(item['code'])}: {cell(item['detail'])}" for item in reasons] or ["None."]
+
+    lines += ["", "## Checks", "", "| Check | Class | Conclusion | Exit codes |", "|---|---|---|---|"]
+    for check in report["checks"]:
+        codes = ", ".join(cell(command["exit_code"]) for command in check["commands"]) or "none"
+        lines.append(f"| {cell(check['id'])} | {cell(check['class'])} | {cell(check['conclusion'])} | {codes} |")
+
+    known = report["known_failing"]
+    lines += ["", "## Known-failing list", ""]
+    if isinstance(known, dict):
+        lines.append(f"Size: {known['size']}.")
+        lines += [f"- remove from list: {cell(test)}" for test in known["remove_from_list"]]
+    else:
+        lines.append("Size: unknown.")
+
+    lines += ["", "## Findings", ""]
+    lines += [
+        f"- {cell(item.get('tool', ''))} {cell(item.get('rule', ''))} {cell(item.get('path', ''))} {cell(item.get('detail', ''))}".rstrip()
+        for item in report["findings"]
+    ] or ["None."]
+
+    lines += ["", "## Dependency changes", ""]
+    lines += [
+        f"- {cell(item.get('name'))}: {cell(item.get('old'))} to {cell(item.get('new'))} ({cell(item.get('changelog'))})"
+        for item in report["dependency_changes"]
+        if isinstance(item, dict)
+    ] or ["None."]
+
+    lines += ["", "## Bypass merges", ""]
+    lines += [
+        f"- PR {cell(item.get('pr'))}, merge {cell(item.get('merge_sha'))}, by {cell(item.get('merged_by'))}"
+        for item in report["bypass_merges"]
+    ] or ["None."]
+
+    lines += ["", "## Resources", ""]
+    lines += [f"- {name}: {cell(value)}" for name, value in report["resources"].items()]
+    lines += [
+        f"- human interventions: {cell(report['human']['interventions'])}",
+        f"- human minutes: {cell(report['human']['minutes'])}",
+    ]
+    lines += ["", "## Semi-automatic steps", ""]
+    lines += [f"- {cell(step)}" for step in report["semi_automatic_steps"]] or ["None."]
+    lines += ["", "This report was generated by a script. No model wrote or edited it.", ""]
+    return "\n".join(lines)
+
+
+def load_trusted(path: str, label: str) -> dict:
+    try:
+        data = read_json(path)
+    except (OSError, ValueError) as error:
+        raise UsageError(f"cannot read {label}") from error
+    if not isinstance(data, dict):
+        raise UsageError(f"{label} must be a JSON object")
+    return data
+
+
+def cmd_generate(args: argparse.Namespace) -> int:
+    context = load_trusted(args.context, "the context")
+    missing = [field for field in CONTEXT_FIELDS if field not in context]
+    if missing:
+        raise UsageError("the context lacks: " + ", ".join(missing))
+    jobs = load_trusted(args.jobs, "the jobs")
+    extras = load_trusted(args.extras, "the extras") if args.extras else {}
+    config = load_config(args.config)
+    artifact = Path(args.artifact)
+
+    verdict, reasons, checks, facts = judge(context, jobs, artifact, config, extras)
+    report = build_report(context, artifact, extras, verdict, reasons, facts)
+    jsonschema.validate(report, json.loads(SCHEMA_PATH.read_text(encoding="utf-8")))
+
+    out = Path(args.out)
+    write_json(out / "report.json", report)
+    (out / "report.md").write_text(render_markdown(report), encoding="utf-8", newline="\n")
+    write_json(out / "verdict.json", {"verdict": verdict, "reasons": reasons, "checks": checks})
+    print(f"preliminary verdict: {verdict}")
+    return EXIT_OK
+
+
+def cmd_final(args: argparse.Namespace) -> int:
+    preliminary = read_json_or_none(args.verdict)
+    extra_reasons = []
+    if not isinstance(preliminary, dict):
+        preliminary = {"verdict": INCOMPLETE, "reasons": []}
+        extra_reasons.append({"code": "NO_PRELIMINARY", "detail": "the preliminary verdict is missing or unreadable"})
+    elif args.expect_verdict_sha256 is not None and sha256_file(Path(args.verdict)) != args.expect_verdict_sha256:
+        preliminary = {"verdict": BLOCKED, "reasons": []}
+        extra_reasons.append({"code": "PUBLISH_OUTPUT_MISMATCH", "detail": "the verdict differs from what the publish job computed"})
+    if args.env_result:
+        environment = read_json_or_none(args.env_result)
+        if not (isinstance(environment, dict) and environment.get("ok") is True):
+            extra_reasons.append({"code": "FAILED_CHECK", "detail": "gate/env failed in the archive job"})
+            if preliminary.get("verdict") == READY:
+                preliminary = {**preliminary, "verdict": BLOCKED}
+    archive = read_json_or_none(args.archive)
+    verdict = preliminary.get("verdict")
+    reasons = [*preliminary.get("reasons", []), *extra_reasons]
+    stored = (
+        isinstance(archive, dict) and archive.get("stored") is True and archive.get("sha256sums_match") is True
+    )
+    actors_ok = not isinstance(archive, dict) or archive.get("actors_ok") is not False
+    own_checks = preliminary.get("checks")
+    if verdict == READY and isinstance(own_checks, dict) and any(value != "success" for value in own_checks.values()):
+        verdict = BLOCKED
+        reasons.append({"code": "FAILED_CHECK", "detail": "the preliminary verdict lists a check that did not succeed"})
+    if not stored:
+        reasons.append({"code": "EVIDENCE_NOT_STORED", "detail": "evidence not stored"})
+        if verdict == READY:
+            verdict = INCOMPLETE
+    if not actors_ok:
+        reasons.append({"code": "REPORTS_WRITTEN_BY_ANOTHER_ACTOR", "detail": str(archive.get("reason"))})
+        if verdict == READY:
+            verdict = BLOCKED
+    if verdict not in (READY, BLOCKED, NEEDS_HUMAN, INCOMPLETE):
+        verdict = INCOMPLETE
+        reasons.append({"code": "UNKNOWN_VERDICT", "detail": "the preliminary verdict is not known"})
+    write_json(
+        args.out,
+        {
+            "verdict": verdict,
+            "reasons": reasons,
+            "conclusions": {
+                "gate/archive": "success" if stored and actors_ok else "failure",
+                "gate/final": conclusion_for(verdict),
+            },
+        },
+    )
+    print(f"final verdict: {verdict}")
+    return EXIT_OK
+
+
+def differences(left: Any, right: Any, path: str = "") -> list[str]:
+    if isinstance(left, dict) and isinstance(right, dict):
+        found: list[str] = []
+        for key in sorted(set(left) | set(right)):
+            child = f"{path}.{key}" if path else str(key)
+            if key in VOLATILE_KEYS or child in VOLATILE_PATHS:
+                continue
+            if key not in left or key not in right:
+                found.append(child)
+            else:
+                found += differences(left[key], right[key], child)
+        return found
+    if isinstance(left, list) and isinstance(right, list):
+        if len(left) != len(right):
+            return [path]
+        found = []
+        for index, (a, b) in enumerate(zip(left, right)):
+            found += differences(a, b, f"{path}[{index}]")
+        return found
+    return [] if left == right else [path]
+
+
+def cmd_compare(args: argparse.Namespace) -> int:
+    found = differences(load_trusted(args.first, "the first report"), load_trusted(args.second, "the second report"))
+    for path in found:
+        print(f"differs: {path}")
+    return EXIT_RULE_FAILED if found else EXIT_OK
+
+
+def cmd_seal(args: argparse.Namespace) -> int:
+    """Write meta.json and SHA256SUMS at the end of the run job."""
+    artifact = Path(args.artifact)
+    artifact.mkdir(parents=True, exist_ok=True)
+    for source, name in (("gate-guard", "guard.json"), ("gate-acceptance", "acceptance.json")):
+        found = artifact / "raw" / source / name
+        if found.is_file() and not found.is_symlink():
+            (artifact / name).write_bytes(found.read_bytes())
+    write_json(
+        artifact / "environment.json",
+        {
+            "python": platform.python_version(),
+            "platform": platform.platform(),
+            "image_os": os.environ.get("ImageOS", "unknown"),
+            "image_version": os.environ.get("ImageVersion", "unknown"),
+        },
+    )
+    write_json(
+        artifact / "meta.json",
+        {"head_sha": args.head_sha, "run_id": args.run_id, "run_attempt": args.run_attempt},
+    )
+    names = sorted(
+        path.relative_to(artifact).as_posix()
+        for path in artifact.rglob("*")
+        if path.is_file() and not path.is_symlink() and path != artifact / "SHA256SUMS"
+    )
+    with (artifact / "SHA256SUMS").open("w", encoding="utf-8", newline="\n") as handle:
+        for name in names:
+            handle.write(f"{sha256_file(artifact / name)}  {name}\n")
+    return EXIT_OK
+
+
+def main(argv: list[str] | None = None) -> int:
+    parser = argparse.ArgumentParser(prog="gate.report")
+    commands = parser.add_subparsers(dest="command", required=True)
+
+    generate = commands.add_parser("generate")
+    generate.add_argument("--context", required=True)
+    generate.add_argument("--jobs", required=True)
+    generate.add_argument("--artifact", required=True)
+    generate.add_argument("--config", required=True)
+    generate.add_argument("--out", required=True)
+    generate.add_argument("--extras")
+
+    final = commands.add_parser("final")
+    final.add_argument("--verdict", required=True)
+    final.add_argument("--archive", required=True)
+    final.add_argument("--out", required=True)
+    final.add_argument("--expect-verdict-sha256")
+    final.add_argument("--env-result")
+
+    compare = commands.add_parser("compare")
+    compare.add_argument("first")
+    compare.add_argument("second")
+
+    seal = commands.add_parser("seal")
+    seal.add_argument("--artifact", required=True)
+    seal.add_argument("--head-sha", required=True)
+    seal.add_argument("--run-id", required=True)
+    seal.add_argument("--run-attempt", required=True)
+
+    args = parser.parse_args(argv)
+    handlers = {"generate": cmd_generate, "final": cmd_final, "compare": cmd_compare, "seal": cmd_seal}
+    try:
+        return handlers[args.command](args)
+    except UsageError as error:
+        return fail_usage(str(error))
+    except jsonschema.ValidationError as error:
+        return fail_usage(f"the report does not match its schema: {error.message}")
+
+
+if __name__ == "__main__":
+    sys.exit(main())

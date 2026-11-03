@@ -1,0 +1,148 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "title": "Quality gate report",
+  "type": "object",
+  "additionalProperties": false,
+  "required": [
+    "verification",
+    "environment",
+    "checks",
+    "coverage",
+    "mutation",
+    "dependency_changes",
+    "findings",
+    "rounds",
+    "resources",
+    "human",
+    "bypass_merges",
+    "known_failing",
+    "verdicts",
+    "semi_automatic_steps",
+    "generated_at"
+  ],
+  "$defs": {
+    "sha": { "type": "string", "pattern": "^[0-9a-f]{40}$" },
+    "unknownOrNumber": {
+      "oneOf": [{ "type": "number", "minimum": 0 }, { "const": "unknown" }]
+    },
+    "unknownOrObject": {
+      "oneOf": [{ "type": "object" }, { "const": "unknown" }]
+    },
+    "verdict": {
+      "enum": ["ready-for-human", "blocked", "needs-human", "incomplete"]
+    }
+  },
+  "properties": {
+    "verification": {
+      "type": "object",
+      "required": [
+        "repository",
+        "head_repository",
+        "pr",
+        "run_id",
+        "run_attempt",
+        "event",
+        "baseline_sha",
+        "base_sha",
+        "head_sha",
+        "gate_sha",
+        "head_ref",
+        "config_hashes"
+      ],
+      "properties": {
+        "repository": { "type": "string" },
+        "head_repository": { "type": "string" },
+        "pr": { "type": "integer" },
+        "run_id": { "type": ["integer", "string"] },
+        "run_attempt": { "type": ["integer", "string"] },
+        "event": { "type": "string" },
+        "baseline_sha": { "type": "string" },
+        "base_sha": { "type": "string" },
+        "head_sha": { "type": "string" },
+        "gate_sha": { "type": "string" },
+        "head_ref": { "type": "string" },
+        "config_hashes": {
+          "type": "object",
+          "additionalProperties": { "type": "string" }
+        }
+      }
+    },
+    "environment": { "$ref": "#/$defs/unknownOrObject" },
+    "checks": {
+      "type": "array",
+      "items": {
+        "type": "object",
+        "required": ["id", "class", "conclusion", "commands", "counts"],
+        "properties": {
+          "id": { "type": "string" },
+          "class": { "enum": ["mandatory", "diagnostic"] },
+          "conclusion": { "type": "string" },
+          "commands": {
+            "type": "array",
+            "items": {
+              "type": "object",
+              "required": ["argv", "exit_code", "duration_seconds", "raw_path", "raw_sha256"],
+              "properties": {
+                "argv": { "type": "array", "items": { "type": "string" } },
+                "exit_code": { "type": ["integer", "string"] },
+                "duration_seconds": { "type": ["number", "string"] },
+                "raw_path": { "type": "string" },
+                "raw_sha256": { "type": ["string", "null"] }
+              }
+            }
+          },
+          "counts": { "type": ["object", "null"] }
+        }
+      }
+    },
+    "coverage": { "$ref": "#/$defs/unknownOrObject" },
+    "mutation": { "$ref": "#/$defs/unknownOrObject" },
+    "dependency_changes": { "type": "array" },
+    "findings": { "type": "array" },
+    "rounds": { "type": "array" },
+    "resources": {
+      "type": "object",
+      "required": ["executor_runs", "executor_turns", "codex_runs", "codex_tokens", "actions_minutes"],
+      "properties": {
+        "executor_runs": { "$ref": "#/$defs/unknownOrNumber" },
+        "executor_turns": { "$ref": "#/$defs/unknownOrNumber" },
+        "codex_runs": { "$ref": "#/$defs/unknownOrNumber" },
+        "codex_tokens": { "$ref": "#/$defs/unknownOrNumber" },
+        "actions_minutes": { "$ref": "#/$defs/unknownOrNumber" }
+      }
+    },
+    "human": {
+      "type": "object",
+      "required": ["interventions", "minutes"],
+      "properties": {
+        "interventions": { "$ref": "#/$defs/unknownOrNumber" },
+        "minutes": { "$ref": "#/$defs/unknownOrNumber" }
+      }
+    },
+    "bypass_merges": { "type": "array" },
+    "known_failing": {
+      "oneOf": [
+        {
+          "type": "object",
+          "required": ["size", "remove_from_list"],
+          "properties": {
+            "size": { "type": "integer", "minimum": 0 },
+            "remove_from_list": { "type": "array", "items": { "type": "string" } }
+          }
+        },
+        { "const": "unknown" }
+      ]
+    },
+    "verdicts": {
+      "type": "object",
+      "required": ["preliminary", "final", "reasons"],
+      "properties": {
+        "preliminary": { "$ref": "#/$defs/verdict" },
+        "final": { "oneOf": [{ "$ref": "#/$defs/verdict" }, { "type": "null" }] },
+        "reasons": { "type": "array" }
+      }
+    },
+    "semi_automatic_steps": { "type": "array" },
+    "generated_at": { "type": "string" }
+  }
+}

@@ -1,0 +1,167 @@
+# The executor. Reusable: a repository calls it for a task issue or a fix round.
+# Its token comes from the repository's own minimal app, minted per run.
+name: executor
+
+on:
+  workflow_call:
+    inputs:
+      config-path:
+        type: string
+        default: quality.toml
+      prompt-file:
+        description: The prompt file on the default branch.
+        type: string
+        default: prompts/executor.md
+      issue-number:
+        description: The task's issue, for a first run.
+        type: string
+        default: ""
+      pr-number:
+        description: The PR, for a fix round.
+        type: string
+        default: ""
+      head-ref:
+        description: The PR's branch, for a fix round.
+        type: string
+        default: ""
+      allowed-bots:
+        description: The apps whose events may start a fix round. Named exactly, never a wildcard.
+        type: string
+        default: ""
+      fix-note-artifact:
+        description: The name of an artifact holding the gate's note, for a fix round.
+        type: string
+        default: ""
+    secrets:
+      CLAUDE_CODE_OAUTH_TOKEN:
+        required: false
+      EXECUTOR_APP_PRIVATE_KEY:
+        required: false
+
+permissions: {}
+
+jobs:
+  limits:
+    name: limits
+    runs-on: ubuntu-24.04
+    timeout-minutes: 5
+    permissions:
+      contents: read
+    outputs:
+      max-turns: ${{ steps.limits.outputs.max-turns }}
+      timeout-minutes: ${{ steps.limits.outputs.timeout-minutes }}
+      integration-branch: ${{ steps.limits.outputs.integration-branch }}
+    env:
+      PYTHONPATH: ${{ github.workspace }}/.gate
+      GATE_CONFIG_PATH: ${{ inputs.config-path }}
+    steps:
+      - name: Get the gate at its pinned commit
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          repository: ${{ job.workflow_repository }}
+          ref: ${{ job.workflow_sha }}
+          path: .gate
+          persist-credentials: false
+
+      - name: Get the configuration from the default branch
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          path: .trusted
+          persist-credentials: false
+
+      - name: Set up Python
+        uses: actions/setup-python@6d4fd22b20465ccc0f7354476588e8df7c9ca0e0 # v7.1.0
+        with:
+          python-version: "3.13.15"
+
+      - name: Read the limits
+        id: limits
+        run: 'python -P -m gate.publish limits --config ".trusted/$GATE_CONFIG_PATH" --output "$GITHUB_OUTPUT"'
+
+  executor:
+    name: executor
+    needs: limits
+    runs-on: ubuntu-24.04
+    timeout-minutes: ${{ fromJSON(needs.limits.outputs.timeout-minutes) }}
+    permissions:
+      contents: read
+    env:
+      PYTHONPATH: ${{ github.workspace }}/.gate
+      GATE_PROMPT_FILE: ${{ inputs.prompt-file }}
+      GATE_ISSUE: ${{ inputs.issue-number }}
+      GATE_PR: ${{ inputs.pr-number }}
+      GATE_FIX_NOTE_ARTIFACT: ${{ inputs.fix-note-artifact }}
+      GATE_INTEGRATION_BRANCH: ${{ needs.limits.outputs.integration-branch }}
+    steps:
+      - name: Get the gate at its pinned commit
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          repository: ${{ job.workflow_repository }}
+          ref: ${{ job.workflow_sha }}
+          path: .gate
+          persist-credentials: false
+
+      - name: Set up Python
+        uses: actions/setup-python@6d4fd22b20465ccc0f7354476588e8df7c9ca0e0 # v7.1.0
+        with:
+          python-version: "3.13.15"
+
+      - name: gate/env
+        env:
+          CLAUDE_CODE_OAUTH_TOKEN: ${{ secrets.CLAUDE_CODE_OAUTH_TOKEN }}
+          EXECUTOR_APP_PRIVATE_KEY: ${{ secrets.EXECUTOR_APP_PRIVATE_KEY }}
+          EXECUTOR_APP_ID: ${{ vars.EXECUTOR_APP_ID }}
+        run: python -P -m gate.env_check --role executor
+
+      - name: Mint the app's token
+        id: app-token
+        uses: actions/create-github-app-token@64ab729a6294000f5aa4a4bc0b73d1f32bc45510 # v3.3.0
+        with:
+          app-id: ${{ vars.EXECUTOR_APP_ID }}
+          private-key: ${{ secrets.EXECUTOR_APP_PRIVATE_KEY }}
+
+      - name: Move the gate out of the working folder
+        run: |
+          mv .gate "$RUNNER_TEMP/gate"
+          echo "PYTHONPATH=$RUNNER_TEMP/gate" >> "$GITHUB_ENV"
+
+      - name: Get the repository
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          ref: ${{ inputs.head-ref }}
+          fetch-depth: 0
+          token: ${{ steps.app-token.outputs.token }}
+
+      - name: Get the gate's note for a fix round
+        if: ${{ inputs.fix-note-artifact != '' }}
+        uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8.0.2
+        with:
+          name: ${{ inputs.fix-note-artifact }}
+          path: note
+
+      - name: Build the prompt
+        id: prompt
+        run: |
+          {
+            echo 'text<<GATE_PROMPT_END'
+            cat "$GATE_PROMPT_FILE"
+            echo
+            if [ -n "$GATE_ISSUE" ]; then echo "The task is issue #$GATE_ISSUE. Open your PR into $GATE_INTEGRATION_BRANCH."; fi
+            if [ -n "$GATE_PR" ]; then echo "This is a fix round for PR #$GATE_PR. Push to that PR's branch."; fi
+            if [ -f note/comment.txt ]; then cat note/comment.txt; echo; fi
+            echo 'GATE_PROMPT_END'
+          } >> "$GITHUB_OUTPUT"
+
+      - name: Run the executor
+        uses: anthropics/claude-code-action@4845bacbb38b3c4b15d948f035349786f678e068 # v1.0.267
+        env:
+          GH_TOKEN: ${{ steps.app-token.outputs.token }}
+        with:
+          github_token: ${{ steps.app-token.outputs.token }}
+          claude_code_oauth_token: ${{ secrets.CLAUDE_CODE_OAUTH_TOKEN }}
+          base_branch: ${{ needs.limits.outputs.integration-branch }}
+          allowed_bots: ${{ inputs.allowed-bots }}
+          prompt: ${{ steps.prompt.outputs.text }}
+          claude_args: >-
+            --max-turns ${{ needs.limits.outputs.max-turns }}
+            --allowedTools "Read,Write,Edit,Glob,Grep,Bash(git:*),Bash(gh pr:*),Bash(gh issue view:*),Bash(python:*),Bash(pytest:*)"

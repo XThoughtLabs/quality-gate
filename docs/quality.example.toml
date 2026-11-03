@@ -1,0 +1,90 @@
+# An example configuration. An application keeps its own quality.toml on its default branch.
+# {raw} is the check's raw output folder. {env:NAME} is a value from the workflow's trusted context.
+
+[project]
+baseline_sha = "0000000000000000000000000000000000000000"
+integration_branch = "candidate/a"
+
+[environment]
+python = "3.13"
+image_os = "ubuntu24"
+
+[limits]
+max_turns = 40
+timeout_minutes = 60
+max_fix_rounds = 3
+
+[guard]
+extra_protected = ["prompts/", ".claude/", ".mcp.json"]
+dependency_files = ["requirements.lock"]
+dependency_sources = ["requirements.in"]
+threshold_keys = []
+
+[feedback]
+judge_workflow_path = ".github/workflows/judge.yml"
+reviewer_app = "example-reviewer"
+executor_app = "example-executor"
+
+[spec_tests]
+deny_read = ["src/**", "tests/**"]
+
+[setup]
+commands = [["python", "-m", "pip", "install", "--quiet", "-r", "requirements.lock"]]
+timeout_seconds = 600
+
+[checks."gate/tests"]
+class = "mandatory"
+commands = [["python", "-m", "pytest", "-q", "-p", "no:cacheprovider", "--ignore=acceptance", "--junitxml={raw}/junit.xml"]]
+junit = "junit.xml"
+forbid_skips = true
+required_outputs = ["junit.xml"]
+
+[checks."gate/acceptance"]
+class = "mandatory"
+commands = [[
+  "{env:GATE_PY}", "-P", "-m", "gate.acceptance",
+  "--junit", "{raw}/junit.xml",
+  "--known-failing", "{env:GATE_KNOWN_FAILING}",
+  "--mode", "{env:GATE_ACCEPTANCE_MODE}",
+  "--out", "{raw}/acceptance.json",
+  "--",
+  "python", "-m", "pytest", "acceptance", "-q", "-p", "no:cacheprovider", "--junitxml={raw}/junit.xml",
+]]
+env = { PYTHONPATH = "{env:GATE_HOME}" }
+required_outputs = ["junit.xml", "acceptance.json"]
+
+[checks."gate/security"]
+class = "mandatory"
+commands = [[
+  "{env:GATE_PY}", "-P", "-m", "gate.security_check",
+  "--bandit", "{raw}/bandit.json",
+  "--pip-audit", "{raw}/pip-audit.json",
+  "--gitleaks", "{raw}/gitleaks.json",
+  "--review", "security-review.md",
+  "--repo", ".",
+  "--base", "{env:GATE_BASE_SHA}",
+  "--head", "{env:GATE_HEAD_SHA}",
+  "--out", "{raw}/security.json",
+  "--tool-command", '["{env:GATE_TOOLS}/bandit", "-r", "src", "-f", "json", "-o", "{raw}/bandit.json"]',
+  "--tool-command", '["{env:GATE_TOOLS}/pip-audit", "-r", "requirements.lock", "--no-deps", "-f", "json", "-o", "{raw}/pip-audit.json"]',
+  "--tool-command", '["{env:GATE_TOOLS_BIN}/gitleaks", "dir", ".", "--report-format", "json", "--report-path", "{raw}/gitleaks.json", "--exit-code", "0"]',
+]]
+env = { PYTHONPATH = "{env:GATE_HOME}" }
+required_outputs = ["security.json"]
+
+[checks."diag/ruff"]
+class = "diagnostic"
+commands = [["{env:GATE_TOOLS}/ruff", "check", "src", "--output-format", "json"]]
+
+[checks."diag/mypy"]
+class = "diagnostic"
+commands = [["{env:GATE_TOOLS}/mypy", "src"]]
+
+[checks."diag/semgrep"]
+class = "diagnostic"
+commands = [["{env:GATE_SEMGREP}/semgrep", "scan", "--metrics", "off", "--config", "{env:GATE_HOME}/semgrep/rules.yml", "--json", "src"]]
+
+[checks."diag/benchmark"]
+class = "diagnostic"
+commands = [["python", "tools/benchmark.py"]]
+env = { PYTHONPATH = "." }

@@ -1,0 +1,354 @@
+# The judge. Reusable: a repository calls it on pull_request_target, so it always
+# runs from that repository's default branch, never from the PR it judges.
+# Three jobs: run (runs PR code, no secrets), publish, archive (neither runs PR code).
+name: judge
+
+on:
+  workflow_call:
+    inputs:
+      config-path:
+        description: Path of the configuration on the default branch.
+        type: string
+        default: quality.toml
+      final-label:
+        description: The label that marks the final PR before delivery, when the known-failing list must be empty.
+        type: string
+        default: final-pr
+
+permissions: {}
+
+env:
+  GATE_HOME: ${{ github.workspace }}/.gate
+  PYTHONPATH: ${{ github.workspace }}/.gate
+  GATE_CONFIG: ${{ github.workspace }}/.trusted/${{ inputs.config-path }}
+  GATE_REPORTS_DIR: ${{ github.workspace }}/.stored/reports
+  GATE_REPOSITORY: ${{ github.repository }}
+  GATE_HEAD_REPOSITORY: ${{ github.event.pull_request.head.repo.full_name }}
+  GATE_PR: ${{ github.event.pull_request.number }}
+  GATE_RUN_ID: ${{ github.run_id }}
+  GATE_RUN_ATTEMPT: ${{ github.run_attempt }}
+  GATE_EVENT: ${{ github.event_name }}
+  GATE_BASE_SHA: ${{ github.event.pull_request.base.sha }}
+  GATE_HEAD_SHA: ${{ github.event.pull_request.head.sha }}
+  GATE_HEAD_REF: ${{ github.event.pull_request.head.ref }}
+  GATE_INTEGRATION_BRANCH: ${{ github.event.pull_request.base.ref }}
+  # The default branch's commit at this run: the source of the configuration and the acceptance tests.
+  GATE_TRUSTED_SHA: ${{ github.sha }}
+  GATE_ENV_ROLE: run
+
+jobs:
+  run:
+    name: run
+    # A fork's code is never run: publish then gives the verdict blocked, FORK_PR.
+    if: ${{ github.event.pull_request.head.repo.full_name == github.repository }}
+    runs-on: ubuntu-24.04
+    timeout-minutes: 60
+    permissions:
+      contents: read
+    env:
+      GATE_PR_DIR: ${{ github.workspace }}/pr
+      GATE_OUT: ${{ github.workspace }}/out
+      GATE_REQUIRE_EMPTY: ${{ contains(github.event.pull_request.labels.*.name, inputs.final-label) && '1' || '' }}
+    steps:
+      - name: Get the gate at its pinned commit
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          repository: ${{ job.workflow_repository }}
+          ref: ${{ job.workflow_sha }}
+          path: .gate
+          persist-credentials: false
+
+      - name: Get the configuration from the default branch
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          path: .trusted
+          persist-credentials: false
+
+      - name: Get the PR head
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          ref: ${{ github.event.pull_request.head.sha }}
+          path: pr
+          fetch-depth: 0
+          persist-credentials: false
+
+      - name: Get the stored runs
+        run: bash "$GATE_HOME/scripts/get_stored_runs.sh" pr "$GITHUB_WORKSPACE/.stored"
+
+      - name: Set up Python
+        uses: actions/setup-python@6d4fd22b20465ccc0f7354476588e8df7c9ca0e0 # v7.1.0
+        with:
+          python-version: "3.13.15"
+
+      - name: Install the gate's tools, with hashes
+        run: |
+          python -m venv "$RUNNER_TEMP/gate-venv"
+          "$RUNNER_TEMP/gate-venv/bin/pip" install --quiet --require-hashes -r "$GATE_HOME/locks/gate.lock"
+          python -m venv "$RUNNER_TEMP/tools-venv"
+          "$RUNNER_TEMP/tools-venv/bin/pip" install --quiet --require-hashes -r "$GATE_HOME/locks/tools.lock"
+          python -m venv "$RUNNER_TEMP/semgrep-venv"
+          "$RUNNER_TEMP/semgrep-venv/bin/pip" install --quiet --require-hashes -r "$GATE_HOME/locks/semgrep.lock"
+          bash "$GATE_HOME/scripts/install_gitleaks.sh" "$RUNNER_TEMP/tools-bin"
+          python -m venv "$RUNNER_TEMP/app-venv"
+          {
+            echo "GATE_PY=$RUNNER_TEMP/gate-venv/bin/python"
+            echo "GATE_TOOLS=$RUNNER_TEMP/tools-venv/bin"
+            echo "GATE_SEMGREP=$RUNNER_TEMP/semgrep-venv/bin"
+            echo "GATE_TOOLS_BIN=$RUNNER_TEMP/tools-bin"
+          } >> "$GITHUB_ENV"
+          echo "$RUNNER_TEMP/app-venv/bin" >> "$GITHUB_PATH"
+
+      # Before any PR code runs.
+      - name: gate/env
+        if: ${{ !cancelled() }}
+        env:
+          GATE_PROBE_TOKEN: ${{ github.token }}
+        run: '"$GATE_PY" -P -m gate.run_checks --config "$GATE_HOME/gate/builtin_checks.toml" --check gate/env --out "$GATE_OUT"'
+
+      - name: gate/guard
+        if: ${{ !cancelled() }}
+        run: '"$GATE_PY" -P -m gate.run_checks --config "$GATE_HOME/gate/builtin_checks.toml" --check gate/guard --out "$GATE_OUT"'
+
+      - name: Take the acceptance tests from the default branch
+        if: ${{ !cancelled() }}
+        run: |
+          case "$GATE_HEAD_REF" in
+            spec/*)
+              echo "GATE_ACCEPTANCE_MODE=exact" >> "$GITHUB_ENV"
+              ;;
+            *)
+              rm -rf "$GATE_PR_DIR/acceptance"
+              if [ -d .trusted/acceptance ]; then cp -r .trusted/acceptance "$GATE_PR_DIR/acceptance"; fi
+              echo "GATE_ACCEPTANCE_MODE=subset" >> "$GITHUB_ENV"
+              ;;
+          esac
+          echo "GATE_KNOWN_FAILING=$GATE_PR_DIR/acceptance/known-failing.txt" >> "$GITHUB_ENV"
+
+      # PR code runs from here on.
+      - name: setup
+        if: ${{ !cancelled() }}
+        run: '"$GATE_PY" -P -m gate.run_checks --config "$GATE_CONFIG" --check setup --if-configured --out "$GATE_OUT" --workdir "$GATE_PR_DIR"'
+
+      - name: gate/tests
+        if: ${{ !cancelled() }}
+        run: '"$GATE_PY" -P -m gate.run_checks --config "$GATE_CONFIG" --check gate/tests --out "$GATE_OUT" --workdir "$GATE_PR_DIR"'
+
+      - name: gate/acceptance
+        if: ${{ !cancelled() }}
+        run: '"$GATE_PY" -P -m gate.run_checks --config "$GATE_CONFIG" --check gate/acceptance --out "$GATE_OUT" --workdir "$GATE_PR_DIR"'
+
+      - name: gate/security
+        if: ${{ !cancelled() }}
+        run: '"$GATE_PY" -P -m gate.run_checks --config "$GATE_CONFIG" --check gate/security --out "$GATE_OUT" --workdir "$GATE_PR_DIR"'
+
+      - name: diag/coverage
+        if: ${{ !cancelled() }}
+        run: '"$GATE_PY" -P -m gate.run_checks --config "$GATE_CONFIG" --check diag/coverage --if-configured --out "$GATE_OUT" --workdir "$GATE_PR_DIR"'
+
+      - name: diag/mypy
+        if: ${{ !cancelled() }}
+        run: '"$GATE_PY" -P -m gate.run_checks --config "$GATE_CONFIG" --check diag/mypy --if-configured --out "$GATE_OUT" --workdir "$GATE_PR_DIR"'
+
+      - name: diag/ruff
+        if: ${{ !cancelled() }}
+        run: '"$GATE_PY" -P -m gate.run_checks --config "$GATE_CONFIG" --check diag/ruff --if-configured --out "$GATE_OUT" --workdir "$GATE_PR_DIR"'
+
+      - name: diag/semgrep
+        if: ${{ !cancelled() }}
+        run: '"$GATE_PY" -P -m gate.run_checks --config "$GATE_CONFIG" --check diag/semgrep --if-configured --out "$GATE_OUT" --workdir "$GATE_PR_DIR"'
+
+      - name: diag/schemathesis
+        if: ${{ !cancelled() }}
+        run: '"$GATE_PY" -P -m gate.run_checks --config "$GATE_CONFIG" --check diag/schemathesis --if-configured --out "$GATE_OUT" --workdir "$GATE_PR_DIR"'
+
+      - name: diag/mutation
+        if: ${{ !cancelled() }}
+        run: '"$GATE_PY" -P -m gate.run_checks --config "$GATE_CONFIG" --check diag/mutation --if-configured --out "$GATE_OUT" --workdir "$GATE_PR_DIR"'
+
+      - name: diag/benchmark
+        if: ${{ !cancelled() }}
+        run: '"$GATE_PY" -P -m gate.run_checks --config "$GATE_CONFIG" --check diag/benchmark --if-configured --out "$GATE_OUT" --workdir "$GATE_PR_DIR"'
+
+      - name: Seal the evidence
+        if: ${{ always() }}
+        run: '"$GATE_PY" -P -m gate.report seal --artifact "$GATE_OUT" --head-sha "$GATE_HEAD_SHA" --run-id "$GATE_RUN_ID" --run-attempt "$GATE_RUN_ATTEMPT"'
+
+      - name: Upload the evidence
+        if: ${{ always() }}
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        with:
+          name: gate-evidence
+          path: out/
+          retention-days: 30
+          if-no-files-found: warn
+
+  publish:
+    name: publish
+    needs: run
+    if: ${{ always() }}
+    runs-on: ubuntu-24.04
+    timeout-minutes: 15
+    permissions:
+      checks: write
+      pull-requests: write
+      actions: read
+      contents: read
+    outputs:
+      verdict-sha256: ${{ steps.generate.outputs.verdict-sha256 }}
+    env:
+      GATE_TOKEN: ${{ github.token }}
+    steps:
+      - name: Get the gate at its pinned commit
+        if: ${{ always() }}
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          repository: ${{ job.workflow_repository }}
+          ref: ${{ job.workflow_sha }}
+          path: .gate
+          persist-credentials: false
+
+      - name: Get the configuration from the default branch
+        if: ${{ always() }}
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          path: .trusted
+          persist-credentials: false
+
+      - name: Set up Python
+        if: ${{ always() }}
+        uses: actions/setup-python@6d4fd22b20465ccc0f7354476588e8df7c9ca0e0 # v7.1.0
+        with:
+          python-version: "3.13.15"
+
+      - name: Install the gate, with hashes
+        if: ${{ always() }}
+        run: |
+          python -m venv "$RUNNER_TEMP/gate-venv"
+          "$RUNNER_TEMP/gate-venv/bin/pip" install --quiet --require-hashes -r "$GATE_HOME/locks/gate.lock"
+          echo "GATE_PY=$RUNNER_TEMP/gate-venv/bin/python" >> "$GITHUB_ENV"
+
+      - name: Check this job's environment
+        if: ${{ always() }}
+        env:
+          GATE_PROBE_TOKEN: ${{ github.token }}
+        run: '"$GATE_PY" -P -m gate.env_check --role publish --config "$GATE_CONFIG" --out publish-env.json || true'
+
+      - name: Get the evidence of the run job
+        if: ${{ always() }}
+        continue-on-error: true
+        uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8.0.2
+        with:
+          name: gate-evidence
+          path: evidence
+
+      - name: Get the stored runs
+        if: ${{ always() }}
+        run: bash "$GATE_HOME/scripts/get_stored_runs.sh" .trusted "$GITHUB_WORKSPACE/.stored"
+
+      - name: Generate the report
+        id: generate
+        if: ${{ always() }}
+        env:
+          GATE_SHA: ${{ job.workflow_sha }}
+        run: |
+          "$GATE_PY" -P -m gate.publish context --config "$GATE_CONFIG" --hash "$GATE_CONFIG" --out context.json
+          "$GATE_PY" -P -m gate.publish jobs --run-id "$GATE_RUN_ID" --attempt "$GATE_RUN_ATTEMPT" --out jobs.json
+          "$GATE_PY" -P -m gate.publish extras --reports-dir "$GATE_REPORTS_DIR" --pr "$GATE_PR" --integration "$GATE_INTEGRATION_BRANCH" --env-result publish-env.json --out extras.json
+          "$GATE_PY" -P -m gate.report generate --context context.json --jobs jobs.json --artifact evidence --config "$GATE_CONFIG" --extras extras.json --out publish-out
+          cp extras.json publish-out/extras.json
+          echo "verdict-sha256=$(sha256sum publish-out/verdict.json | cut -d' ' -f1)" >> "$GITHUB_OUTPUT"
+
+      - name: Post the mandatory checks and the comment
+        if: ${{ always() }}
+        run: |
+          "$GATE_PY" -P -m gate.publish post-checks --verdict publish-out/verdict.json --head-sha "$GATE_HEAD_SHA"
+          "$GATE_PY" -P -m gate.publish comment --pr "$GATE_PR" --body publish-out/report.md
+
+      - name: Upload the report for the archive
+        if: ${{ always() }}
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        with:
+          name: gate-publish
+          path: publish-out/
+          retention-days: 30
+          if-no-files-found: warn
+
+  archive:
+    name: archive
+    needs: [run, publish]
+    if: ${{ always() }}
+    runs-on: ubuntu-24.04
+    timeout-minutes: 15
+    permissions:
+      contents: write
+      checks: write
+    env:
+      GATE_TOKEN: ${{ github.token }}
+      GATE_EXPECT_VERDICT: ${{ needs.publish.outputs.verdict-sha256 }}
+    steps:
+      - name: Get the gate at its pinned commit
+        if: ${{ always() }}
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          repository: ${{ job.workflow_repository }}
+          ref: ${{ job.workflow_sha }}
+          path: .gate
+          persist-credentials: false
+
+      - name: Get the configuration from the default branch
+        if: ${{ always() }}
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          path: .trusted
+          persist-credentials: false
+
+      - name: Set up Python
+        if: ${{ always() }}
+        uses: actions/setup-python@6d4fd22b20465ccc0f7354476588e8df7c9ca0e0 # v7.1.0
+        with:
+          python-version: "3.13.15"
+
+      - name: Install the gate, with hashes
+        if: ${{ always() }}
+        run: |
+          python -m venv "$RUNNER_TEMP/gate-venv"
+          "$RUNNER_TEMP/gate-venv/bin/pip" install --quiet --require-hashes -r "$GATE_HOME/locks/gate.lock"
+          echo "GATE_PY=$RUNNER_TEMP/gate-venv/bin/python" >> "$GITHUB_ENV"
+
+      - name: Check this job's environment
+        if: ${{ always() }}
+        env:
+          GATE_PROBE_TOKEN: ${{ github.token }}
+        run: '"$GATE_PY" -P -m gate.env_check --role archive --config "$GATE_CONFIG" --out archive-env.json || true'
+
+      - name: Get the evidence of the run job
+        if: ${{ always() }}
+        continue-on-error: true
+        uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8.0.2
+        with:
+          name: gate-evidence
+          path: evidence
+
+      - name: Get the report
+        if: ${{ always() }}
+        continue-on-error: true
+        uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8.0.2
+        with:
+          name: gate-publish
+          path: publish-out
+
+      - name: Store the evidence and post the final verdict
+        if: ${{ always() }}
+        env:
+          GATE_SHA: ${{ job.workflow_sha }}
+        run: |
+          folder="reports/$GATE_PR/$GATE_RUN_ID-$GATE_RUN_ATTEMPT"
+          "$GATE_PY" -P -m gate.publish context --config "$GATE_CONFIG" --hash "$GATE_CONFIG" --out context.json
+          "$GATE_PY" -P -m gate.archive store --api-repo "$GATE_REPOSITORY" --branch reports --pr "$GATE_PR" --run-id "$GATE_RUN_ID" --attempt "$GATE_RUN_ATTEMPT" --artifact evidence --publish publish-out --context context.json --out archive-result.json || true
+          mkdir -p final
+          "$GATE_PY" -P -m gate.report final --verdict publish-out/verdict.json --expect-verdict-sha256 "$GATE_EXPECT_VERDICT" --archive archive-result.json --env-result archive-env.json --out final/final.json
+          if ! "$GATE_PY" -P -m gate.archive append --api-repo "$GATE_REPOSITORY" --branch reports --path "$folder/final.json" --file final/final.json --out append-result.json; then
+            # The final verdict could not be stored, so the evidence is not complete.
+            "$GATE_PY" -P -m gate.report final --verdict publish-out/verdict.json --expect-verdict-sha256 "$GATE_EXPECT_VERDICT" --archive append-result.json --env-result archive-env.json --out final/final.json
+          fi
+          "$GATE_PY" -P -m gate.publish post-final --final final/final.json --head-sha "$GATE_HEAD_SHA"

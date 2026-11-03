@@ -1,0 +1,44 @@
+# The gate's own Semgrep rules, pinned with this repository. A diagnostic check only.
+rules:
+  - id: gate.sql-built-from-a-string
+    message: SQL built from a formatted string. Use placeholders.
+    severity: WARNING
+    languages: [python]
+    pattern-either:
+      - pattern: $C.execute(f"...")
+      - pattern: $C.execute("..." % ...)
+      - pattern: $C.execute("...".format(...))
+      - pattern: $C.execute("..." + ...)
+
+  - id: gate.shell-true
+    message: A subprocess with shell=True.
+    severity: WARNING
+    languages: [python]
+    pattern: subprocess.$F(..., shell=True, ...)
+
+  - id: gate.eval-or-exec
+    message: eval or exec.
+    severity: WARNING
+    languages: [python]
+    pattern-either:
+      - pattern: eval(...)
+      - pattern: exec(...)
+
+  - id: gate.unsafe-deserialization
+    message: Deserialization that can run code.
+    severity: WARNING
+    languages: [python]
+    pattern-either:
+      - pattern: pickle.load(...)
+      - pattern: pickle.loads(...)
+      - pattern: yaml.load(...)
+
+  - id: gate.bare-except
+    message: A bare except hides failures.
+    severity: INFO
+    languages: [python]
+    pattern: |
+      try:
+        ...
+      except:
+        ...

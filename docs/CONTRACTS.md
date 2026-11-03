@@ -82,10 +82,11 @@ Prints one line per item: `OK <item>` or `BROKEN <item>: <reason>`. `--out` writ
   | `archive` | contents write, checks write | pull-requests |
   | `feedback` | pull-requests write, contents read | contents, checks |
 
-  Items are named `permission:<name>:<allowed|denied>`. Any other status, or no token, or a network error, is broken: never a pass.
+  Items are named `permission:<name>-<read|write>:<allowed|denied>`, for example `permission:contents-write:denied`: the permission as in the table, and the state that is required. Any other status, or no token, or a network error, is broken: never a pass.
 - **E-4 Environment.** When `[environment]` is set, items `environment:python` and `environment:image_os` compare the values. A mismatch names both the expected and the found value.
 - **E-4a** The role `reproduce` is for a rerun in the pinned container: it runs E-2, and of E-4 only `environment:python`.
-- **E-5 Names, never values.** Each broken item names the broken part. No value of any variable appears in stdout, stderr or `--out`, for any role.
+- **E-5 Names, never values.** Each broken item names the broken part. No value of a variable appears in stdout, stderr or `--out`, for any role. The one exception is E-4: the Python version and `ImageOS`, which are not secret.
+- **E-6** `--config` is optional, and has no default: without it, E-4 does not apply.
 
 ## 3. `gate.run_checks`
 
@@ -95,7 +96,7 @@ Runs every command of one check, in order, in the working directory.
 
 - **R-1** Each command's stdout and stderr go to `DIR/raw/<slug>/<index>.log`. The slug is the check ID with `/` replaced by `-`. The index starts at 0.
 - **R-2** Each command appends one row to `DIR/exit-codes.tsv`, which starts with the header `check	index	exit_code	duration_seconds	raw_path	argv_json`. `exit_code` is the numeric exit code.
-- **R-3** Every command runs even when an earlier one failed. The script's own exit code is the first non-zero exit code of the commands, or 0.
+- **R-3** Every command runs even when an earlier one failed. The script's own exit code is the first non-zero exit code of the commands, or 0. This holds over C-2, so 124 and 127 reach the caller.
 - **R-4** A command not found records 127. A command past `timeout_seconds` is killed and records 124. Neither is a pass.
 - **R-5** A check with `junit` set reads that file from its raw folder, relative to it, and writes `counts.json` there with `tests`, `failures`, `errors`, `skipped`. A missing or unparsable file is a failure. With `forbid_skips`, `skipped > 0` is a failure. Such a failure appends a row with index `post` and exit code 1, and the script exits non-zero.
 - **R-6** `required_outputs` are relative to the raw folder. A missing one appends a row with index `post` and exit code 1, and the script exits non-zero.
@@ -127,7 +128,7 @@ The test ID is `<classname>::<name>` from the JUnit file. The list holds one ent
 
 `python -P -m gate.guard --repo DIR --base SHA --head SHA --branch REF --config FILE --out FILE [--reports-dir DIR] [--pr N]`
 
-Reads git objects only and runs no code from the repository. It compares the merge base of `--base` and `--head` with `--head`, with renames shown as a delete and an add.
+Reads git objects only and runs no code from the repository, nor any command that the repository's git settings name (an external diff, a textconv, an fsmonitor). It compares the merge base of `--base` and `--head` with `--head`, with renames shown as a delete and an add.
 
 `--out` writes `{"kind", "head_sha", "violations": [{"rule", "path", "detail"}], "needs_code_owner": [path], "dependency_changes": [{"name", "old", "new", "changelog"}], "fingerprint": {"round", "cumulative"}, "repeated_fix"}`.
 
@@ -261,6 +262,8 @@ Writes `{"verdict", "reasons", "conclusions": {"gate/archive", "gate/final"}}`.
 - **F-1** The verdict is `ready-for-human` only when the preliminary verdict is `ready-for-human` and the archive result says `stored` and `sha256sums_match` are both true.
 - **F-2** With the evidence not stored or a missing or unreadable archive result, a preliminary `ready-for-human` becomes `incomplete` with code `EVIDENCE_NOT_STORED`. Any other preliminary verdict stays as it is and gains that reason.
 - **F-2a** A missing or unreadable preliminary verdict gives `incomplete`, code `NO_PRELIMINARY`. `--expect-verdict-sha256 VALUE` compares the verdict file with the hash the publish job gave through its job output, which a job that ran PR code cannot change: a difference, or an empty value, gives `blocked`, code `PUBLISH_OUTPUT_MISMATCH`. `--env-result FILE` with `ok` not true adds `FAILED_CHECK`, and a ready verdict becomes `blocked`.
+- **F-1a** A preliminary verdict file whose own `checks` hold anything but `success` never becomes ready.
+- **F-4** An archive result with `actors_ok` false makes `gate/archive` a failure, turns a ready verdict into `blocked`, and adds the code `REPORTS_WRITTEN_BY_ANOTHER_ACTOR`.
 - **F-3** `gate/final` is `success` only for `ready-for-human`. Every other verdict is `failure`, never `neutral` or `skipped`, because GitHub counts those as success. `gate/archive` is `success` only when the evidence was stored and matches.
 
 ### 8.3 `compare`
@@ -291,34 +294,58 @@ The GitHub side of the judge: `context`, `jobs`, `extras`, `post-checks`, `post-
 
 ## 9. `gate.archive`
 
-`python -P -m gate.archive store --remote URL --branch reports --pr N --run-id R --attempt A --artifact DIR --publish DIR --context FILE --out FILE [--max-bytes N]`
+`python -P -m gate.archive store (--remote URL | --api-repo OWNER/NAME) --branch reports --pr N --run-id R --attempt A --artifact DIR --publish DIR --context FILE --out FILE [--max-bytes N]`
 
 Stores `reports/<pr>/<run_id>-<attempt>/` on the branch: `context.json`, the files of `--publish`, the artifact under `artifact/`, and `SHA256SUMS` over all of them as `<sha256>  <relative path>`, readable by `sha256sum -c`. For later runs `guard.json` and `acceptance.json` are also stored at the top of the attempt's folder, from the artifact, when present.
 
-`--out` writes `{"stored", "sha256sums_match", "path", "commit", "reason", "artifact_present", "skipped_unsafe"}`. The exit code is 0 when stored and matching, otherwise 1.
+`--out` writes `{"stored", "sha256sums_match", "path", "commit", "reason", "artifact_present", "skipped_unsafe", "actors_ok"}`, and `foreign_commits` when some exist. The exit code is 0 when stored, matching and `actors_ok`, otherwise 1.
+
+`--remote` is a plain git remote, such as a local bare repository. `--api-repo` writes to GitHub through the API at `GITHUB_API_URL`, with the token in `GATE_TOKEN`:
+
+| Purpose | Route |
+|---|---|
+| The branch's head | `GET /repos/{repo}/git/ref/heads/{branch}`: `object.sha`. A 404 means the branch does not exist |
+| The files | `GET /repos/{repo}/git/trees/{commit}?recursive=1`: `tree[].path`, `type`, `sha`, and `truncated`, which is an error when true |
+| Write a file | `POST /repos/{repo}/git/blobs`: `content` in base64, `encoding`: `sha` |
+| Write a tree | `POST /repos/{repo}/git/trees`: `tree[]` of `path`, `mode`, `type`, `sha`, and `base_tree` when the branch exists: `sha` |
+| Write a commit | `POST /repos/{repo}/git/commits`: exactly `message`, `tree`, `parents`: `sha` |
+| Move the branch | `PATCH /repos/{repo}/git/refs/heads/{branch}`: `sha`, `force` false. For a new branch, `POST /repos/{repo}/git/refs`: `ref`, `sha`. A 409 or 422 means it moved |
+| Read a file | `GET /repos/{repo}/git/blobs/{sha}`: `content` in base64 |
+| The commits | `GET /repos/{repo}/commits?sha={branch}&per_page=100&page={n}`: `sha`, `author.login`, `commit.verification.verified` |
 
 - **W-1** The branch is created, with no parent, when missing.
 - **W-2** A missing artifact folder still stores the rest, with `artifact_present` false. This is the cancelled run.
 - **W-3 Append only.** When the attempt's folder already exists, nothing changes and the result has `stored` false, reason `ALREADY_EXISTS`.
 - **W-4** It never force-pushes. On a refused push it fetches and retries, up to 5 times. Two runs at once both end stored.
 - **W-5 Read-back.** After the push it reads the branch again from the remote and recomputes every SHA-256. `sha256sums_match` is true only when all agree.
-- **W-6 Untrusted artifact.** Symbolic links and anything under a `.git` folder are not stored and are listed in `skipped_unsafe`.
+- **W-6 Untrusted artifact.** Symbolic links and anything under a `.git` folder are not stored and are listed in `skipped_unsafe`. Everything else is stored byte for byte, a `.gitignore` or a `.gitattributes` included, and neither changes how another file is stored.
 - **W-7** An artifact larger than `--max-bytes` (default 200,000,000) is not stored: `stored` false, reason `TOO_LARGE`.
 - **W-8** Earlier attempts are never changed.
+- **W-11** A `--remote` on `github.com` exits 2. A `git push` would leave the commits unsigned, so GitHub is written only with `--api-repo`.
+- **W-12 Another actor (HQ's addition to decision R).** The executor's app has Contents write, and the ruleset blocks only force pushes and deletion. With `--api-repo`, after each write every commit on the branch must have `author.login` `github-actions[bot]` and `commit.verification.verified` true. Otherwise `actors_ok` is false, `reason` is `reports written by another actor`, `foreign_commits` lists them, and the exit code is 1. The evidence stays stored. When the commits cannot be read, `actors_ok` is also false.
+- **W-13** A commit body holds no author, committer or signature: GitHub signs a commit only without them.
 
-`python -P -m gate.archive append --remote URL --branch reports --path RELPATH --file FILE --out FILE` adds one file that does not yet exist to a stored folder, with a read-back, and writes the same result. An existing file gives `stored` false, reason `ALREADY_EXISTS`.
+`python -P -m gate.archive append (--remote URL | --api-repo OWNER/NAME) --branch reports --path RELPATH --file FILE --out FILE` adds one file that does not yet exist to a stored folder, with a read-back, and writes the same result. `RELPATH` is the new file's own path from the branch's root, for example `reports/7/1001-1/final.json`. An existing file gives `stored` false, reason `ALREADY_EXISTS`.
 
-## 10. `gate.feedback` (decision N)
+## 10. `gate.feedback` (decisions N and R)
 
-`python -P -m gate.feedback decide --event-name NAME --event FILE --pulls FILE --reports-dir DIR --config FILE --out FILE [--integration-branch candidate/a]`
+`python -P -m gate.feedback decide --event-name NAME --event FILE --pulls FILE --reports-dir DIR --config FILE --out FILE [--statuses FILE] [--integration-branch candidate/a]`
 
-`--pulls`, trusted, lists open PRs: `[{"number", "head_sha", "base_ref", "head_ref"}]`.
+The events are `workflow_run` and `issue_comment`. Any other event exits 2, `status` included. A missing `--reports-dir` folder exits 2: a lost read must never look like "no earlier rounds".
 
-Writes `{"act", "pr", "head_sha", "round", "reason_code", "comment"}`. Exit 0 whether it acts or not. `act` is true only with `reason_code` null.
+`--pulls`, trusted, lists open PRs: `[{"number", "head_sha", "base_ref", "head_ref"}]`. `--statuses`, trusted, is the API's list of the commit's statuses, newest first: `[{"context", "state", "creator": {"login"}}]`.
+
+Writes `{"act", "post", "pr", "head_sha", "round", "reason_code", "comment"}`. Exit 0 whether it acts or not. `act` is true only with `reason_code` null. `post` says whether the comment goes on the PR.
 
 **`workflow_run` events.** `workflow_run.path` must equal `feedback.judge_workflow_path` and `workflow_run.event` must be `pull_request_target`, otherwise `UNEXPECTED_SENDER`. The record is found at `<reports-dir>/*/<workflow_run.id>-<workflow_run.run_attempt>/`: `context.json` gives `pr` and `head_sha`, `final.json` gives the verdict. No record gives `NO_RECORD`. A verdict of `ready-for-human` gives `NOT_A_FAILURE`, and `needs-human` gives `NEEDS_HUMAN`.
 
-**`status` events.** `context` must be `independent-review`, otherwise `WRONG_CONTEXT`. `state` must be `failure`, otherwise `NOT_A_FAILURE`. `sender.login` must be `<feedback.reviewer_app>[bot]`, otherwise `UNEXPECTED_SENDER`. `sha` is the head.
+**`issue_comment` events (decision R).** In this order:
+
+- `action` must be `created` and `issue.pull_request` must be present, otherwise `NOT_A_REVIEW`.
+- `sender.login` must be `<feedback.reviewer_app>[bot]`, otherwise `UNEXPECTED_SENDER`. The sender decides, never the comment's text.
+- The comment's body must hold the marker `<!-- gate-review sha=<40 hex> verdict=<pass|changes_requested> -->`, otherwise `NO_MARKER`. Its SHA is the head. A verdict of `pass` gives `NOT_A_FAILURE`.
+- In `--statuses`, the newest status with `context` `independent-review` must have `state` `failure`, otherwise `STATUS_NOT_FAILURE`, and `creator.login` `<feedback.reviewer_app>[bot]`, otherwise `STATUS_WRONG_CREATOR`. A verdict in the comment alone starts nothing.
+- For a comment event, D-1 also requires that the listed PR with this head is `issue.number`.
 
 **Both events, in this order:**
 
@@ -328,6 +355,11 @@ Writes `{"act", "pr", "head_sha", "round", "reason_code", "comment"}`. Exit 0 wh
 - **D-4** A stored `guard.json` for this head with `repeated_fix` true gives `REPEATED_FIX`.
 - **D-5** Otherwise `act` is true and `round` is the done rounds plus one.
 - **D-6** `comment` always says what happened and why, in plain text, obeys C-4 and C-5, and writes the mention as `` `@claude` ``.
+- **D-7** `post` is true, so that the PR is told why, except for `NOT_A_FAILURE`, `NOT_A_REVIEW` and `UNEXPECTED_SENDER`. Anyone can comment on a public repository, and the gate must not answer each one.
+
+`python -P -m gate.feedback outputs --decision FILE --config FILE --output FILE --note FILE` hands a decision to the workflow: `act`, `post`, `pr`, `head-ref`, `allowed-bots`.
+
+- **D-8** It refuses, with exit 2, a branch name or an app name that holds anything outside letters, digits and `._/-`, and a PR that is not a positive integer. These values reach expressions.
 
 ## 11. `gate.review_local`
 
@@ -350,7 +382,7 @@ Routes it uses:
 
 - **L-1** The model gets only `SPEC.md`, the issue, the diff and the judge's report, on stdin, in an empty temporary folder. Its environment holds none of the `REVIEWER_*` variables.
 - **L-2** The default command is `codex exec --sandbox read-only --skip-git-repo-check --ephemeral --output-schema <file> -o <file> -`. `--codex "COMMAND"` replaces the program. The arguments `--output-schema <file>` and `-o <file>` are always passed. The result is the JSON written to the `-o` file: `{"verdict": "pass"|"changes_requested", "findings": [{"severity", "where", "what"}]}`.
-- **L-3** `pass` posts `success`, and `changes_requested` posts `failure`, with `context` `independent-review` on exactly `--sha`. A comment carries the findings and obeys C-4 and C-5.
+- **L-3** `pass` posts `success`, and `changes_requested` posts `failure`, with `context` `independent-review` on exactly `--sha`. **The status is posted first, then the comment (decision R)**: the comment can start a fix round, which checks the status. The comment carries the findings, obeys C-4 and C-5, and holds the marker `<!-- gate-review sha=<the SHA> verdict=<the verdict> -->`.
 - **L-4** When `--sha` is not the PR's head, before the model or again just before posting, nothing is posted and the exit code is 1, code `HEAD_MOVED`.
 - **L-5** A model result that is missing, is not valid JSON, or has another verdict posts nothing and exits 1, code `MODEL_OUTPUT_INVALID`. The gate then stays blocked: it fails closed.
 - **L-6** A missing part of the input, the judge's report included, runs no model, posts nothing and exits 1, code `MISSING_INPUT`.
@@ -359,7 +391,7 @@ Routes it uses:
 
 ## 12. Workflows (checked from their YAML)
 
-- **Y-1** All four are `on: workflow_call`: `judge.yml`, `executor.yml`, `spec-tests.yml`, `feedback.yml`. Runners are exactly `ubuntu-24.04`.
+- **Y-1** These four are `on: workflow_call`: `judge.yml`, `executor.yml`, `spec-tests.yml`, `feedback.yml`. Runners are exactly `ubuntu-24.04`, in every workflow.
 - **Y-2** Every `uses:` of an action is `owner/name@<40 hex>`, and each is in `ACTIONS-LOCK.md`.
 - **Y-3 Exact permissions in `judge.yml`.** `run`: `contents: read`. `publish`: `checks: write`, `pull-requests: write`, `actions: read`, `contents: read`. `archive`: `contents: write`, `checks: write`. These three permissions beyond the original table are amendment AA-01.
 - **Y-4** No workflow or job grants `actions: write`, or `permissions: write-all`.
@@ -370,4 +402,7 @@ Routes it uses:
 - **Y-9** The artifact upload has `retention-days: 30` and `if: ${{ always() }}`.
 - **Y-10** In `executor.yml` the app token comes from `actions/create-github-app-token`, and `claude-code-action` takes it as `github_token`. `claude_args` holds `--max-turns`. The job has `timeout-minutes`.
 - **Y-11** In `spec-tests.yml` the action's settings hold `permissions.deny` built from `spec_tests.deny_read`, for the read tools. The paths in `deny_read` are also removed from the working folder before the model starts.
-- **Y-12** In `feedback.yml` secrets are referenced only in the job that runs the executor. The decision job comes first and the executor job runs only when it says `act`.
+- **Y-12** In `feedback.yml` secrets are referenced only in the job that runs the executor. The decision job comes first and the executor job runs only when it says `act`. Its permissions are `contents: read` and `pull-requests: write`, and nothing more.
+- **Y-13 Self-test (decision T).** `self-test.yml` runs on `push` and `pull_request`, has `contents: read` and no secrets, and runs `make check` and actionlint, on Python given as an exact version, through `actions/setup-python` at a full SHA.
+- **Y-14** In `judge.yml`, `gate.archive` is called with `--api-repo`, never `--remote`.
+- **Y-15** `executor.yml` passes its `allowed-bots` input to the action's `allowed_bots`. At this action's pin, a bot's event is refused without it. It holds named apps, never `*`.

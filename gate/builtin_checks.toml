@@ -1,0 +1,32 @@
+# The two checks whose commands belong to the gate itself, not to the application.
+# Each one is run by gate.run_checks, so that its numeric exit code is recorded
+# like every other check's. {env:NAME} takes a value from the workflow's trusted context.
+
+[checks."gate/env"]
+class = "mandatory"
+commands = [[
+  "{env:GATE_PY}", "-P", "-m", "gate.env_check",
+  "--role", "{env:GATE_ENV_ROLE}",
+  "--config", "{env:GATE_CONFIG}",
+  "--out", "{raw}/env.json",
+]]
+env = { PYTHONPATH = "{env:GATE_HOME}" }
+required_outputs = ["env.json"]
+timeout_seconds = 120
+
+[checks."gate/guard"]
+class = "mandatory"
+commands = [[
+  "{env:GATE_PY}", "-P", "-m", "gate.guard",
+  "--repo", "{env:GATE_PR_DIR}",
+  "--base", "{env:GATE_BASE_SHA}",
+  "--head", "{env:GATE_HEAD_SHA}",
+  "--branch", "{env:GATE_HEAD_REF}",
+  "--config", "{env:GATE_CONFIG}",
+  "--reports-dir", "{env:GATE_REPORTS_DIR}",
+  "--pr", "{env:GATE_PR}",
+  "--out", "{raw}/guard.json",
+]]
+env = { PYTHONPATH = "{env:GATE_HOME}" }
+required_outputs = ["guard.json"]
+timeout_seconds = 300

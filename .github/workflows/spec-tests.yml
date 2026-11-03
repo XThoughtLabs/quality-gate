@@ -1,0 +1,136 @@
+# The spec-test author. Reusable: a repository calls it on workflow_dispatch.
+# It writes tests from the specification into acceptance/ on a spec/* branch,
+# and it must not see the application's code.
+name: spec-tests
+
+on:
+  workflow_call:
+    inputs:
+      config-path:
+        type: string
+        default: quality.toml
+      prompt-file:
+        type: string
+        default: prompts/spec-tests.md
+    secrets:
+      CLAUDE_CODE_OAUTH_TOKEN:
+        required: false
+      EXECUTOR_APP_PRIVATE_KEY:
+        required: false
+
+permissions: {}
+
+jobs:
+  limits:
+    name: limits
+    runs-on: ubuntu-24.04
+    timeout-minutes: 5
+    permissions:
+      contents: read
+    outputs:
+      max-turns: ${{ steps.limits.outputs.max-turns }}
+      timeout-minutes: ${{ steps.limits.outputs.timeout-minutes }}
+      integration-branch: ${{ steps.limits.outputs.integration-branch }}
+      spec-settings: ${{ steps.limits.outputs.spec-settings }}
+    env:
+      PYTHONPATH: ${{ github.workspace }}/.gate
+      GATE_CONFIG_PATH: ${{ inputs.config-path }}
+    steps:
+      - name: Get the gate at its pinned commit
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          repository: ${{ job.workflow_repository }}
+          ref: ${{ job.workflow_sha }}
+          path: .gate
+          persist-credentials: false
+
+      - name: Get the configuration from the default branch
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          path: .trusted
+          persist-credentials: false
+
+      - name: Set up Python
+        uses: actions/setup-python@6d4fd22b20465ccc0f7354476588e8df7c9ca0e0 # v7.1.0
+        with:
+          python-version: "3.13.15"
+
+      - name: Read the limits, and permissions.deny from spec_tests.deny_read
+        id: limits
+        run: 'python -P -m gate.publish limits --config ".trusted/$GATE_CONFIG_PATH" --output "$GITHUB_OUTPUT"'
+
+  author:
+    name: author
+    needs: limits
+    runs-on: ubuntu-24.04
+    timeout-minutes: ${{ fromJSON(needs.limits.outputs.timeout-minutes) }}
+    permissions:
+      contents: read
+    env:
+      PYTHONPATH: ${{ github.workspace }}/.gate
+      GATE_PROMPT_FILE: ${{ inputs.prompt-file }}
+      GATE_CONFIG_PATH: ${{ inputs.config-path }}
+    steps:
+      - name: Get the gate at its pinned commit
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          repository: ${{ job.workflow_repository }}
+          ref: ${{ job.workflow_sha }}
+          path: .gate
+          persist-credentials: false
+
+      - name: Set up Python
+        uses: actions/setup-python@6d4fd22b20465ccc0f7354476588e8df7c9ca0e0 # v7.1.0
+        with:
+          python-version: "3.13.15"
+
+      - name: gate/env
+        env:
+          CLAUDE_CODE_OAUTH_TOKEN: ${{ secrets.CLAUDE_CODE_OAUTH_TOKEN }}
+          EXECUTOR_APP_PRIVATE_KEY: ${{ secrets.EXECUTOR_APP_PRIVATE_KEY }}
+          EXECUTOR_APP_ID: ${{ vars.EXECUTOR_APP_ID }}
+        run: python -P -m gate.env_check --role spec-tests
+
+      - name: Mint the app's token
+        id: app-token
+        uses: actions/create-github-app-token@64ab729a6294000f5aa4a4bc0b73d1f32bc45510 # v3.3.0
+        with:
+          app-id: ${{ vars.EXECUTOR_APP_ID }}
+          private-key: ${{ secrets.EXECUTOR_APP_PRIVATE_KEY }}
+
+      - name: Move the gate out of the working folder
+        run: |
+          mv .gate "$RUNNER_TEMP/gate"
+          echo "PYTHONPATH=$RUNNER_TEMP/gate" >> "$GITHUB_ENV"
+
+      - name: Get the repository
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          token: ${{ steps.app-token.outputs.token }}
+          fetch-depth: 1
+
+      - name: Remove the paths of spec_tests.deny_read from the working folder
+        run: python -P -m gate.publish hide-paths --config "$GATE_CONFIG_PATH" --repo .
+
+      - name: Build the prompt
+        id: prompt
+        run: |
+          {
+            echo 'text<<GATE_PROMPT_END'
+            cat "$GATE_PROMPT_FILE"
+            echo 'GATE_PROMPT_END'
+          } >> "$GITHUB_OUTPUT"
+
+      - name: Run the spec-test author
+        uses: anthropics/claude-code-action@4845bacbb38b3c4b15d948f035349786f678e068 # v1.0.267
+        env:
+          GH_TOKEN: ${{ steps.app-token.outputs.token }}
+        with:
+          github_token: ${{ steps.app-token.outputs.token }}
+          claude_code_oauth_token: ${{ secrets.CLAUDE_CODE_OAUTH_TOKEN }}
+          base_branch: ${{ needs.limits.outputs.integration-branch }}
+          prompt: ${{ steps.prompt.outputs.text }}
+          settings: ${{ needs.limits.outputs.spec-settings }}
+          claude_args: >-
+            --max-turns ${{ needs.limits.outputs.max-turns }}
+            --allowedTools "Read,Write,Edit,Glob,Grep,Bash(git add:*),Bash(git commit:*),Bash(git checkout -b:*),Bash(git push:*),Bash(gh pr create:*)"
