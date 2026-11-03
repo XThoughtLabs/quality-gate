@@ -1,4 +1,4 @@
-"""gate.security_check: rules S-1 to S-7."""
+"""gate.security_check: rules S-1 to S-7 (S-5 and S-6 as amended by decision W)."""
 from __future__ import annotations
 
 import json
@@ -14,7 +14,7 @@ EMPTY_LEAKS: list = []
 MISSING = object()
 
 BANDIT_ONE = {"errors": [], "results": [
-    {"test_id": "B608", "filename": "workflow/store.py", "line_number": 121, "issue_text": "sql", "issue_severity": "MEDIUM"}]}
+    {"test_id": "B602", "filename": "src/app.py", "line_number": 121, "issue_text": "sql", "issue_severity": "MEDIUM"}]}
 PIP_ONE = {"dependencies": [
     {"name": "examplelib", "version": "1.0", "vulns": [{"id": "PYSEC-2024-0001", "fix_versions": ["1.1"], "description": "x"}]},
     {"name": "cleanlib", "version": "2.0", "vulns": []}]}
@@ -81,8 +81,8 @@ def finding(d, tool, rule=None):
 @pytest.mark.req("S-1", "S-3")
 def test_s1_bandit_finding_is_read_with_rule_path_and_line(tmp_path):
     res, d, _ = sec(tmp_path, bandit=BANDIT_ONE)
-    f = finding(d, "bandit", "B608")
-    assert len(f) == 1 and f[0]["path"] == "workflow/store.py" and f[0]["line"] == 121 and f[0]["reviewed"] is False
+    f = finding(d, "bandit", "B602")
+    assert len(f) == 1 and f[0]["path"] == "src/app.py" and f[0]["line"] == 121 and f[0]["reviewed"] is False
     assert_rc(res, 1)
 
 
@@ -123,7 +123,7 @@ def test_s1_several_findings_from_all_three_tools_are_all_listed(tmp_path):
 
 
 ALL_REVIEWED = [
-    ("bandit", "B608", "workflow/store.py", "table name is a constant"),
+    ("bandit", "B602", "src/app.py", "table name is a constant"),
     ("pip-audit", "PYSEC-2024-0001", "examplelib", "not reachable from our code"),
     ("gitleaks", "generic-api-key", "src/config.py", "a documented placeholder"),
 ]
@@ -147,15 +147,15 @@ def test_s2_a_row_does_not_depend_on_the_line_number(tmp_path):
 
 @pytest.mark.req("S-2", "S-3")
 @pytest.mark.parametrize("variant,row", [
-    ("blank-reason", ("bandit", "B608", "workflow/store.py", "")),
-    ("other-rule", ("bandit", "B101", "workflow/store.py", "reason")),
-    ("other-path", ("bandit", "B608", "workflow/other.py", "reason")),
-    ("other-tool", ("gitleaks", "B608", "workflow/store.py", "reason")),
+    ("blank-reason", ("bandit", "B602", "src/app.py", "")),
+    ("other-rule", ("bandit", "B101", "src/app.py", "reason")),
+    ("other-path", ("bandit", "B602", "src/other.py", "reason")),
+    ("other-tool", ("gitleaks", "B602", "src/app.py", "reason")),
 ])
 def test_s2_a_row_that_does_not_match_or_has_no_reason_does_not_review(tmp_path, variant, row):
     res, d, _ = sec(tmp_path, bandit=BANDIT_ONE, review=[row])
     assert_rc(res, 1)
-    assert finding(d, "bandit", "B608")[0]["reviewed"] is False
+    assert finding(d, "bandit", "B602")[0]["reviewed"] is False
     assert "UNREVIEWED_FINDING" in d["reason_codes"]
 
 
@@ -163,10 +163,10 @@ def test_s2_a_row_that_does_not_match_or_has_no_reason_does_not_review(tmp_path,
 def test_s2_only_the_matching_finding_is_reviewed(tmp_path):
     two = {"errors": [], "results": [
         BANDIT_ONE["results"][0],
-        {"test_id": "B105", "filename": "workflow/auth.py", "line_number": 5, "issue_text": "pw", "issue_severity": "LOW"}]}
+        {"test_id": "B105", "filename": "src/auth.py", "line_number": 5, "issue_text": "pw", "issue_severity": "LOW"}]}
     res, d, _ = sec(tmp_path, bandit=two, review=[ALL_REVIEWED[0]])
     assert_rc(res, 1)
-    assert finding(d, "bandit", "B608")[0]["reviewed"] is True
+    assert finding(d, "bandit", "B602")[0]["reviewed"] is True
     assert finding(d, "bandit", "B105")[0]["reviewed"] is False
 
 
@@ -304,7 +304,8 @@ def sec_tools(tmp_path, tools):
 
 def exit_codes(d):
     got = d["tool_exit_codes"]
-    return list(got.values()) if isinstance(got, dict) else list(got)
+    assert isinstance(got, list) and all(type(c) is int for c in got), f"a list of integers, got {got!r}"
+    return got
 
 
 @pytest.mark.req("S-7")
@@ -314,7 +315,7 @@ def test_s7_a_tool_that_finds_nothing_but_exits_non_zero_does_not_decide_only_it
     assert_rc(res, 0)
     assert_no_traceback(res)
     assert d["ok"] is True and d["reason_codes"] == []
-    assert exit_codes(d) == [1, 0, 1] or sorted(exit_codes(d)) == [0, 1, 1], "each tool's exit code is recorded"
+    assert exit_codes(d) == [1, 0, 1], "each tool's exit code is recorded, in the order the commands were given"
 
 
 @pytest.mark.req("S-7", "S-3")
@@ -323,8 +324,8 @@ def test_s7_a_tool_that_finds_something_is_judged_by_its_output(tmp_path):
                                   (EMPTY_LEAKS, "gitleaks.json", 0)])
     assert_rc(res, 1)
     assert "UNREVIEWED_FINDING" in d["reason_codes"]
-    assert finding(d, "bandit", "B608")[0]["path"] == "workflow/store.py"
-    assert 1 in exit_codes(d)
+    assert finding(d, "bandit", "B602")[0]["path"] == "src/app.py"
+    assert exit_codes(d) == [1, 0, 0]
 
 
 @pytest.mark.req("S-7")
@@ -333,4 +334,52 @@ def test_s7_the_flag_is_repeatable_and_the_tool_runs_before_its_output_is_read(t
     # the gitleaks output was never produced, so S-4 still applies to it, but the other two were read after their commands ran
     assert_rc(res, 1)
     assert d["reason_codes"].count("MISSING_TOOL_OUTPUT") >= 1
-    assert len(exit_codes(d)) == 2
+    assert exit_codes(d) == [0, 0]
+
+
+# ----------------------------------------------------------------------------- S-5: each spelling (decision W)
+
+NOSEC_SPELLINGS = ["# nosec", "#nosec", "# NOSEC", "# NoSec", "#   nosec", "# nosec B307", "# nosec:B307", "# NOSEC B307"]
+GITLEAKS_SPELLINGS = ["gitleaks:allow", "GITLEAKS:ALLOW", "Gitleaks:Allow", "gitleaks: allow", "gitleaks :allow",
+                      "gitleaks:  allow", "gitleaks : allow", "# gitleaks:allow", "#gitleaks:allow"]
+
+
+@pytest.mark.req("S-5")
+@pytest.mark.parametrize("spelling", NOSEC_SPELLINGS)
+def test_s5_each_nosec_spelling_without_a_row_exits_1(tmp_path, spelling):
+    res, d, _ = sec(tmp_path, head_files={"src/app.py": f"def f():\n    return eval('1')  {spelling}\n"})
+    assert_rc(res, 1)
+    assert "SUPPRESSION_WITHOUT_ENTRY" in d["reason_codes"] and "src/app.py" in json.dumps(d["suppressions"])
+
+
+@pytest.mark.req("S-5")
+@pytest.mark.parametrize("spelling", NOSEC_SPELLINGS)
+def test_s5_control_each_nosec_spelling_with_a_row_for_that_tool_and_path_is_allowed(tmp_path, spelling):
+    res, d, _ = sec(tmp_path, head_files={"src/app.py": f"def f():\n    return eval('1')  {spelling}\n"},
+                    review=[("bandit", "B307", "src/app.py", "eval of a literal, reviewed")])
+    assert_rc(res, 0)
+    assert "SUPPRESSION_WITHOUT_ENTRY" not in d["reason_codes"]
+
+
+@pytest.mark.req("S-5")
+@pytest.mark.parametrize("spelling", GITLEAKS_SPELLINGS)
+def test_s5_each_gitleaks_spelling_without_a_row_exits_1(tmp_path, spelling):
+    res, d, _ = sec(tmp_path, head_files={"src/config.py": f"KEY = 'placeholder'  {spelling}\n"})
+    assert_rc(res, 1)
+    assert "SUPPRESSION_WITHOUT_ENTRY" in d["reason_codes"] and "src/config.py" in json.dumps(d["suppressions"])
+
+
+@pytest.mark.req("S-5")
+@pytest.mark.parametrize("spelling", GITLEAKS_SPELLINGS)
+def test_s5_control_each_gitleaks_spelling_with_a_row_for_that_tool_and_path_is_allowed(tmp_path, spelling):
+    res, d, _ = sec(tmp_path, head_files={"src/config.py": f"KEY = 'placeholder'  {spelling}\n"},
+                    review=[("gitleaks", "generic-api-key", "src/config.py", "documented placeholder")])
+    assert_rc(res, 0)
+    assert "SUPPRESSION_WITHOUT_ENTRY" not in d["reason_codes"]
+
+
+@pytest.mark.req("S-5")
+@pytest.mark.parametrize("line", ["x = 1  # nose", "x = 1  # gitleaks", "x = 1  # allow", "x = 1  # no sec"])
+def test_s5_control_near_misses_are_no_suppression(tmp_path, line):
+    res, d, _ = sec(tmp_path, head_files={"src/app.py": f"def f():\n    {line}\n    return 1\n"})
+    assert "SUPPRESSION_WITHOUT_ENTRY" not in d["reason_codes"], line

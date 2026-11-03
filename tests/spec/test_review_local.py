@@ -1,4 +1,4 @@
-"""gate.review_local: rules L-1 to L-8 (L-3 as amended by decision R). A local stub plays the GitHub API; a small Python fake plays the model."""
+"""gate.review_local: rules L-1, L-1a, L-2 to L-8 (L-3 as amended by decision R). A local stub plays the GitHub API; a small Python fake plays the model."""
 from __future__ import annotations
 
 import base64
@@ -12,7 +12,8 @@ from pathlib import Path
 import pytest
 
 from gatekit import (SENTINEL_PREFIX, assert_no_traceback, assert_rc, assert_refused, bare_mentions, base_env,
-                     load_out, read_json, run_gate, write_text)
+                     load_out, make_config, read_json, run_gate, write_text)
+from gitapi import BOT, FakeGitApi
 
 REPO = "example-org/example-app"
 PR_N, ISSUE_N, INSTALL_ID, APP_ID = 7, 3, "555", "424242"
@@ -109,7 +110,11 @@ class RL:
         self.head_always = None
         self.move_after_model = False
         self.reports = {f"reports/{PR_N}/1001-1/report.json": report_text(SHA, "JUDGE-REPORT-MARKER-DELTA")}
+        self.quality_toml = None   # the default branch's quality.toml (None: a 404, so no list of accepted commits)
         self._routes()
+        # the commits of the reports branch (L-1a), a clean history unless a test adds to it
+        self.git_api = FakeGitApi(stub, repo=REPO, token=INSTALL_TOKEN)
+        self.git_api.seed({f"reports/{PR_N}/1001-1/report.json": b"{}"}, author=BOT, verified=True)
 
     # ------------------------------------------------------------------ stub
     def _auth_ok(self, req):
@@ -179,6 +184,12 @@ class RL:
             path = req.path.split("/contents/", 1)[1]
             return (200, self.reports[path]) if path in self.reports else (404, {"message": "Not Found"})
 
+        def quality(req):
+            if not self._auth_ok(req):
+                return 401, {"message": "Bad credentials"}
+            return (200, self.quality_toml) if self.quality_toml is not None else (404, {"message": "Not Found"})
+
+        s.route("GET", repo + "/contents/quality.toml", quality)
         s.route("POST", re.escape(f"/app/installations/{INSTALL_ID}/access_tokens"), token)
         s.route("GET", repo + f"/pulls/{PR_N}", pull)
         s.route("GET", repo + "/contents/SPEC.md", spec)
@@ -405,7 +416,8 @@ def test_l2_the_default_command_is_codex_exec_with_the_documented_flags(rl, tmp_
     assert rl.record is not None, "the model was not run"
     args = rl.record["argv"]
     assert args[:1] == ["exec"]
-    for flag in ("--sandbox", "--skip-git-repo-check", "--ephemeral", "--output-schema", "-o"):
+    for flag in ("--sandbox", "--skip-git-repo-check", "--ephemeral", "--ignore-user-config", "--ignore-rules",
+                 "--output-schema", "-o"):
         assert flag in args, f"{flag} missing from {args}"
     assert args[args.index("--sandbox") + 1] == "read-only"
     assert args[-1] == "-", "the prompt is read from stdin"
@@ -618,3 +630,98 @@ def test_l3_when_posting_the_status_fails_no_comment_is_posted(rl, status):
     assert res.rc != 0
     assert_no_traceback(res)
     assert out["posted"] is False
+
+
+# ----------------------------------------------------------------------------- L-1: the model's environment is an allow-list
+
+ALLOWED = {"PATH", "PATHEXT", "SYSTEMROOT", "SYSTEMDRIVE", "WINDIR", "COMSPEC", "TEMP", "TMP", "TMPDIR", "HOME",
+           "USERPROFILE", "APPDATA", "LOCALAPPDATA", "CODEX_HOME", "LANG", "LC_ALL"}
+PYTHON_ADDS = {"__PYVENV_LAUNCHER__", "LC_CTYPE", "PYTHONCOERCECLOCALE"}   # what a Python interpreter may add to itself
+
+
+@pytest.mark.req("L-1")
+def test_l1_the_models_environment_holds_only_the_allowed_variables(rl):
+    plant = {"CODEX_HOME": str(rl.tmp / "codex-home"), "LANG": "C.UTF-8", "SOME_OTHER_SETTING": "SENTINEL-VALUE-OTHER",
+             "GITHUB_TOKEN": "SENTINEL-VALUE-GHT", "OPENAI_API_KEY": "SENTINEL-VALUE-OAI",
+             "HTTPS_PROXY": "http://127.0.0.1:9", "GIT_TERMINAL_PROMPT": "0", "MY_LIBRARY_PATH": "SENTINEL-VALUE-LIB"}
+    res, _ = rl.run("pass", env=rl.env(**plant))
+    assert_rc(res, 0)
+    rec = rl.record
+    assert rec is not None, "the model was not run"
+    names = {k.upper() for k in rec["env"]}
+    unexpected = names - ALLOWED - PYTHON_ADDS
+    assert not unexpected, f"variables outside the allow-list reached the model: {sorted(unexpected)}"
+    assert not [v for v in rec["env"].values() if SENTINEL_PREFIX in v]
+    assert rec["env"].get("CODEX_HOME") == plant["CODEX_HOME"], "an allowed variable that is set is passed on"
+    assert "PATH" in names
+
+
+# ----------------------------------------------------------------------------- L-1a (decision V)
+
+
+def untrusted(rl, res, out):
+    assert_rc(res, 1)
+    assert_no_traceback(res)
+    assert rl.record is None, "no model may run when the reports branch cannot be trusted"
+    rl.nothing_posted()
+    assert_out(out, posted=False, state=None, code="REPORTS_UNTRUSTED")
+    assert not [r for r in rl.stub.requests if r.path.endswith("/git/trees/reports") or "/contents/reports/" in r.path], \
+        "the judge's report is not read before the check"
+
+
+@pytest.mark.req("L-1a")
+def test_l1a_the_reports_branch_is_checked_before_the_judges_report_is_read(rl):
+    res, out = rl.run("pass")
+    assert_rc(res, 0)
+    gets = [r for r in rl.stub.requests if r.method == "GET"]
+    first_check = next(i for i, r in enumerate(gets) if r.path.endswith("/commits"))
+    first_report = next(i for i, r in enumerate(gets) if r.path.endswith("/git/trees/reports") or "/contents/reports/" in r.path)
+    assert first_check < first_report, "the check of W-12 and W-14 comes before the report is read"
+    assert any(r.path.endswith("/contents/quality.toml") for r in gets), "the list comes from the default branch's quality.toml"
+    q = [r for r in gets if r.path.endswith("/contents/quality.toml")][0]
+    assert "application/vnd.github.raw" in q.header("accept")
+    assert rl.git_api.bad_auth == [] and rl.bad_auth == []
+
+
+@pytest.mark.req("L-1a")
+@pytest.mark.parametrize("how", ["other-author", "unsigned", "unreadable"])
+def test_l1a_a_foreign_commit_or_a_failed_read_runs_no_model_posts_nothing_and_exits_1(rl, how):
+    if how == "other-author":
+        rl.git_api.seed({f"reports/{PR_N}/1002-1/context.json": b"{}"}, author="someone-else[bot]")
+    elif how == "unsigned":
+        rl.git_api.seed({f"reports/{PR_N}/1002-1/context.json": b"{}"}, author=BOT, verified=False)
+    else:
+        rl.git_api.commits_status = 500
+    res, out = rl.run("pass")
+    untrusted(rl, res, out)
+
+
+@pytest.mark.req("L-1a", "W-14")
+def test_l1a_a_listed_commit_that_only_adds_under_reports_is_accepted_via_the_default_branchs_list(rl, tmp_path):
+    foreign = rl.git_api.seed({f"reports/{PR_N}/1002-1/context.json": b"{}"}, author="someone-else[bot]")
+    cfg = make_config(tmp_path / "q.toml", archive_accepted=[
+        {"sha": foreign, "reason": "a recovery commit that only added records", "date": "2026-11-03"}])
+    rl.quality_toml = cfg.read_text(encoding="utf-8")
+    res, out = rl.run("pass")
+    assert_rc(res, 0)
+    assert rl.statuses(), "with the list from the default branch the review goes on"
+
+
+@pytest.mark.req("L-1a", "W-14")
+def test_l1a_a_listed_commit_that_changes_a_record_stays_foreign(rl, tmp_path):
+    rl.git_api.seed({f"reports/{PR_N}/1002-1/context.json": b"{}"})
+    foreign = rl.git_api.seed({f"reports/{PR_N}/1002-1/context.json": b'{"changed": true}'}, author="someone-else[bot]")
+    cfg = make_config(tmp_path / "q.toml", archive_accepted=[
+        {"sha": foreign, "reason": "listed, but it changes a record", "date": "2026-11-03"}])
+    rl.quality_toml = cfg.read_text(encoding="utf-8")
+    res, out = rl.run("pass")
+    untrusted(rl, res, out)
+
+
+@pytest.mark.req("L-1a")
+def test_l1a_a_404_for_quality_toml_means_no_list_so_a_foreign_commit_still_blocks(rl):
+    assert rl.quality_toml is None   # the stub answers 404
+    rl.git_api.seed({f"reports/{PR_N}/1002-1/context.json": b"{}"}, author="someone-else[bot]")
+    res, out = rl.run("pass")
+    untrusted(rl, res, out)
+    assert [r for r in rl.stub.requests if r.path.endswith("/contents/quality.toml")], "the list was asked for"

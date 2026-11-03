@@ -1,4 +1,4 @@
-"""gate.feedback decide and outputs (decisions N and R): D-1 to D-8. The events are workflow_run and issue_comment."""
+"""gate.feedback decide and outputs (decisions N, R and V): D-0 to D-8. The events are workflow_run and issue_comment."""
 from __future__ import annotations
 
 from pathlib import Path
@@ -12,17 +12,23 @@ HEAD = "3" * 40
 OLD = ["a" * 40, "b" * 40, "c" * 40, "d" * 40]
 APP = "example-reviewer"
 BOT = f"{APP}[bot]"
-PR = {"number": 7, "head_sha": HEAD, "base_ref": "candidate/a", "head_ref": "ai/7-example"}
-NO_POST = {"NOT_A_FAILURE", "NOT_A_REVIEW", "UNEXPECTED_SENDER"}
+REPO_NAME = "example-org/example-app"
+PR = {"number": 7, "head_sha": HEAD, "base_ref": "candidate/a", "head_ref": "ai/7-example",
+      "head_repository": REPO_NAME, "repository": REPO_NAME}
+ACTORS_OK = {"actors_ok": True, "foreign_commits": [], "accepted_commits": [], "reason": None}
+MISSING = object()
+NO_POST = {"NOT_A_FAILURE", "NOT_A_REVIEW", "UNEXPECTED_SENDER"}   # D-7
 
 
 def marker(sha=HEAD, verdict="changes_requested"):
     return f"<!-- gate-review sha={sha} verdict={verdict} -->"
 
 
-def wf_event(run_id=1001, attempt=1, path=".github/workflows/judge.yml", event="pull_request_target"):
+def wf_event(run_id=1001, attempt=1, path=".github/workflows/judge.yml", event="pull_request_target",
+             conclusion="failure"):
     return {"action": "completed",
-            "workflow_run": {"id": run_id, "run_attempt": attempt, "path": path, "event": event, "conclusion": "failure"}}
+            "workflow_run": {"id": run_id, "run_attempt": attempt, "path": path, "event": event,
+                             "conclusion": conclusion}}
 
 
 def comment_event(*, sha=HEAD, verdict="changes_requested", login=BOT, number=7, action="created", pull_request=True,
@@ -41,15 +47,16 @@ def status(state="failure", creator=BOT, context="independent-review"):
 
 
 class Fb:
-    def __init__(self, tmp, kind="workflow_run", max_rounds=3):
+    def __init__(self, tmp, kind="workflow_run", max_rounds=3, integration_in_config="candidate/a"):
         self.tmp = Path(tmp)
         self.kind = kind
         self.reports = self.tmp / "reports"
         self.reports.mkdir()
         self.pulls = [dict(PR)]
         self.integration = None
-        self.cfg = make_config(self.tmp / "quality.toml", limits={"max_turns": 40, "timeout_minutes": 60,
-                                                                    "max_fix_rounds": max_rounds})
+        self.cfg = make_config(self.tmp / "quality.toml", integration_branch=integration_in_config,
+                               limits={"max_turns": 40, "timeout_minutes": 60, "max_fix_rounds": max_rounds})
+        self.actors = ACTORS_OK               # the result of gate.archive check-actors (D-0)
         self.event = wf_event() if kind == "workflow_run" else comment_event()
         self.statuses = [status()]            # newest first, as the API gives them
         self.send_statuses = kind == "issue_comment"
@@ -71,14 +78,21 @@ class Fb:
 
     def earlier_heads(self, n):
         for i, head in enumerate(OLD[:n]):
-            self.put(7, 900 + i, 1, head, final=False, context=False)
+            self.put(7, 900 + i, 1, head, final=False)   # D-3 counts the heads that context.json holds
 
     def args(self, event_name=None):
         event = write_json(self.tmp / "event.json", self.event)
         pulls = write_json(self.tmp / "pulls.json", self.pulls)
         out = self.tmp / "decision.json"
-        args = ["decide", "--event-name", self.kind if event_name is None else event_name, "--event", event, "--pulls", pulls, "--reports-dir",
-                self.reports, "--config", self.cfg, "--out", out]
+        actors = self.tmp / "actors.json"
+        if self.actors is MISSING:
+            pass                               # the file does not exist
+        elif isinstance(self.actors, str):
+            write_text(actors, self.actors)    # an unreadable file
+        else:
+            write_json(actors, self.actors)
+        args = ["decide", "--event-name", self.kind if event_name is None else event_name, "--event", event,
+                "--pulls", pulls, "--reports-dir", self.reports, "--actors", actors, "--config", self.cfg, "--out", out]
         if self.send_statuses:
             args += ["--statuses", write_json(self.tmp / "statuses.json", self.statuses)]
         if self.integration:
@@ -120,11 +134,21 @@ def test_d5_acts_on_a_current_head_with_round_one_and_writes_the_mention_in_back
 
 
 @pytest.mark.req("D-5")
-@pytest.mark.parametrize("verdict", ["blocked", "incomplete"])
-def test_workflow_run_acts_on_blocked_and_incomplete_verdicts(tmp_path, verdict):
+def test_workflow_run_acts_on_a_blocked_verdict(tmp_path):
+    fb = Fb(tmp_path)
+    fb.put(7, 1001, 1, HEAD, verdict="blocked")
+    assert fb.run()["act"] is True
+
+
+@pytest.mark.req("WR-1")
+@pytest.mark.parametrize("verdict", ["incomplete", "cancelled", "success", "unknown", ""])
+def test_workflow_run_with_any_other_verdict_than_blocked_is_not_actionable(tmp_path, verdict):
+    # a cancelled or lost run starts no model
     fb = Fb(tmp_path)
     fb.put(7, 1001, 1, HEAD, verdict=verdict)
-    assert fb.run()["act"] is True
+    d = fb.run()
+    refused(d, "NOT_ACTIONABLE")
+    assert d["post"] is True
 
 
 @pytest.mark.req("D-5")
@@ -141,8 +165,8 @@ def test_d5_round_is_the_number_of_done_rounds_plus_one(tmp_path, kind, earlier,
 @pytest.mark.parametrize("kind", KINDS)
 def test_d3_runs_of_one_head_count_once(tmp_path, kind):
     fb = Fb(tmp_path, kind)
-    fb.put(7, 1001, 2, HEAD, final=False, context=False)   # a rerun of the same commit
-    fb.put(7, 1002, 1, HEAD, final=False, context=False)
+    fb.put(7, 1001, 2, HEAD, final=False)   # a rerun of the same commit
+    fb.put(7, 1002, 1, HEAD, final=False)
     d = fb.run()
     assert d["act"] is True and d["round"] == 1, "distinct head_sha values are counted, not runs"
 
@@ -171,7 +195,7 @@ def test_d3_the_cap_is_limits_max_fix_rounds(tmp_path):
 def test_d3_only_this_prs_records_count(tmp_path, kind):
     fb = Fb(tmp_path, kind)
     for i, head in enumerate(OLD):
-        fb.put(8, 800 + i, 1, head, final=False, context=False)
+        fb.put(8, 800 + i, 1, head, final=False)
     d = fb.run()
     assert d["act"] is True and d["round"] == 1
 
@@ -191,7 +215,7 @@ def test_d4_repeated_fix_stored_for_this_head_stops_the_loop(tmp_path, kind):
 @pytest.mark.parametrize("kind", KINDS)
 def test_d4_control_repeated_fix_stored_for_another_head_does_not_stop_this_one(tmp_path, kind):
     fb = Fb(tmp_path, kind)
-    fb.put(7, 900, 1, OLD[0], repeated=True, final=False, context=False)
+    fb.put(7, 900, 1, OLD[0], repeated=True, final=False)
     d = fb.run()
     assert d["act"] is True and d["round"] == 2
 
@@ -667,7 +691,7 @@ def decision(**change):
 
 def outputs(tmp_path, dec, *, app=APP):
     cfg = make_config(tmp_path / "quality.toml", feedback={"judge_workflow_path": ".github/workflows/judge.yml",
-                                                            "reviewer_app": app})
+                                                            "reviewer_app": app, "executor_app": "example-executor"})
     dec_path = write_json(tmp_path / "decision.json", dec)
     out, note = tmp_path / "github-output.txt", tmp_path / "note.md"
     res = run_gate("feedback", "outputs", "--decision", dec_path, "--config", cfg, "--output", out, "--note", note,
@@ -728,3 +752,228 @@ def test_d8_control_the_allowed_characters_pass(tmp_path, branch, app):
     assert_rc(res, 0)
     got = parse_outputs(out.read_text(encoding="utf-8"))
     assert got["head-ref"] == branch and app in got["allowed-bots"]
+
+
+# ----------------------------------------------------------------------------- D-0 (decision V): can the evidence be trusted?
+
+BAD_ACTORS = [
+    ("actors-not-ok", {"actors_ok": False, "foreign_commits": ["f" * 40], "accepted_commits": [],
+                       "reason": "reports written by another actor"}),
+    ("no-actors_ok-key", {"foreign_commits": [], "accepted_commits": []}),
+    ("empty-object", {}),
+    ("not-an-object", []),
+    ("unreadable", "this is not json {"),
+    ("empty-file", ""),
+    ("file-missing", MISSING),
+]
+
+
+@pytest.mark.req("D-0")
+@pytest.mark.parametrize("kind", KINDS)
+@pytest.mark.parametrize("name,actors", BAD_ACTORS, ids=[b[0] for b in BAD_ACTORS])
+def test_d0_actors_that_are_not_ok_or_cannot_be_read_mean_reports_untrusted(tmp_path, kind, name, actors):
+    fb = Fb(tmp_path, kind)
+    fb.actors = actors
+    d = fb.run()
+    refused(d, "REPORTS_UNTRUSTED")
+    assert d["post"] is True
+
+
+@pytest.mark.req("D-0")
+@pytest.mark.parametrize("kind", KINDS)
+def test_d0_control_actors_ok_true_goes_on_to_read_the_evidence(tmp_path, kind):
+    fb = Fb(tmp_path, kind)
+    fb.actors = dict(ACTORS_OK, accepted_commits=["a" * 40])   # accepted commits are fine
+    assert fb.run()["act"] is True
+
+
+@pytest.mark.req("D-0")
+@pytest.mark.parametrize("kind", KINDS)
+def test_d0_stored_evidence_is_not_read_when_it_cannot_be_trusted(tmp_path, kind):
+    fb = Fb(tmp_path, kind)
+    fb.actors = dict(ACTORS_OK, actors_ok=False)
+    (fb.reports / "7" / "1001-1" / "context.json").write_text("this is not json {", encoding="utf-8")
+    (fb.reports / "7" / "1001-1" / "guard.json").write_text("{ nor this", encoding="utf-8")
+    if kind == "workflow_run":
+        fb.event = wf_event(run_id=4242)    # a record that would be NO_RECORD if the folder were read
+    refused(fb.run(), "REPORTS_UNTRUSTED")
+
+
+# the orders around D-0
+
+@pytest.mark.req("D-0", "N-1")
+def test_order_workflow_run_unexpected_sender_comes_before_d0(tmp_path):
+    fb = Fb(tmp_path)
+    fb.event = wf_event(path=".github/workflows/other.yml")
+    fb.actors = dict(ACTORS_OK, actors_ok=False)
+    refused(fb.run(), "UNEXPECTED_SENDER")
+
+
+@pytest.mark.req("D-0", "N-1")
+def test_order_workflow_run_d0_comes_before_cancelled(tmp_path):
+    fb = Fb(tmp_path)
+    fb.event = wf_event(conclusion="cancelled")
+    fb.actors = dict(ACTORS_OK, actors_ok=False)
+    refused(fb.run(), "REPORTS_UNTRUSTED")
+
+
+@pytest.mark.req("DR-0", "D-0")
+def test_order_comment_not_a_review_and_unexpected_sender_come_before_d0(tmp_path):
+    fb = cm(tmp_path, action="edited", login="mallory")
+    fb.actors = dict(ACTORS_OK, actors_ok=False)
+    refused(fb.run(), "NOT_A_REVIEW")
+    other = tmp_path / "second"
+    other.mkdir()
+    fb2 = Fb(other, "issue_comment")
+    fb2.event = comment_event(login="mallory")
+    fb2.actors = dict(ACTORS_OK, actors_ok=False)
+    refused(fb2.run(), "UNEXPECTED_SENDER")
+
+
+@pytest.mark.req("DR-0", "D-0")
+def test_order_comment_d0_comes_before_the_marker(tmp_path):
+    fb = cm(tmp_path, body="no marker here")
+    fb.actors = dict(ACTORS_OK, actors_ok=False)
+    refused(fb.run(), "REPORTS_UNTRUSTED")
+
+
+# ----------------------------------------------------------------------------- the workflow_run record and its conclusion
+
+
+@pytest.mark.req("N-1")
+@pytest.mark.parametrize("with_record", [True, False], ids=["with-a-blocked-record", "without-any-record"])
+def test_workflow_run_cancelled_is_not_actionable_whatever_is_stored(tmp_path, with_record):
+    fb = Fb(tmp_path)
+    fb.event = wf_event(run_id=1001 if with_record else 4242, conclusion="cancelled")
+    d = fb.run()
+    refused(d, "NOT_ACTIONABLE")
+    assert d["post"] is True
+
+
+@pytest.mark.req("N-1")
+@pytest.mark.parametrize("conclusion", ["failure", "success", "neutral"])
+def test_workflow_run_control_other_conclusions_go_on_to_the_record(tmp_path, conclusion):
+    fb = Fb(tmp_path)
+    fb.event = wf_event(conclusion=conclusion)
+    assert fb.run()["act"] is True
+
+
+@pytest.mark.req("N-1")
+def test_workflow_run_a_record_in_two_pr_folders_is_ambiguous_and_is_no_record(tmp_path):
+    fb = Fb(tmp_path)
+    fb.put(8, 1001, 1, "9" * 40, verdict="blocked")   # the same run id and attempt under another PR
+    refused(fb.run(), "NO_RECORD")
+
+
+@pytest.mark.req("N-1")
+def test_workflow_run_a_pr_that_is_not_its_folders_name_is_no_record(tmp_path):
+    fb = Fb(tmp_path)
+    write_json(fb.reports / "7" / "1001-1" / "context.json", {"pr": 9, "head_sha": HEAD, "run_id": 1001, "run_attempt": 1})
+    refused(fb.run(), "NO_RECORD")
+
+
+@pytest.mark.req("N-1")
+@pytest.mark.parametrize("missing", ["context.json", "final.json"])
+def test_workflow_run_a_missing_file_of_the_record_is_no_record(tmp_path, missing):
+    fb = Fb(tmp_path)
+    (fb.reports / "7" / "1001-1" / missing).unlink()
+    refused(fb.run(), "NO_RECORD")
+
+
+@pytest.mark.req("N-1")
+def test_workflow_run_control_the_same_run_id_with_another_attempt_is_a_different_folder(tmp_path):
+    fb = Fb(tmp_path)
+    fb.put(8, 1001, 2, "9" * 40, verdict="blocked")   # not the attempt of the event
+    assert fb.run()["act"] is True
+
+
+@pytest.mark.req("D-3")
+def test_d3_rounds_are_counted_from_context_json_and_not_from_guard_json(tmp_path):
+    fb = Fb(tmp_path)
+    for i, head in enumerate(OLD[:3]):                 # guard.json files without a context.json count for nothing
+        fb.put(7, 900 + i, 1, head, final=False, context=False)
+    d = fb.run()
+    assert d["act"] is True and d["round"] == 1
+
+
+# ----------------------------------------------------------------------------- D-2a
+
+
+@pytest.mark.req("D-2a")
+@pytest.mark.parametrize("kind", KINDS)
+@pytest.mark.parametrize("head_repository", ["someone-else/example-app", "example-org/example-app-fork", ""])
+def test_d2a_a_pull_request_from_another_repository_is_a_fork(tmp_path, kind, head_repository):
+    fb = Fb(tmp_path, kind)
+    fb.pulls = [dict(PR, head_repository=head_repository)]
+    d = fb.run()
+    refused(d, "FORK_PR")
+    assert d["post"] is True
+
+
+@pytest.mark.req("D-2a")
+@pytest.mark.parametrize("kind", KINDS)
+@pytest.mark.parametrize("head_ref", ["spec/tests-1", "maint/lists", "feature/x", "ai-fix", "aix/1", "feature/ai/7"])
+def test_d2a_only_an_ai_branch_gets_a_fix_round(tmp_path, kind, head_ref):
+    fb = Fb(tmp_path, kind)
+    fb.pulls = [dict(PR, head_ref=head_ref)]
+    d = fb.run()
+    refused(d, "NOT_AN_EXECUTOR_PR")
+    assert d["post"] is True
+
+
+@pytest.mark.req("D-2a")
+@pytest.mark.parametrize("kind", KINDS)
+@pytest.mark.parametrize("head_ref", ["ai/7-example", "ai/x/y", "ai/1"])
+def test_d2a_control_ai_branches_of_the_same_repository_act(tmp_path, kind, head_ref):
+    fb = Fb(tmp_path, kind)
+    fb.pulls = [dict(PR, head_ref=head_ref)]
+    assert fb.run()["act"] is True
+
+
+@pytest.mark.req("D-2a", "D-2")
+@pytest.mark.parametrize("kind", KINDS)
+def test_order_d2_comes_before_d2a(tmp_path, kind):
+    fb = Fb(tmp_path, kind)
+    fb.pulls = [dict(PR, base_ref="main", head_repository="someone-else/example-app", head_ref="spec/x")]
+    refused(fb.run(), "PR_NOT_INTO_INTEGRATION")
+
+
+@pytest.mark.req("D-2a")
+@pytest.mark.parametrize("kind", KINDS)
+def test_order_the_fork_check_comes_before_the_branch_check_and_both_before_d3(tmp_path, kind):
+    fb = Fb(tmp_path, kind)
+    fb.pulls = [dict(PR, head_repository="someone-else/example-app", head_ref="spec/x")]
+    fb.earlier_heads(3)
+    refused(fb.run(), "FORK_PR")
+    other = tmp_path / "second"
+    other.mkdir()
+    fb2 = Fb(other, kind)
+    fb2.pulls = [dict(PR, head_ref="spec/x")]
+    fb2.earlier_heads(3)
+    refused(fb2.run(), "NOT_AN_EXECUTOR_PR")
+
+
+# ----------------------------------------------------------------------------- the integration branch must be named
+
+
+@pytest.mark.req("D-2")
+@pytest.mark.parametrize("kind", KINDS)
+def test_d2_neither_the_flag_nor_the_configuration_names_the_branch_exits_2(tmp_path, kind):
+    fb = Fb(tmp_path, kind, integration_in_config=None)
+    args, out = fb.args()
+    res = run_gate("feedback", *args, cwd=tmp_path)
+    assert_refused(res, 2, out)
+
+
+@pytest.mark.req("D-2")
+def test_d2_control_the_flag_alone_names_the_branch(tmp_path):
+    fb = Fb(tmp_path, integration_in_config=None)
+    fb.integration = "candidate/a"
+    assert fb.run()["act"] is True
+
+
+@pytest.mark.req("D-2")
+def test_d2_control_the_configuration_alone_names_the_branch(tmp_path):
+    fb = Fb(tmp_path, integration_in_config="candidate/a")
+    assert fb.integration is None
+    assert fb.run()["act"] is True

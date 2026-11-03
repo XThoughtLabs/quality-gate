@@ -1,4 +1,4 @@
-"""gate.archive through the API (--api-repo): W-12, W-13 and the route table of section 9, against an in-memory stand-in."""
+"""gate.archive through the API (--api-repo): W-12 to W-15 and the route table of section 9, against an in-memory stand-in."""
 from __future__ import annotations
 
 import json
@@ -7,7 +7,8 @@ from pathlib import Path
 import pytest
 
 from archivekit import ART, PUB, RESULT_KEYS, folder, make_inputs, sums_of
-from gatekit import (assert_no_traceback, assert_rc, base_env, load_out, run_gate, sha256_bytes, write_bytes, write_text)
+from gatekit import (assert_no_traceback, assert_rc, base_env, load_out, make_config, run_gate, sha256_bytes,
+                     write_bytes, write_text)
 from gitapi import BOT, FakeGitApi
 
 ANOTHER_ACTOR_REASON = "reports written by another actor"
@@ -245,7 +246,7 @@ def assert_another_actor(res, d, api, foreign_sha=None):
 
 @pytest.mark.req("W-12")
 def test_w12_a_commit_by_another_author_is_found(tmp_path, api):
-    foreign = seed_other_run(api, author="xtl-gate-executor[bot]", verified=True)
+    foreign = seed_other_run(api, author="example-executor[bot]", verified=True)
     res, d = store_api(tmp_path, api, make_inputs(tmp_path))
     assert_another_actor(res, d, api, foreign)
     assert d["sha256sums_match"] is True
@@ -296,7 +297,7 @@ def test_w12_control_only_signed_commits_of_the_actions_bot_pass(tmp_path, api):
 
 @pytest.mark.req("W-12")
 def test_w12_the_check_is_run_after_the_write_so_a_late_foreign_commit_is_seen(tmp_path, api):
-    api.interfere.append({"files": {"reports/9/1-1/context.json": b"{}"}, "author": "xtl-gate-executor[bot]"})
+    api.interfere.append({"files": {"reports/9/1-1/context.json": b"{}"}, "author": "example-executor[bot]"})
     res, d = store_api(tmp_path, api, make_inputs(tmp_path))
     assert_another_actor(res, d, api)
     assert d["foreign_commits"]
@@ -382,3 +383,261 @@ def test_append_to_an_existing_file_through_the_api_is_refused(tmp_path, api):
     assert_rc(res, 1)
     assert d["stored"] is False and d["reason"] == "ALREADY_EXISTS"
     assert api.head() == head and api.files() == files
+
+
+# ----------------------------------------------------------------------------- W-14: the recovery of reports (decision V)
+
+OTHER_ACTOR = "someone-else[bot]"
+
+
+def accepted_config(tmp_path, entries, name="quality.toml"):
+    return make_config(Path(tmp_path) / name, archive_accepted=entries)
+
+
+def entry(listed_sha, **change):
+    e = {"sha": listed_sha, "reason": "a recovery commit that only added records", "date": "2026-11-03"}
+    e.update(change)
+    return {k: v for k, v in e.items() if v is not None}
+
+
+def store_with(tmp_path, api, entries, **kw):
+    cfg = accepted_config(tmp_path, entries)
+    out = Path(tmp_path) / "api-out.json"
+    if out.exists():
+        out.unlink()
+    res = run_gate("archive", *api_args(api, make_inputs(tmp_path), out), "--config", cfg, env=api_env(api), cwd=tmp_path)
+    return res, load_out(res, out)
+
+
+@pytest.mark.req("W-14")
+def test_w14_a_listed_commit_that_only_adds_under_reports_with_one_parent_is_accepted(tmp_path, api):
+    seed_other_run(api)
+    foreign = api.seed({"reports/9/5-1/context.json": b"{}", "reports/9/5-1/report.json": b"{}"}, author=OTHER_ACTOR)
+    res, d = store_with(tmp_path, api, [entry(foreign)])
+    assert_rc(res, 0)
+    assert d["actors_ok"] is True and d["stored"] is True
+    assert foreign in json.dumps(d["accepted_commits"]), "accepted commits go into accepted_commits"
+    assert not d.get("foreign_commits")
+
+
+@pytest.mark.req("W-14")
+def test_w14_control_the_same_commit_unlisted_stays_foreign(tmp_path, api):
+    seed_other_run(api)
+    foreign = api.seed({"reports/9/5-1/context.json": b"{}"}, author=OTHER_ACTOR)
+    res, d = store_with(tmp_path, api, [entry("c" * 40)])   # another SHA is listed
+    assert_rc(res, 1)
+    assert d["actors_ok"] is False and d["reason"] == ANOTHER_ACTOR_REASON
+    assert foreign in json.dumps(d["foreign_commits"])
+    assert not d.get("accepted_commits")
+
+
+def foreign_modifying(api):
+    seed_other_run(api)
+    api.seed({"reports/9/5-1/context.json": b"{}"})
+    return api.seed({"reports/9/5-1/context.json": b'{"changed": true}'}, author=OTHER_ACTOR)
+
+
+def foreign_deleting(api):
+    seed_other_run(api)
+    api.seed({"reports/9/5-1/context.json": b"{}", "reports/9/5-1/report.json": b"{}"})
+    return api.seed({}, author=OTHER_ACTOR, delete=["reports/9/5-1/report.json"])
+
+
+def foreign_adding_outside(api):
+    seed_other_run(api)
+    return api.seed({"README.md": b"outside the records"}, author=OTHER_ACTOR)
+
+
+def foreign_adding_inside_and_outside(api):
+    seed_other_run(api)
+    return api.seed({"reports/9/5-1/context.json": b"{}", "elsewhere/file.txt": b"x"}, author=OTHER_ACTOR)
+
+
+def foreign_adding_under_a_lookalike_folder(api):
+    seed_other_run(api)
+    return api.seed({"reportsx/9/5-1/context.json": b"{}"}, author=OTHER_ACTOR)
+
+
+def foreign_with_two_parents(api):
+    seed_other_run(api)
+    side = api.seed({"reports/8/1-1/context.json": b"{}"}, branch="side")
+    return api.seed({"reports/9/5-1/context.json": b"{}"}, author=OTHER_ACTOR, extra_parents=[side])
+
+
+STAYS_FOREIGN = [foreign_modifying, foreign_deleting, foreign_adding_outside, foreign_adding_inside_and_outside,
+                 foreign_adding_under_a_lookalike_folder, foreign_with_two_parents]
+
+
+@pytest.mark.req("W-14")
+@pytest.mark.parametrize("make", STAYS_FOREIGN, ids=[f.__name__ for f in STAYS_FOREIGN])
+def test_w14_a_listed_commit_that_changes_deletes_adds_elsewhere_or_merges_stays_foreign(tmp_path, api, make):
+    foreign = make(api)
+    res, d = store_with(tmp_path, api, [entry(foreign)])
+    assert_rc(res, 1)
+    assert d["actors_ok"] is False and d["reason"] == ANOTHER_ACTOR_REASON
+    assert foreign in json.dumps(d["foreign_commits"]), "listed or not, it blocks"
+    assert d["stored"] is True
+
+
+@pytest.mark.req("W-14")
+@pytest.mark.parametrize("change", [
+    {"reason": None}, {"date": None}, {"reason": ""}, {"date": ""}, {"sha": "SHORT"}, {"sha": None},
+], ids=["no-reason", "no-date", "empty-reason", "empty-date", "short-sha", "no-sha"])
+def test_w14_an_entry_without_a_full_sha_a_reason_and_a_date_is_ignored(tmp_path, api, change):
+    seed_other_run(api)
+    foreign = api.seed({"reports/9/5-1/context.json": b"{}"}, author=OTHER_ACTOR)
+    if change.get("sha") == "SHORT":
+        change = {"sha": foreign[:12]}
+    res, d = store_with(tmp_path, api, [entry(foreign, **change)])
+    assert_rc(res, 1)
+    assert d["actors_ok"] is False
+    assert foreign in json.dumps(d["foreign_commits"])
+
+
+@pytest.mark.req("W-14")
+def test_w14_control_a_complete_entry_among_broken_ones_still_counts(tmp_path, api):
+    seed_other_run(api)
+    foreign = api.seed({"reports/9/5-1/context.json": b"{}"}, author=OTHER_ACTOR)
+    res, d = store_with(tmp_path, api, [entry("d" * 40, reason=None), entry(foreign)])
+    assert_rc(res, 0)
+    assert d["actors_ok"] is True
+
+
+@pytest.mark.req("W-14")
+def test_w14_one_listed_and_one_unlisted_foreign_commit_still_block_and_name_only_the_unlisted(tmp_path, api):
+    seed_other_run(api)
+    listed = api.seed({"reports/9/5-1/context.json": b"{}"}, author=OTHER_ACTOR)
+    unlisted = api.seed({"reports/9/6-1/context.json": b"{}"}, author="third-party[bot]")
+    res, d = store_with(tmp_path, api, [entry(listed)])
+    assert_rc(res, 1)
+    assert unlisted in json.dumps(d["foreign_commits"]) and listed not in json.dumps(d["foreign_commits"])
+    assert listed in json.dumps(d["accepted_commits"])
+
+
+@pytest.mark.req("W-14")
+def test_w14_a_listed_commit_whose_files_cannot_be_read_is_not_accepted(tmp_path, api):
+    seed_other_run(api)
+    foreign = api.seed({"reports/9/5-1/context.json": b"{}"}, author=OTHER_ACTOR)
+    api.one_commit_status = 500
+    res, d = store_with(tmp_path, api, [entry(foreign)])
+    assert_rc(res, 1)
+    assert d["actors_ok"] is False
+
+
+@pytest.mark.req("W-14")
+def test_w14_no_history_is_rewritten_and_nothing_is_forced(tmp_path, api):
+    seed_other_run(api)
+    foreign = api.seed({"reports/9/5-1/context.json": b"{}"}, author=OTHER_ACTOR)
+    before = set(api.reachable())
+    res, d = store_with(tmp_path, api, [entry(foreign)])
+    assert_rc(res, 0)
+    assert before <= set(api.reachable()), "every commit that was on the branch still is"
+    assert foreign in api.reachable()
+    assert all(m["body"].get("force") is False for m in api.moves)
+
+
+@pytest.mark.req("W-14", "W-12")
+def test_w14_the_listed_commit_must_still_be_signed_or_the_actor_rule_for_our_own_commits_stands(tmp_path, api):
+    seed_other_run(api)
+    foreign = api.seed({"reports/9/5-1/context.json": b"{}"}, author=OTHER_ACTOR)
+    api.sign_new = False   # our own new commit is not signed, which no list can excuse
+    res, d = store_with(tmp_path, api, [entry(foreign)])
+    assert_rc(res, 1)
+    assert d["actors_ok"] is False and api.head() in json.dumps(d["foreign_commits"])
+
+
+# ----------------------------------------------------------------------------- W-15: check-actors
+
+
+def check_actors(tmp_path, api, *, config=None, branch="reports", env=None):
+    out = Path(tmp_path) / "actors.json"
+    if out.exists():
+        out.unlink()
+    args = ["check-actors", "--api-repo", api.repo, "--branch", branch, "--out", out]
+    if config is not None:
+        args += ["--config", config]
+    res = run_gate("archive", *args, env=env or api_env(api), cwd=tmp_path)
+    return res, load_out(res, out)
+
+
+@pytest.mark.req("W-15")
+def test_w15_a_clean_branch_is_actors_ok(tmp_path, api):
+    seed_other_run(api)
+    res, d = check_actors(tmp_path, api)
+    assert_rc(res, 0)
+    assert_no_traceback(res)
+    assert {"actors_ok", "foreign_commits", "accepted_commits", "reason"} <= set(d)
+    assert d["actors_ok"] is True and not d["foreign_commits"] and not d["accepted_commits"]
+
+
+@pytest.mark.req("W-15")
+def test_w15_a_foreign_commit_is_found_and_the_exit_code_is_1(tmp_path, api):
+    seed_other_run(api)
+    foreign = api.seed({"reports/9/5-1/context.json": b"{}"}, author=OTHER_ACTOR)
+    res, d = check_actors(tmp_path, api)
+    assert_rc(res, 1)
+    assert d["actors_ok"] is False and foreign in json.dumps(d["foreign_commits"])
+    assert d["reason"] == ANOTHER_ACTOR_REASON
+
+
+@pytest.mark.req("W-15")
+@pytest.mark.parametrize("kind", ["unsigned", "other-author"])
+def test_w15_unsigned_and_foreign_authors_are_both_found(tmp_path, api, kind):
+    seed_other_run(api)
+    if kind == "unsigned":
+        foreign = api.seed({"reports/9/5-1/context.json": b"{}"}, author=BOT, verified=False)
+    else:
+        foreign = api.seed({"reports/9/5-1/context.json": b"{}"}, author="third-party[bot]")
+    res, d = check_actors(tmp_path, api)
+    assert_rc(res, 1)
+    assert foreign in json.dumps(d["foreign_commits"])
+
+
+@pytest.mark.req("W-15", "W-14")
+def test_w15_the_list_of_accepted_commits_is_honoured(tmp_path, api):
+    seed_other_run(api)
+    foreign = api.seed({"reports/9/5-1/context.json": b"{}"}, author=OTHER_ACTOR)
+    res, d = check_actors(tmp_path, api, config=accepted_config(tmp_path, [entry(foreign)]))
+    assert_rc(res, 0)
+    assert d["actors_ok"] is True and foreign in json.dumps(d["accepted_commits"]) and not d["foreign_commits"]
+    api2_foreign = api.seed({"reports/9/5-1/context.json": b'{"changed": true}'}, author=OTHER_ACTOR)
+    res, d = check_actors(tmp_path, api, config=accepted_config(tmp_path, [entry(foreign), entry(api2_foreign)]))
+    assert_rc(res, 1)
+    assert api2_foreign in json.dumps(d["foreign_commits"]), "a commit that changes a record stays foreign even when listed"
+
+
+@pytest.mark.req("W-15")
+def test_w15_a_branch_that_does_not_exist_yet_is_actors_ok(tmp_path, api):
+    res, d = check_actors(tmp_path, api)
+    assert_rc(res, 0)
+    assert d["actors_ok"] is True and not d["foreign_commits"]
+
+
+@pytest.mark.req("W-15")
+def test_w15_makes_only_the_check_and_writes_nothing(tmp_path, api):
+    seed_other_run(api)
+    head = api.head()
+    res, d = check_actors(tmp_path, api)
+    assert_rc(res, 0)
+    assert [r for r in api.stub.requests if r.method != "GET"] == [], "check-actors only reads"
+    assert api.head() == head and api.moves == []
+
+
+@pytest.mark.req("W-15", "W-12")
+@pytest.mark.parametrize("status", [404, 500])
+def test_w15_commits_that_cannot_be_read_are_not_actors_ok(tmp_path, api, status):
+    seed_other_run(api)
+    api.commits_status = status
+    res, d = check_actors(tmp_path, api)
+    assert_rc(res, 1)
+    assert_no_traceback(res)
+    assert d["actors_ok"] is False
+
+
+@pytest.mark.req("W-15", "C-3")
+def test_w15_never_prints_the_token(tmp_path, api):
+    seed_other_run(api, author=OTHER_ACTOR)
+    res, d = check_actors(tmp_path, api)
+    assert d["actors_ok"] is False
+    texts = [res.out, res.err, (tmp_path / "actors.json").read_text(encoding="utf-8")]
+    assert all(api.token not in t for t in texts)

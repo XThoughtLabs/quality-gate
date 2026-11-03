@@ -69,7 +69,8 @@ class World:
         self.run_conclusion = None  # derived
         self.publish_steps_extra: list[dict] = []
         self.meta = {"head_sha": H3, "run_id": 1001, "run_attempt": 1}
-        self.guard = {"kind": "ai", "head_sha": H3, "violations": [], "needs_code_owner": [], "dependency_changes": [],
+        self.guard = {"kind": "ai", "head_sha": H3, "violations": [], "needs_code_owner": [], "marked_tests": [],
+                      "dependency_changes": [],
                       "fingerprint": {"round": "a" * 64, "cumulative": "b" * 64}, "repeated_fix": False}
         self.acceptance = {"ok": True, "mode": "subset", "list_size": 2, "failing_not_listed": [],
                            "listed_failing": ["acceptance.test_status::test_history"],
@@ -88,6 +89,9 @@ class World:
         self.tamper_after_sums: dict[str, bytes] = {}
         self.config_limits = {"max_turns": 40, "timeout_minutes": 60, "max_fix_rounds": 3}
         self.config_raw = ""
+        self.config_accepted: list[dict] = []   # [[archive.accepted_foreign_commits]] of quality.toml (W-14)
+        self.setup_step: str | None = None      # the conclusion of a step named `setup` in the run job (V-10)
+        self.setup_codes: list = [0]            # its rows in exit-codes.tsv
 
     # ------------------------------------------------------------------ editing
     @staticmethod
@@ -119,6 +123,9 @@ class World:
         steps = [{"name": "Set up job", "status": "completed", "conclusion": "success", "number": 1},
                  {"name": "Checkout", "status": "completed", "conclusion": "success", "number": 2}]
         n = 3
+        if self.setup_step is not None:
+            steps.append({"name": "setup", "number": n, "status": "completed", "conclusion": self.setup_step})
+            n += 1
         for cid in self.checks:
             if cid in self.steps:
                 steps.append({"name": cid, "number": n, **self.steps[cid]})
@@ -138,13 +145,18 @@ class World:
                 raw = f"raw/{slug(cid)}/{r['index']}.log" if isinstance(r["index"], int) else ""
                 lines.append("\t".join([cid, str(r["index"]), str(r["exit_code"]), str(r["duration"]), raw,
                                         json.dumps(r["argv"])]))
+        if self.setup_step is not None:
+            for i, code in enumerate(self.setup_codes):
+                lines.append("\t".join(["setup", str(i), str(code), "0.25", f"raw/setup/{i}.log",
+                                        json.dumps(["python", "-m", "check", "setup"])]))
         return "\n".join(lines) + "\n"
 
     def build(self):
         write_json(self.tmp / "context.json", self.ctx)
         write_json(self.tmp / "jobs.json", self._jobs())
         checks_cfg = {c: {"class": FIXED_CLASS[c], "commands": [["python", "-m", "check"]]} for c in self.checks}
-        make_config(self.tmp / "quality.toml", limits=self.config_limits, checks=checks_cfg, raw_text=self.config_raw)
+        make_config(self.tmp / "quality.toml", limits=self.config_limits, checks=checks_cfg, raw_text=self.config_raw,
+                    archive_accepted=self.config_accepted)
         if self.extras is not None:
             write_json(self.tmp / "extras.json", self.extras)
         art = self.tmp / "artifact"
@@ -164,6 +176,9 @@ class World:
             files["raw/diag-coverage/summary.json"] = json.dumps(self.coverage).encode()
         if self.mutation is not None:
             files["raw/diag-mutation/summary.json"] = json.dumps(self.mutation).encode()
+        if self.setup_step is not None:
+            for i in range(len(self.setup_codes)):
+                files[f"raw/setup/{i}.log"] = f"output of setup command {i}\n".encode()
         files["exit-codes.tsv"] = self._tsv().encode()
         files["meta.json"] = json.dumps(self.meta).encode()
         if self.guard is not None:

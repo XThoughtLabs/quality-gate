@@ -45,6 +45,7 @@ class FakeGitApi:
         self.fail_moves: list[int] = [] # statuses to answer the next moves with, nothing changed
         self.interfere: list[dict] = [] # files of a competing commit that lands before the next move is judged
         self.commits_status = 200       # the status of GET .../commits
+        self.one_commit_status = 200    # the status of GET .../commits/{sha}
         self.truncated = False          # the tree listing says it is truncated
         self.tamper_after_move = False  # after the first successful move, the branch silently changes a stored file
         self._tampered = False
@@ -76,14 +77,17 @@ class FakeGitApi:
         return {p: self.blobs[sha] for p, sha in self.flat_files(head).items()}
 
     def seed(self, files: dict[str, bytes], *, author: str = BOT, verified: bool = True, branch: str = "reports",
-             message: str = "seed") -> str:
+             message: str = "seed", delete=(), extra_parents=()) -> str:
         head = self.branches.get(branch)
         flat = dict(self.trees[self.commits[head]["tree"]]) if head else {}
+        for path in delete:
+            flat.pop(path)
         for path, data in files.items():
             sha = blob_sha(data)
             self.blobs[sha] = data
             flat[path] = ("100644", "blob", sha)
-        sha = self._new_commit(self._put_tree(flat), [head] if head else [], message, author, verified)
+        parents = ([head] if head else []) + list(extra_parents)
+        sha = self._new_commit(self._put_tree(flat), parents, message, author, verified)
         self.branches[branch] = sha
         return sha
 
@@ -137,6 +141,7 @@ class FakeGitApi:
         s.route("PATCH", base + r"/git/refs/heads/.+", guarded(self._patch_ref))
         s.route("POST", base + r"/git/refs", guarded(self._post_ref))
         s.route("GET", base + r"/commits", guarded(self._get_commits))
+        s.route("GET", base + r"/commits/[0-9a-f]+", guarded(self._get_commit))
 
     def _get_ref(self, req):
         branch = req.path.split("/git/ref/heads/", 1)[1]
@@ -273,3 +278,26 @@ class FakeGitApi:
         shas = self.reachable(branch)[(page - 1) * per_page: page * per_page]
         return 200, [{"sha": sha, "author": {"login": self.commits[sha]["author"]},
                       "commit": {"verification": {"verified": self.commits[sha]["verified"]}}} for sha in shas]
+
+    def _get_commit(self, req):
+        """One commit: its parents and the files it changed against its first parent."""
+        if self.one_commit_status != 200:
+            return self.one_commit_status, {"message": "simulated failure"}
+        sha = req.path.rsplit("/", 1)[1]
+        if sha not in self.commits:
+            return 404, {"message": "Not Found"}
+        c = self.commits[sha]
+        new = self.trees[c["tree"]]
+        old = self.trees[self.commits[c["parents"][0]]["tree"]] if c["parents"] else {}
+        files = []
+        for path in sorted(set(new) | set(old)):
+            if path not in old:
+                files.append({"filename": path, "status": "added"})
+            elif path not in new:
+                files.append({"filename": path, "status": "removed"})
+            elif new[path] != old[path]:
+                files.append({"filename": path, "status": "modified"})
+        per_page, page = int(req.q("per_page") or 30), int(req.q("page") or 1)
+        return 200, {"sha": sha, "parents": [{"sha": q} for q in c["parents"]],
+                     "files": files[(page - 1) * per_page: page * per_page], "author": {"login": c["author"]},
+                     "commit": {"verification": {"verified": c["verified"]}}}

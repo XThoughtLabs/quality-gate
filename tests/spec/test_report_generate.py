@@ -715,3 +715,110 @@ def test_v9_comes_after_the_contradictions(tmp_path):
     w.extras = {"env_failures": ["publish"]}
     m_head_sha(w)
     done(w.run(), "blocked", "SHA_MISMATCH")
+
+
+# ----------------------------------------------------------------------------- V-10 and the report fields of decisions U to W
+
+
+@pytest.mark.req("V-10", "V-4")
+def test_v10_a_failed_setup_adds_failed_check_and_a_ready_verdict_is_blocked(tmp_path):
+    w = world(tmp_path)
+    w.setup_step, w.setup_codes = "failure", [3]
+    o = w.run()
+    done(o, "blocked", "FAILED_CHECK")
+    assert all(o.verdict["checks"][c] == "success" for c in SIX), "no mandatory step failed; the setup is a reason of its own"
+    assert o.report["setup"] == {"conclusion": "failure", "exit_codes": [3]}
+
+
+@pytest.mark.req("V-10")
+def test_v10_control_a_setup_that_succeeded_changes_nothing(tmp_path):
+    w = world(tmp_path)
+    w.setup_step, w.setup_codes = "success", [0, 0]
+    o = w.run()
+    done(o, "ready-for-human")
+    assert "FAILED_CHECK" not in o.codes
+    assert o.report["setup"] == {"conclusion": "success", "exit_codes": [0, 0]}
+
+
+@pytest.mark.req("V-10")
+def test_v10_control_no_setup_step_is_not_configured(tmp_path):
+    o = world(tmp_path).run()
+    done(o, "ready-for-human")
+    assert o.report["setup"] == "not-configured"
+
+
+@pytest.mark.req("V-10", "V-6")
+def test_v10_a_claim_cannot_rescue_a_failed_setup(tmp_path):
+    w = world(tmp_path)
+    w.setup_step, w.setup_codes = "failure", [1]
+    w.meta["claimed_verdict"] = "ready-for-human"
+    o = w.run()
+    assert o.verdict["verdict"] != "ready-for-human", o.describe()
+    assert "FAILED_CHECK" in o.codes
+
+
+@pytest.mark.req("R-JSON")
+def test_report_verification_carries_trusted_sha_and_execution_environment_when_given_else_unknown(tmp_path):
+    w = world(tmp_path)
+    w.ctx.update(trusted_sha="7" * 40, execution_environment="github-hosted runner")
+    ver = w.run().report["verification"]
+    assert ver["trusted_sha"] == "7" * 40 and ver["execution_environment"] == "github-hosted runner"
+    other = world(tmp_path / "second")
+    ver = other.run().report["verification"]
+    assert ver["trusted_sha"] == "unknown" and ver["execution_environment"] == "unknown"
+
+
+@pytest.mark.req("R-JSON")
+def test_report_needs_code_owner_and_marked_tests_come_from_guard_json_or_are_empty(tmp_path):
+    w = world(tmp_path)
+    w.guard["needs_code_owner"] = ["requirements.lock", "tests/test_extra.py"]
+    w.guard["marked_tests"] = [{"path": "tests/test_extra.py", "name": "test_helpers"}]
+    r = w.run().report
+    assert r["needs_code_owner"] == ["requirements.lock", "tests/test_extra.py"]
+    assert r["marked_tests"] == [{"path": "tests/test_extra.py", "name": "test_helpers"}]
+    none = world(tmp_path / "second")
+    none.guard = None
+    r = none.run().report
+    assert r["needs_code_owner"] == [] and r["marked_tests"] == []
+
+
+@pytest.mark.req("R-JSON", "W-14")
+def test_report_shows_the_accepted_foreign_commits_of_the_configuration_on_every_report(tmp_path):
+    entries = [{"sha": "a" * 40, "reason": "a recovery commit that only added records", "date": "2026-11-03"},
+               {"sha": "b" * 40, "reason": "another one", "date": "2026-11-04"}]
+    w = world(tmp_path)
+    w.config_accepted = entries
+    got = w.run().report["accepted_foreign_commits"]
+    assert [{k: e[k] for k in ("sha", "reason", "date")} for e in got] == entries
+    plain = world(tmp_path / "second")
+    assert plain.run().report["accepted_foreign_commits"] == []
+
+
+@pytest.mark.req("R-JSON")
+def test_report_independent_review_comes_from_extras_else_unknown(tmp_path):
+    w = world(tmp_path)
+    w.extras = {"independent_review": {"state": "success", "head_sha": H3}}
+    assert w.run().report["independent_review"] == {"state": "success", "head_sha": H3}
+    plain = world(tmp_path / "second")
+    assert plain.run().report["independent_review"] == "unknown"
+
+
+@pytest.mark.req("R-JSON")
+def test_report_rounds_hold_this_runs_own_fingerprint_when_extras_lack_its_head(tmp_path):
+    w = world(tmp_path)
+    w.guard["fingerprint"] = {"round": "e" * 64, "cumulative": "f" * 64}
+    w.extras = {"rounds": [{"head_sha": H1, "round": "r" * 64, "cumulative": "c" * 64}]}
+    rounds = w.run().report["rounds"]
+    own = [r for r in rounds if r["head_sha"] == H3]
+    assert len(own) == 1 and own[0]["round"] == "e" * 64 and own[0]["cumulative"] == "f" * 64
+    assert any(r["head_sha"] == H1 for r in rounds), "the rounds that were given stay"
+
+
+@pytest.mark.req("R-JSON")
+def test_report_rounds_control_when_extras_already_hold_this_head_it_is_not_added_twice(tmp_path):
+    w = world(tmp_path)
+    w.guard["fingerprint"] = {"round": "e" * 64, "cumulative": "f" * 64}
+    w.extras = {"rounds": [{"head_sha": H3, "round": "r" * 64, "cumulative": "c" * 64}]}
+    rounds = w.run().report["rounds"]
+    own = [r for r in rounds if r["head_sha"] == H3]
+    assert len(own) == 1 and own[0]["round"] == "r" * 64, "the trusted extras win and the head is listed once"

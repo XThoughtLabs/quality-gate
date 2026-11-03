@@ -1,12 +1,12 @@
-"""gate.acceptance: rules A-1 to A-10 (decision O)."""
+"""gate.acceptance: rules A-1 to A-11 (decisions O and W)."""
 from __future__ import annotations
 
 import sys
 
 import pytest
 
-from gatekit import (assert_no_traceback, assert_rc, assert_refused, base_env, junit_xml, load_out, run_gate,
-                     write_script, write_text)
+from gatekit import (assert_no_traceback, assert_rc, assert_refused, base_env, junit_xml, load_out, make_config,
+                     run_gate, write_script, write_text)
 
 T1 = "acceptance.test_status::test_history"
 T2 = "acceptance.test_status::test_permissions"
@@ -14,11 +14,12 @@ T3 = "acceptance.test_search::test_find"
 T4 = "acceptance.test_search::test_empty"
 
 OUT_KEYS = {"ok", "mode", "list_size", "failing_not_listed", "listed_failing", "remove_from_list",
-            "missing_listed", "passed", "reason_codes"}
+            "missing_listed", "missing_tests", "passed", "reason_codes"}
 
 
 def acc(tmp_path, cases, listed=None, *, mode=None, require_empty=False, list_missing=False, raw_junit=None,
-        env_extra=None, command=None):
+        env_extra=None, command=None, config=None, tests_dir=None):
+    """config: None (no --config), a dict for the [acceptance] table, or "no-table" (a configuration without it)."""
     junit = tmp_path / "junit.xml"
     if raw_junit is not None:
         write_text(junit, raw_junit)
@@ -33,6 +34,11 @@ def acc(tmp_path, cases, listed=None, *, mode=None, require_empty=False, list_mi
         args += ["--mode", mode]
     if require_empty:
         args.append("--require-empty")
+    if config is not None:
+        cfg = make_config(tmp_path / "quality.toml", acceptance=None if config == "no-table" else config)
+        args += ["--config", cfg]
+    if tests_dir is not None:
+        args += ["--tests-dir", tests_dir]
     if command:
         args += ["--", *command]
     res = run_gate("acceptance", *args, cwd=tmp_path, env=base_env(env_extra))
@@ -353,23 +359,148 @@ def test_a9_any_other_exit_code_fails_the_check_even_when_the_junit_looks_fine(t
 
 
 @pytest.mark.req("A-10")
-def test_a10_gate_require_empty_acts_as_the_flag(tmp_path):
-    res, d, _ = acc(tmp_path, [(T1, "fail")], [f"{T1} PUB-01"], env_extra={"GATE_REQUIRE_EMPTY": "1"})
+def test_a10_require_empty_true_in_the_configuration_acts_as_the_flag(tmp_path):
+    res, d, _ = acc(tmp_path, [(T1, "fail")], [f"{T1} PUB-01"], config={"require_empty": True})
     assert_rc(res, 1)
     assert "LIST_NOT_EMPTY" in d["reason_codes"] and d["ok"] is False
 
 
 @pytest.mark.req("A-10")
-@pytest.mark.parametrize("env_extra", [None, {"GATE_REQUIRE_EMPTY": "0"}, {"GATE_REQUIRE_EMPTY": ""}],
-                         ids=["unset", "zero", "empty"])
-def test_a10_control_without_the_variable_set_to_1_a_non_empty_list_is_allowed(tmp_path, env_extra):
-    res, d, _ = acc(tmp_path, [(T1, "fail")], [f"{T1} PUB-01"], env_extra=env_extra)
+@pytest.mark.parametrize("config", [{"require_empty": False}, "no-table", {}], ids=["false", "no-table", "empty-table"])
+def test_a10_control_without_true_in_the_configuration_a_non_empty_list_is_allowed(tmp_path, config):
+    res, d, _ = acc(tmp_path, [(T1, "fail")], [f"{T1} PUB-01"], config=config)
     assert_rc(res, 0)
     assert d["ok"] is True
 
 
 @pytest.mark.req("A-10")
-def test_a10_gate_require_empty_with_an_empty_list_passes(tmp_path):
-    res, d, _ = acc(tmp_path, [(T1, "pass")], [], env_extra={"GATE_REQUIRE_EMPTY": "1"})
+def test_a10_with_an_empty_list_the_requirement_is_met(tmp_path):
+    res, d, _ = acc(tmp_path, [(T1, "pass")], [], config={"require_empty": True})
     assert_rc(res, 0)
     assert d["ok"] is True
+
+
+@pytest.mark.req("A-10")
+@pytest.mark.parametrize("value", ["1", "true", "yes"])
+@pytest.mark.parametrize("config", [None, {"require_empty": False}], ids=["no-config", "config-false"])
+def test_a10_no_environment_variable_sets_it(tmp_path, config, value):
+    res, d, _ = acc(tmp_path, [(T1, "fail")], [f"{T1} PUB-01"], config=config, env_extra={"GATE_REQUIRE_EMPTY": value})
+    assert_rc(res, 0)
+    assert d["ok"] is True and "LIST_NOT_EMPTY" not in d["reason_codes"]
+
+
+@pytest.mark.req("A-10", "A-6")
+def test_a10_the_flag_still_works_when_the_configuration_says_false(tmp_path):
+    res, d, _ = acc(tmp_path, [(T1, "fail")], [f"{T1} PUB-01"], config={"require_empty": False}, require_empty=True)
+    assert_rc(res, 1)
+    assert "LIST_NOT_EMPTY" in d["reason_codes"]
+
+
+# ----------------------------------------------------------------------------- A-11 (decision W)
+
+TREE = {
+    "acceptance/test_status.py": "def test_history():\n    assert 2 + 2 == 4\n\n\ndef test_permissions():\n    assert 3 + 3 == 6\n",
+    "acceptance/test_search.py": (
+        "import unittest\n\n\nclass TestSearch:\n    def test_find(self):\n        assert 1\n\n"
+        "    def helper_empty(self):\n        pass\n\n\nclass Helper:\n    def test_not_a_test(self):\n        assert 1\n\n\n"
+        "class CaseSearch(unittest.TestCase):\n    def testEmpty(self):\n        pass\n"),
+    "acceptance/calc_test.py": "def test_calc():\n    assert 1\n",
+    "acceptance/helpers.py": "def test_not_collected_from_a_helper_file():\n    assert 1\n",
+}
+EXPECTED = ["acceptance.test_status::test_history", "acceptance.test_status::test_permissions",
+            "acceptance.test_search.TestSearch::test_find", "acceptance.test_search.CaseSearch::testEmpty",
+            "acceptance.calc_test::test_calc"]
+NOT_EXPECTED = "acceptance.test_search.Helper::test_not_a_test"
+
+
+def a11(tmp_path, junit_ids, listed=None, *, tree=None, tests_dir="acceptance", **kw):
+    for rel, text in (TREE if tree is None else tree).items():
+        write_text(tmp_path / rel, text)
+    cases = [(i, "pass") for i in junit_ids]
+    return acc(tmp_path, cases, listed or [], tests_dir=tests_dir, **kw)
+
+
+@pytest.mark.req("A-11")
+def test_a11_every_test_of_the_folder_is_in_the_junit_file_so_the_check_is_ok(tmp_path):
+    res, d, _ = a11(tmp_path, EXPECTED)
+    assert_rc(res, 0)
+    assert d["ok"] is True and d["missing_tests"] == [] and "MISSING_TEST" not in d["reason_codes"]
+
+
+@pytest.mark.req("A-11")
+@pytest.mark.parametrize("missing", EXPECTED)
+def test_a11_a_test_absent_from_junit_and_not_on_the_list_fails(tmp_path, missing):
+    res, d, _ = a11(tmp_path, [i for i in EXPECTED if i != missing])
+    assert_rc(res, 1)
+    assert_no_traceback(res)
+    assert "MISSING_TEST" in d["reason_codes"] and d["ok"] is False
+    assert d["missing_tests"] == [missing]
+
+
+@pytest.mark.req("A-11")
+def test_a11_several_missing_tests_are_all_listed_sorted(tmp_path):
+    res, d, _ = a11(tmp_path, [EXPECTED[0]])
+    assert_rc(res, 1)
+    assert d["missing_tests"] == sorted(EXPECTED[1:])
+
+
+@pytest.mark.req("A-11")
+def test_a11_a_parametrized_name_matches_the_test(tmp_path):
+    ids = [i + "[case-1]" if i.endswith("test_history") else i for i in EXPECTED]
+    res, d, _ = a11(tmp_path, ids)
+    assert_rc(res, 0)
+    assert d["missing_tests"] == []
+
+
+@pytest.mark.req("A-11")
+def test_a11_a_class_not_named_test_and_not_a_testcase_is_not_expected(tmp_path):
+    assert NOT_EXPECTED not in EXPECTED
+    res, d, _ = a11(tmp_path, EXPECTED)   # the junit file does not hold Helper::test_not_a_test
+    assert_rc(res, 0)
+    assert NOT_EXPECTED not in d["missing_tests"]
+
+
+@pytest.mark.req("A-11")
+def test_a11_only_files_named_test_star_or_star_test_are_read(tmp_path):
+    res, d, _ = a11(tmp_path, [i for i in EXPECTED if "calc_test" not in i])
+    assert_rc(res, 1)
+    assert d["missing_tests"] == ["acceptance.calc_test::test_calc"], "calc_test.py is read, helpers.py is not"
+
+
+@pytest.mark.req("A-11", "A-4")
+def test_a11_a_listed_test_that_is_missing_stays_a_missing_listed_not_a_missing_test(tmp_path):
+    listed = [f"{EXPECTED[0]} PUB-01"]
+    res, d, _ = a11(tmp_path, EXPECTED[1:], listed)
+    assert_rc(res, 1)
+    assert "MISSING_LISTED" in d["reason_codes"] and d["missing_listed"] == [EXPECTED[0]]
+    assert "MISSING_TEST" not in d["reason_codes"] and d["missing_tests"] == []
+
+
+@pytest.mark.req("A-11")
+def test_a11_without_tests_dir_nothing_is_required_and_missing_tests_is_empty(tmp_path):
+    for rel, text in TREE.items():
+        write_text(tmp_path / rel, text)
+    res, d, _ = acc(tmp_path, [(EXPECTED[0], "pass")], [])
+    assert_rc(res, 0)
+    assert d["missing_tests"] == [] and "MISSING_TEST" not in d["reason_codes"]
+
+
+@pytest.mark.req("A-11")
+def test_a11_ids_take_their_paths_relative_to_the_working_folder(tmp_path):
+    tree = {"suite/acceptance/test_deep.py": "def test_deep():\n    assert 1\n"}
+    res, d, _ = a11(tmp_path, ["suite.acceptance.test_deep::test_deep"], tree=tree, tests_dir="suite/acceptance")
+    assert_rc(res, 0)
+    other = tmp_path / "second"
+    other.mkdir()
+    res, d, _ = a11(other, ["x.test_deep::test_deep"], tree=tree, tests_dir="suite/acceptance")
+    assert_rc(res, 1)
+    assert d["missing_tests"] == ["suite.acceptance.test_deep::test_deep"]
+
+
+@pytest.mark.req("A-11")
+def test_a11_the_test_files_are_parsed_and_never_run(tmp_path):
+    marker = tmp_path / "ran.txt"
+    tree = {"acceptance/test_boom.py": f"open({str(marker)!r}, 'w').write('ran')\n\n\ndef test_boom():\n    assert 1\n"}
+    res, d, _ = a11(tmp_path, ["acceptance.test_boom::test_boom"], tree=tree)
+    assert_rc(res, 0)
+    assert not marker.exists()

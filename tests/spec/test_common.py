@@ -1,4 +1,6 @@
-"""Common rules C-1, C-2, C-6 (C-3, C-4, C-5 are checked where the scripts print or post)."""
+"""Common rules C-1, C-2, C-6 (C-3, C-4, C-5 are checked where the scripts print or post).
+
+C-6 as amended: jsonschema is for `report generate` only, so `report seal`, `compare` and `final` must run without it."""
 from __future__ import annotations
 
 import subprocess
@@ -11,7 +13,7 @@ from gatekit import (Repo, assert_no_traceback, assert_rc, assert_refused, base_
                      write_text)
 
 MODULES = ["env_check", "run_checks", "acceptance", "guard", "security_check", "concurrency_harness", "report",
-           "archive", "feedback", "review_local", "publish", "reproduce"]
+           "archive", "feedback", "review_local", "publish", "reproduce", "diag_summary"]
 
 
 # ----------------------------------------------------------------------------- C-1
@@ -89,8 +91,9 @@ def scenario_feedback(tmp):
     event = write_json(tmp / "event.json", {"workflow_run": {"id": 1, "run_attempt": 1, "path": "x.yml", "event": "push"}})
     pulls = write_json(tmp / "pulls.json", [])
     (tmp / "reports").mkdir()
+    actors = write_json(tmp / "actors.json", {"actors_ok": True, "foreign_commits": [], "accepted_commits": [], "reason": None})
     return "feedback", ["decide", "--event-name", "workflow_run", "--event", event, "--pulls", pulls, "--reports-dir",
-                        tmp / "reports", "--config", cfg, "--out", tmp / "o.json"], base_env(), 0
+                        tmp / "reports", "--actors", actors, "--config", cfg, "--out", tmp / "o.json"], base_env(), 0
 
 
 def scenario_guard(tmp):
@@ -101,8 +104,8 @@ def scenario_guard(tmp):
     repo.write("src/a.py", "x = 2\n")
     head = repo.commit("head")
     cfg = make_config(tmp / "quality.toml")
-    return "guard", ["--repo", repo.path, "--base", base, "--head", head, "--branch", "ai/1-x", "--config", cfg,
-                     "--out", tmp / "o.json"], base_env(), 0
+    return "guard", ["--repo", repo.path, "--base", base, "--head", head, "--branch", "ai/1-x", "--author",
+                     "example-executor[bot]", "--config", cfg, "--out", tmp / "o.json"], base_env(), 0
 
 
 def scenario_archive(tmp):
@@ -126,7 +129,25 @@ def scenario_reproduce(tmp):
     return "reproduce", ["--repo", repo.path, "--sha", sha, "--out", tmp / "rerun"], base_env(), 2  # no evidence is stored
 
 
-SCENARIOS = [scenario_acceptance, scenario_env_check, scenario_run_checks, scenario_security_check,
+def scenario_report_seal(tmp):
+    write_bytes(tmp / "artifact" / "exit-codes.tsv", b"check\tindex\texit_code\n")
+    return "report", ["seal", "--artifact", tmp / "artifact", "--head-sha", "3" * 40, "--run-id", "1", "--run-attempt", "1"], base_env(), 0
+
+
+def scenario_report_compare(tmp):
+    doc = {"verification": {"run_id": 1, "run_attempt": 1}, "checks": [], "generated_at": "t1"}
+    a = write_json(tmp / "a.json", doc)
+    b = write_json(tmp / "b.json", dict(doc, generated_at="t2"))
+    return "report", ["compare", a, b], base_env(), 0
+
+
+def scenario_report_final(tmp):
+    verdict = write_json(tmp / "v.json", {"verdict": "blocked", "reasons": [], "checks": {}})
+    archive = write_json(tmp / "ar.json", {"stored": True, "sha256sums_match": True, "actors_ok": True})
+    return "report", ["final", "--verdict", verdict, "--archive", archive, "--out", tmp / "o.json"], base_env(), None
+
+
+SCENARIOS = [scenario_report_seal, scenario_report_compare, scenario_report_final, scenario_acceptance, scenario_env_check, scenario_run_checks, scenario_security_check,
              scenario_concurrency, scenario_feedback, scenario_guard, scenario_archive, scenario_reproduce]
 
 
@@ -140,11 +161,11 @@ def test_c6_every_script_but_report_and_review_local_runs_on_the_standard_librar
     normal.mkdir()
     module, args, env, expected = scenario(normal)
     res = run_gate(module, *args, env=env, cwd=normal)
-    assert_rc(res, expected)  # the scenario itself is sound
+    assert (res.rc != 2) if expected is None else (res.rc == expected), res.describe()  # the scenario itself is sound
     bare = tmp_path / "stdlib-only"
     bare.mkdir()
     module, args, env, expected = scenario(bare)
     res = run_gate(module, *args, env=env, cwd=bare, pyflags=("-S", "-P"))
     assert "ModuleNotFoundError" not in res.err and "ImportError" not in res.err, \
         f"gate.{module} needs a third-party library, which C-6 forbids\n{res.describe()}"
-    assert_rc(res, expected)
+    assert (res.rc != 2) if expected is None else (res.rc == expected), res.describe()

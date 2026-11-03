@@ -231,15 +231,25 @@ def _table(name: str, mapping: dict) -> str:
 def make_config(path, *, baseline_sha: str = "a" * 40, integration_branch: str = "candidate/a",
                 environment: dict | None = None, limits: dict | None = None, guard: dict | None = None,
                 feedback: dict | None = None, spec_tests: dict | None = None,
-                checks: dict | None = None, setup: dict | None = None, raw_text: str = "") -> Path:
-    parts = [_table("project", {"baseline_sha": baseline_sha, "integration_branch": integration_branch})]
+                checks: dict | None = None, setup: dict | None = None, acceptance: dict | None = None,
+                archive_accepted: list | None = None, raw_text: str = "") -> Path:
+    project = {"baseline_sha": baseline_sha}
+    if integration_branch is not None:   # None leaves project.integration_branch out of the file
+        project["integration_branch"] = integration_branch
+    parts = [_table("project", project)]
     if environment is not None:
         parts.append(_table("environment", environment))
     parts.append(_table("limits", limits if limits is not None else
                         {"max_turns": 40, "timeout_minutes": 60, "max_fix_rounds": 3}))
     parts.append(_table("guard", guard if guard is not None else {}))
     parts.append(_table("feedback", feedback if feedback is not None else
-                        {"judge_workflow_path": ".github/workflows/judge.yml", "reviewer_app": "example-reviewer"}))
+                        {"judge_workflow_path": ".github/workflows/judge.yml", "reviewer_app": "example-reviewer",
+                         "executor_app": "example-executor"}))
+    if acceptance is not None:
+        parts.append(_table("acceptance", acceptance))
+    for entry in archive_accepted or []:
+        table = _table("archive.accepted_foreign_commits", entry)  # written as an array of tables
+        parts.append(table.replace("[archive.accepted_foreign_commits]", "[[archive.accepted_foreign_commits]]", 1))
     parts.append(_table("spec_tests", spec_tests if spec_tests is not None else {"deny_read": ["src/**", "tests/**"]}))
     for cid, body in (checks or {}).items():
         parts.append(_table(f'checks."{cid}"', {k: v for k, v in body.items() if not isinstance(v, dict)}))
@@ -362,10 +372,16 @@ class Repo:
                        input_bytes=data if isinstance(data, bytes) else data.encode("utf-8")).stdout.decode().strip()
         self.git("update-index", "--add", "--cacheinfo", f"100644,{blob},{rel}")
 
-    def commit(self, msg: str = "change", stage_all: bool = True) -> str:
+    def commit(self, msg: str = "change", stage_all: bool = True, *, author_name: str | None = None,
+               committer_name: str | None = None) -> str:
         if stage_all:
             self.git("add", "-A")
-        self.git("commit", "-q", "--allow-empty", "-m", msg)
+        env = git_env()
+        if author_name:
+            env["GIT_AUTHOR_NAME"] = author_name
+        if committer_name:
+            env["GIT_COMMITTER_NAME"] = committer_name
+        self.git("commit", "-q", "--allow-empty", "-m", msg, env=env)
         return self.sha()
 
     def branch(self, name: str, start: str = "HEAD") -> None:

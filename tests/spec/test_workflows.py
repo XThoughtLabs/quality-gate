@@ -1,6 +1,7 @@
 """Workflows (CONTRACTS.md section 12), read as YAML from GATE_ROOT/.github/workflows and ACTIONS-LOCK.md."""
 from __future__ import annotations
 
+import json
 import re
 
 import pytest
@@ -23,7 +24,9 @@ def load(name: str) -> dict:
 
 
 def text_of(name: str) -> str:
-    return (GATE_ROOT / ".github" / "workflows" / f"{name}.yml").read_text(encoding="utf-8")
+    path = GATE_ROOT / ".github" / "workflows" / f"{name}.yml"
+    assert path.exists(), f"{path} must exist (CONTRACTS.md section 12)"
+    return path.read_text(encoding="utf-8")
 
 
 def triggers(wf: dict):
@@ -475,3 +478,155 @@ def test_y15_executor_passes_its_allowed_bots_input_to_the_action_and_never_allo
         allowed = str((st.get("with") or {}).get("allowed_bots", ""))
         assert "inputs.allowed-bots" in allowed, f"allowed_bots is {allowed!r}"
         assert "*" not in allowed
+
+
+# ----------------------------------------------------------------------------- Y-16 to Y-21 (decisions V and W)
+# These are checks of the YAML text. What a script really does at run time cannot be seen from here.
+
+PR_CODE_STEPS = ("gate/tests", "gate/acceptance", "gate/security")
+
+
+def step_text(st):
+    return json.dumps(st, default=str)
+
+
+@pytest.mark.req("Y-16")
+def test_y16_the_prs_security_review_is_replaced_by_the_default_branchs_after_the_guard_and_before_pr_code():
+    ss = run_steps()
+    names = [st.get("name") for st in ss]
+    guard = names.index("gate/guard")
+    first_pr_code = min(names.index(n) for n in names if n and (n in PR_CODE_STEPS or str(n).startswith("diag/")))
+    fixes = [i for i, st in enumerate(ss) if "security-review.md" in str(st.get("run", ""))]
+    assert fixes, "a step of the run job must deal with security-review.md"
+    assert any(guard < i < first_pr_code for i in fixes), \
+        f"it must sit after gate/guard (step {guard}) and before the first step that runs PR code (step {first_pr_code}): {fixes}"
+    st = ss[[i for i in fixes if guard < i < first_pr_code][0]]
+    text = step_text(st)
+    assert re.search(r"default", text, re.I), "the replacement comes from the default branch"
+    assert re.search(r"\brm\b|Remove-Item|unlink|git rm", str(st.get("run", ""))), "and the file is removed when that branch has none"
+
+
+@pytest.mark.req("Y-16")
+def test_y16_control_no_step_before_the_guard_touches_it_in_a_way_that_the_pr_could_undo():
+    ss = run_steps()
+    names = [st.get("name") for st in ss]
+    guard = names.index("gate/guard")
+    for i, st in enumerate(ss):
+        if i > guard and (st.get("name") in PR_CODE_STEPS) and "security-review.md" in str(st.get("run", "")):
+            pytest.fail(f"step {st['name']} handles security-review.md after PR code may already have run")
+
+
+EXECUTOR_FILES = ["executor", "spec-tests"]
+
+
+def action_step(name):
+    wf = load(name)
+    found = [(job_id, i, st) for job_id, job in jobs(wf).items() for i, st in enumerate(steps(job))
+             if "claude-code-action@" in str(st.get("uses", ""))]
+    assert found, f"{name}.yml must run claude-code-action"
+    return wf, found[0]
+
+
+@pytest.mark.req("Y-17")
+@pytest.mark.parametrize("name", EXECUTOR_FILES)
+def test_y17_the_action_step_scrubs_the_subprocess_environment_and_allows_no_gh(name):
+    wf, (job_id, idx, st) = action_step(name)
+    env = st.get("env") or {}
+    assert str(env.get("CLAUDE_CODE_SUBPROCESS_ENV_SCRUB")) == "1", f"env of the action step: {env}"
+    allowed = " ".join(str(v) for k, v in (st.get("with") or {}).items()
+                       if k in ("claude_args", "allowed_tools", "allowedTools", "settings"))
+    assert allowed.strip(), "the action step names its allowed tools"
+    assert not re.search(r"(?<![\w.-])gh(?![\w-])", allowed), f"the allowed tools hold gh: {allowed}"
+
+
+@pytest.mark.req("Y-17")
+@pytest.mark.parametrize("name", EXECUTOR_FILES)
+def test_y17_a_later_step_with_the_apps_token_opens_the_pr(name):
+    wf, (job_id, idx, st) = action_step(name)
+    ss = steps(jobs(wf)[job_id])
+    mint = [s for s in ss if str(s.get("uses", "")).startswith("actions/create-github-app-token@")]
+    assert mint and mint[0].get("id"), "the app token is minted in the same job, with an id"
+    token_ref = f"steps.{mint[0]['id']}.outputs.token"
+    later = ss[idx + 1:]
+    openers = [s for s in later if re.search(r"pr create|pulls|create-pull-request", step_text(s)) and token_ref in step_text(s)]
+    assert openers, "a step after the action opens the PR with the app's token; the model only pushes its branch"
+    assert "pr create" not in step_text(st), "and the action step itself does not"
+
+
+@pytest.mark.req("Y-18")
+@pytest.mark.parametrize("name", EXECUTOR_FILES)
+def test_y18_the_prompt_comes_from_the_default_branch_and_the_notes_stay_outside_the_working_folder(name):
+    text = text_of(name)
+    assert re.search(r"default_branch|default-branch|github\.event\.repository\.default_branch", text, re.I), \
+        "the prompt file is taken from the default branch's copy"
+    assert re.search(r"runner\.temp|RUNNER_TEMP", text), \
+        "the gate's note and the issue's text are written outside the working folder (the runner's temp folder)"
+    wf, (job_id, idx, st) = action_step(name)
+    prompt_refs = " ".join(str(v) for k, v in (st.get("with") or {}).items() if "prompt" in k)
+    assert "github.workspace" not in prompt_refs and "GITHUB_WORKSPACE" not in prompt_refs, \
+        "the prompt does not come from inside the working folder"
+
+
+@pytest.mark.req("Y-19")
+def test_y19_the_guard_gets_the_prs_author_from_the_trusted_context():
+    st = next(s for s in run_steps() if s.get("name") == "gate/guard")
+    script = str(st.get("run", ""))
+    assert "gate.guard" in script and "--author" in script, "gate.guard is called with --author"
+    m = re.search(r'--author\s+"?\$\{?(\w+)', script)
+    assert m, f"--author takes a shell variable, not an expression pasted into the script (Y-8): {script}"
+    env = st.get("env") or {}
+    assert m.group(1) in env, f"the variable {m.group(1)} is set in the step's env"
+    assert "${{" in str(env[m.group(1)]), "from the workflow's trusted context"
+
+
+@pytest.mark.req("Y-19")
+def test_y19_no_label_sets_a_requirement():
+    wf = load("judge")
+    assert "GATE_REQUIRE_EMPTY" not in text_of("judge")
+    for st in run_steps(wf):
+        if st.get("name") in ("gate/guard", "gate/acceptance"):
+            assert "label" not in step_text(st).lower(), f"step {st['name']} reads a label"
+
+
+INSTALLERS = re.compile(r"\bpip3?\s+install\b|\bapt(-get)?\b|\bnpm\b|\byarn\b|\bconda\b|\bpoetry\b|\bbrew\b|\bpipx\b|python\s+-m\s+pip")
+
+
+@pytest.mark.req("Y-20")
+def test_y20_the_archive_job_installs_nothing():
+    job = jobs(load("judge"))["archive"]
+    ss = steps(job)
+    assert ss, "the archive job has steps"
+    for st in ss:
+        assert not INSTALLERS.search(str(st.get("run", ""))), f"the archive job installs something: {st.get('run')}"
+    assert any("gate.archive" in str(st.get("run", "")) for st in ss)
+
+
+@pytest.mark.req("Y-20")
+def test_y20_control_the_run_job_may_install_so_the_check_is_not_vacuous():
+    scripts = " ".join(str(st.get("run", "")) for st in run_steps())
+    assert scripts.strip(), "the run job has scripts"
+
+
+@pytest.mark.req("Y-21")
+def test_y21_the_fix_job_has_a_concurrency_group_per_pr():
+    wf = load("feedback")
+    assert "fix" in jobs(wf), f"feedback.yml needs a job named fix, has {list(jobs(wf))}"
+    conc = jobs(wf)["fix"].get("concurrency")
+    assert conc, "the fix job needs a concurrency block"
+    group = conc if isinstance(conc, str) else conc.get("group")
+    assert group and "${{" in str(group), f"the group must be an expression so that it differs per PR: {group!r}"
+    assert re.search(r"pr|pull", str(group), re.I), f"and the expression must name the PR: {group!r}"
+
+
+@pytest.mark.req("Y-21")
+def test_y21_executor_refuses_to_start_the_model_when_the_expected_head_has_moved():
+    wf = load("executor")
+    inputs = (triggers(wf)["workflow_call"] or {}).get("inputs") or {}
+    assert "expected-head" in inputs, f"executor.yml needs an `expected-head` input, has {list(inputs)}"
+    job_id, idx, st = action_step("executor")[1]
+    ss = steps(jobs(wf)[job_id])
+    guards = [i for i, s in enumerate(ss[:idx]) if "expected-head" in step_text(s) or "EXPECTED_HEAD" in step_text(s)]
+    assert guards, "a step before the model starts compares the PR's head with expected-head"
+    gate_step = ss[guards[0]]
+    refuses = "exit 1" in str(gate_step.get("run", "")) or "if" in st or any("if" in s for s in ss[guards[0] + 1: idx + 1])
+    assert refuses, "and either fails the job or keeps the action step from running"

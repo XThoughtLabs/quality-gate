@@ -55,3 +55,11 @@ def stub():
         yield server
     finally:
         server.stop()
+
+
+@pytest.fixture(scope="session")
+def baseline(tmp_path_factory):
+    """The synthetic repository that the guard tests change (see guardkit.py)."""
+    from guardkit import build_baseline
+
+    return build_baseline(tmp_path_factory)

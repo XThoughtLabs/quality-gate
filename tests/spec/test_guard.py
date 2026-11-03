@@ -9,197 +9,8 @@ import pytest
 
 from gatekit import (Repo, assert_no_traceback, assert_rc, assert_refused, git, load_out, make_config, run_gate,
                      write_json, write_script, write_text)
-
-# ----------------------------------------------------------------------------- the synthetic baseline
-
-
-def lock_text(entries):
-    out = []
-    for name, ver, hs in entries:
-        if not hs:
-            out.append(f"{name}=={ver}\n")
-        else:
-            out.append(f"{name}=={ver} \\\n" + " \\\n".join(f"    --hash=sha256:{c * 64}" for c in hs) + "\n")
-    return "".join(out)
-
-
-def lines_file(a="VALUE = 1", b="OTHER = 'x'", top=0):
-    ls = [f"# filler {i}" for i in range(1, 61)]
-    ls[4] = a
-    ls[49] = b
-    return "\n".join([f"# extra {i}" for i in range(top)] + ls) + "\n"
-
-
-TEST_APP = '''import pytest
-from src.app import add
-
-
-def _helper():
-    return 1
-
-
-def test_add():
-    assert add(1, 2) == 3
-    assert add(2, 2) == 4
-    assert add(3, 3) == 6
-
-
-def test_add_zero():
-    assert add(0, 0) == 0
-
-
-def test_raises():
-    with pytest.raises(ValueError):
-        add("x", 1)
-'''
-
-TEST_UNIT = '''import unittest
-
-
-class AddTest(unittest.TestCase):
-    def test_equal(self):
-        self.assertEqual(1 + 1, 2)
-        self.assertIn(1, [1, 2])
-'''
-
-ACC_STATUS = '''def test_history():
-    assert 2 + 2 == 4
-
-
-def test_permissions():
-    assert 3 + 3 == 6
-'''
-
-BASE_LOCK = lock_text([("examplelib", "1.0", "a"), ("otherlib", "2.0", "bc")])
-
-PYPROJECT = '''[tool.coverage.report]
-fail_under = 90
-
-[tool.pytest.ini_options]
-addopts = "--cov-fail-under=90"
-
-[tool.example]
-min_score = 50
-other_limit = 70
-'''
-
-BASE = {
-    "README.md": "# example\n",
-    "src/app.py": lines_file(),
-    "src/util.py": "def helper():\n    return 1\n",
-    "src/testing_tools.py": "def tool():\n    return 1\n",
-    "src/contest.py": "def contest():\n    return 1\n",
-    "tests/test_app.py": TEST_APP,
-    "tests/test_unit.py": TEST_UNIT,
-    "tests/helpers.py": "def make():\n    return 1\n",
-    "acceptance/test_status.py": ACC_STATUS,
-    "requirements.lock": BASE_LOCK,
-    "requirements.in": "examplelib\notherlib\n",
-    ".github/workflows/ci.yml": "name: ci\non: push\njobs: {}\n",
-    "quality.toml": "[project]\nname = \"example\"\n",
-    "CODEOWNERS": "* owner\n",
-    "SPEC.md": "# spec\n",
-    "TASK.md": "# task\n",
-    "BASELINE.md": "# baseline\n",
-    "OPEN-ISSUES.md": "# issues\n",
-    "SOURCE-MANIFEST.json": "{}\n",
-    "evidence/baseline.txt": "evidence\n",
-    "prompts/executor.md": "prompt\n",
-    "pyproject.toml": PYPROJECT,
-    ".coveragerc": "[report]\nfail-under=90\n",
-}
-
-GUARD_CFG = {"extra_protected": ["prompts/"], "dependency_files": ["requirements.lock"],
-             "dependency_sources": ["requirements.in"], "threshold_keys": ["min_score"]}
-
-
-@pytest.fixture(scope="session")
-def baseline(tmp_path_factory):
-    repo = Repo(tmp_path_factory.mktemp("guard-baseline") / "repo")
-    for path, content in BASE.items():
-        repo.write(path, content)
-    repo.commit("baseline")
-    return repo.path
-
-
-class Case:
-    """A baseline repository, a change on a branch, and a way to run the guard on it."""
-
-    def __init__(self, tmp_path, baseline, *, branch="ai/12-example", base_edits=None, guard=None):
-        self.tmp = Path(tmp_path)
-        self.branch = branch
-        self.repo = Repo.clone(baseline, self.tmp / "repo")
-        if base_edits:
-            self._apply(base_edits)
-            self.repo.commit("baseline tweaks")
-        self.base = self.repo.sha()
-        self.head = self.base
-        self.repo.branch("pr-branch")  # a neutral git branch name; the guard is told the name through --branch
-        self.cfg = make_config(self.tmp / "quality.toml", guard=GUARD_CFG if guard is None else guard)
-        self._runs = 0
-
-    def _apply(self, edits):
-        for path, content in edits.items():
-            if content is None:
-                self.repo.remove(path)
-            else:
-                self.repo.write(path, content)
-
-    def change(self, edits=None, *, renames=(), raw=None, msg="change"):
-        for old, new in renames:
-            self.repo.mv(old, new)
-        self._apply(edits or {})
-        self.repo.git("add", "-A")
-        for path, content in (raw or {}).items():
-            self.repo.raw_add(path, content)
-        self.head = self.repo.commit(msg, stage_all=False)
-        return self.head
-
-    def run(self, *, base=None, head=None, branch=None, reports=None, pr=None, config=None, extra=()):
-        self._runs += 1
-        out = self.tmp / f"guard-{self._runs}.json"
-        args = ["--repo", self.repo.path, "--base", base or self.base, "--head", head or self.head,
-                "--branch", branch or self.branch, "--config", config or self.cfg, "--out", out]
-        if reports is not None:
-            Path(reports).mkdir(parents=True, exist_ok=True)
-            args += ["--reports-dir", reports]
-        if pr is not None:
-            args += ["--pr", pr]
-        args += list(extra)
-        res = run_gate("guard", *args, cwd=self.tmp)
-        return res, load_out(res, out)
-
-
-def sub(text, old, new):
-    assert old in text, f"test setup error: {old!r} not found"
-    return text.replace(old, new, 1)
-
-
-def rules(d):
-    return [v["rule"] for v in d["violations"]]
-
-
-def of(d, rule):
-    return [v for v in d["violations"] if v["rule"] == rule]
-
-
-def assert_clean(res, d):
-    assert_rc(res, 0)
-    assert_no_traceback(res)
-    assert d["violations"] == [], f"expected no violation, got {d['violations']}"
-
-
-def assert_fires(res, d, rule, path=None):
-    assert_rc(res, 1)
-    assert_no_traceback(res)
-    assert d is not None, "--out must be written even when the guard fails"
-    for v in d["violations"]:
-        assert {"rule", "path", "detail"} <= set(v), v
-    got = of(d, rule)
-    assert got, f"{rule} did not fire; violations: {d['violations']}"
-    if path is not None:
-        assert any(v["path"] == path for v in got), f"{rule} fired but not for {path}: {got}"
-
+from guardkit import (ACC_STATUS, commit_app, fp_between, run_store, store_guard, BASE, BASE_LOCK, EXECUTOR, GUARD_CFG, PERSON, PYPROJECT, TEST_APP, TEST_EXTRA,
+                      TEST_UNIT, Case, assert_clean, assert_fires, lines_file, lock_text, of, rules, sub)
 
 # ----------------------------------------------------------------------------- output shape, kinds, exit codes
 
@@ -210,10 +21,11 @@ def test_clean_change_exits_0_and_writes_the_documented_shape(tmp_path, baseline
     head = case.change({"src/app.py": lines_file(a="VALUE = 2")})
     res, d = case.run()
     assert_clean(res, d)
-    assert set(d) >= {"kind", "head_sha", "violations", "needs_code_owner", "dependency_changes", "fingerprint",
-                      "repeated_fix"}
+    assert set(d) >= {"kind", "head_sha", "violations", "needs_code_owner", "marked_tests", "dependency_changes",
+                      "fingerprint", "repeated_fix"}
     assert d["kind"] == "ai" and d["head_sha"] == head
-    assert d["needs_code_owner"] == [] and d["dependency_changes"] == [] and d["repeated_fix"] is False
+    assert d["needs_code_owner"] == [] and d["marked_tests"] == [] and d["dependency_changes"] == []
+    assert d["repeated_fix"] is False
     for key in ("round", "cumulative"):
         assert re.fullmatch(r"[0-9a-f]{64}", d["fingerprint"][key]), "a fingerprint is a SHA-256 hex digest"
 
@@ -250,7 +62,7 @@ def test_q2_guard_refuses_a_bad_configuration(tmp_path, baseline, raw):
     cfg = make_config(tmp_path / "bad.toml", guard=GUARD_CFG, raw_text=raw)
     out = tmp_path / "guard-bad.json"
     res = run_gate("guard", "--repo", case.repo.path, "--base", case.base, "--head", case.head, "--branch", case.branch,
-                   "--config", cfg, "--out", out, cwd=tmp_path)
+                   "--author", case.author, "--config", cfg, "--out", out, cwd=tmp_path)
     assert_refused(res, 2, out)
 
 
@@ -316,6 +128,8 @@ PROTECTED_CASES = [
     ("BASELINE.md", "# changed\n"),
     ("OPEN-ISSUES.md", "# changed\n"),
     ("SOURCE-MANIFEST.json", "{\"changed\": true}\n"),
+    ("security-review.md", "| bandit | B602 | src/app.py | an executor-written row |\n"),   # decision W
+    ("security-review.md", None),                                                  # deleted
     ("evidence/baseline.txt", None),                                               # deleted
     ("evidence/new.txt", "added\n"),
     ("prompts/executor.md", "changed prompt\n"),                                   # guard.extra_protected
@@ -331,7 +145,7 @@ def test_g1_protected_path_fires(tmp_path, baseline, path, content):
     assert_fires(res, d, "PROTECTED_PATH", path)
 
 
-CASE_VARIANTS = [".GitHub/workflows/x.yml", "ACCEPTANCE/extra.txt", "Quality.Toml", "codeowners", "Spec.MD",
+CASE_VARIANTS = ["Security-Review.MD", ".GitHub/workflows/x.yml", "ACCEPTANCE/extra.txt", "Quality.Toml", "codeowners", "Spec.MD",
                  "task.md", "baseline.md", "open-issues.md", "Source-Manifest.JSON", "EVIDENCE/y.txt"]
 
 
@@ -577,12 +391,30 @@ def test_g5_control_a_suppression_that_was_already_there_is_not_added(tmp_path, 
 # ----------------------------------------------------------------------------- G-6
 
 LOWERED = {
-    "fail_under": ("pyproject.toml", "fail_under = 90", "fail_under = 80"),
-    "cov-fail-under": ("pyproject.toml", "--cov-fail-under=90", "--cov-fail-under=70"),
+    # The pyproject.toml cases are also G-1b's (a [tool.*] section): the rule is looked for beside it.
+    "fail_under-in-pyproject": ("pyproject.toml", "fail_under = 90", "fail_under = 80"),
+    "cov-fail-under-in-pyproject": ("pyproject.toml", "--cov-fail-under=90", "--cov-fail-under=70"),
     "fail-under-no-spaces": (".coveragerc", "fail-under=90", "fail-under=85"),
-    "threshold-key-from-config": ("pyproject.toml", "min_score = 50", "min_score = 40"),
-    "removed-fail_under": ("pyproject.toml", "fail_under = 90\n", ""),
+    "threshold-key-from-config": ("ci/limits.toml", "min_score = 50", "min_score = 40"),
     "removed-fail-under": (".coveragerc", "fail-under=90\n", ""),
+    "removed-threshold-key": ("ci/limits.toml", "min_score = 50\n", ""),
+    # each form
+    "form-colon": ("ci/limits.yml", "fail_under: 90", "fail_under: 10"),
+    "form-space": ("Makefile", "--cov-fail-under=90", "--cov-fail-under 10"),
+    "form-list": ("ci/args.py", '"--cov-fail-under", "90"', '"--cov-fail-under", "10"'),
+    "form-equals-in-a-command": ("Makefile", "--cov-fail-under=90", "--cov-fail-under=10"),
+    # letter case, - and _
+    "another-letter-case": (".coveragerc", "fail-under=90", "FAIL-UNDER=10"),
+    "dash-for-underscore": ("ci/limits.yml", "fail_under: 90", "fail-under: 10"),
+    "threshold-key-in-capitals": ("ci/limits.toml", "min_score = 50", "MIN_SCORE = 40"),
+    # a key in a comment does not count, so commenting a threshold out removes it
+    "commented-out": (".coveragerc", "fail-under=90", "# fail-under=90"),
+    "commented-out-threshold-key": ("ci/limits.toml", "min_score = 50", "# min_score = 50"),
+    # several values of one key: the lowest is compared
+    "a-new-lower-second-value": (".coveragerc", "fail-under=90", "fail-under=90\nfail-under=50"),
+    # an added --no-cov
+    "no-cov-added-to-a-command": ("Makefile", "-q", "-q --no-cov"),
+    "no-cov-added-to-a-list": ("ci/args.py", '"90"]', '"90", "--no-cov"]'),
 }
 
 
@@ -598,11 +430,18 @@ def test_g6_lowered_or_removed_threshold_fires(tmp_path, baseline, variant):
 
 @pytest.mark.req("G-6")
 @pytest.mark.parametrize("path,old,new", [
-    ("pyproject.toml", "fail_under = 90", "fail_under = 95"),            # raised
-    ("pyproject.toml", "other_limit = 70", "other_limit = 10"),          # a key that is not a threshold key
-    ("pyproject.toml", "min_score = 50", "min_score = 60"),              # raised
-    (".coveragerc", "fail-under=90", "fail-under=90\nprecision = 2"),    # unrelated edit in the same file
-], ids=["raised", "other-key", "threshold-key-raised", "unrelated-edit"])
+    (".coveragerc", "fail-under=90", "fail-under=95"),                             # raised
+    ("ci/limits.toml", "other_limit = 70", "other_limit = 10"),                    # a key that is not a threshold key
+    ("ci/limits.toml", "min_score = 50", "min_score = 60"),                        # raised
+    (".coveragerc", "fail-under=90", "fail-under=90\nprecision = 2"),             # unrelated edit in the same file
+    (".coveragerc", "fail-under=90", "fail-under=90\nfail-under=95"),             # a second, higher value: the lowest is unchanged
+    (".coveragerc", "fail-under=90", "fail-under=90\n# fail-under=10"),           # a lower value only in a comment
+    ("Makefile", "-q", "-q --cov-report=term"),                                    # another flag
+    ("ci/limits.yml", "fail_under: 90", "fail_under: 95"),
+    ("ci/args.py", '"90"', '"95"'),
+    ("ci/limits.toml", "min_score = 50", "MIN_SCORE = 60"),                        # another letter case, raised
+], ids=["raised", "other-key", "threshold-key-raised", "unrelated-edit", "second-value-higher",
+        "lower-value-in-a-comment", "another-flag", "colon-raised", "list-raised", "capitals-raised"])
 def test_g6_control_other_edits_are_clean(tmp_path, baseline, path, old, new):
     case = Case(tmp_path, baseline)
     case.change({path: sub(BASE[path], old, new)})
@@ -613,13 +452,13 @@ def test_g6_control_other_edits_are_clean(tmp_path, baseline, path, old, new):
 @pytest.mark.req("G-6")
 def test_g6_control_threshold_keys_come_from_the_configuration(tmp_path, baseline):
     case = Case(tmp_path, baseline, guard={"extra_protected": ["prompts/"]})
-    case.change({"pyproject.toml": sub(PYPROJECT, "min_score = 50", "min_score = 10")})
+    case.change({"ci/limits.toml": sub(BASE["ci/limits.toml"], "min_score = 50", "min_score = 10")})
     res, d = case.run()
     assert_clean(res, d)
     case2 = Case(tmp_path / "second", baseline)
-    case2.change({"pyproject.toml": sub(PYPROJECT, "min_score = 50", "min_score = 10")})
+    case2.change({"ci/limits.toml": sub(BASE["ci/limits.toml"], "min_score = 50", "min_score = 10")})
     res2, d2 = case2.run()
-    assert_fires(res2, d2, "THRESHOLD_LOWERED", "pyproject.toml")
+    assert_fires(res2, d2, "THRESHOLD_LOWERED", "ci/limits.toml")
 
 
 # ----------------------------------------------------------------------------- G-7 and G-8
@@ -711,25 +550,6 @@ def test_g8_control_no_dependency_change_means_no_approval_needed(tmp_path, base
 
 
 # ----------------------------------------------------------------------------- G-9 and the fingerprints
-
-
-def store_guard(reports, pr, run_id, attempt, guard_json):
-    write_json(Path(reports) / str(pr) / f"{run_id}-{attempt}" / "guard.json", guard_json)
-
-
-def commit_app(case, a, b):
-    return case.change({"src/app.py": lines_file(a, b)})
-
-
-def run_store(case, head, reports, pr, run_id, attempt=1):
-    res, d = case.run(head=head, reports=reports, pr=pr)
-    store_guard(reports, pr, run_id, attempt, d)
-    return res, d
-
-
-def fp_between(case, a, b):
-    res, d = case.run(base=a, head=b)
-    return d["fingerprint"]["cumulative"]
 
 
 @pytest.mark.req("G-9")
