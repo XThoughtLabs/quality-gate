@@ -106,6 +106,7 @@ def main(argv: list[str] | None = None) -> int:
     parser.add_argument("--require-empty", action="store_true")
     parser.add_argument("--config", help="the configuration from the default branch")
     parser.add_argument("--tests-dir", help="the folder whose tests must all appear in the JUnit file")
+    parser.add_argument("--tests-root", help="the folder pytest counts its IDs from, when not the working folder")
     parser.add_argument("--out", required=True)
     args = parser.parse_args(arguments)
 
@@ -125,10 +126,11 @@ def main(argv: list[str] | None = None) -> int:
         expected: set[str] = set()
         if args.tests_dir:
             folder = Path(args.tests_dir).resolve()
-            root = Path.cwd().resolve()
+            root = Path(args.tests_root).resolve() if args.tests_root else Path.cwd().resolve()
             if not folder.is_relative_to(root):
-                raise UsageError("--tests-dir must be under the working folder")
-            expected = ids_under_folder(folder, root)
+                raise UsageError("--tests-dir must be under the folder the IDs are counted from")
+            ignore = config.get("acceptance", {}).get("expected_tests_ignore", [])
+            expected = {test_id for test_id in ids_under_folder(folder, root, ignore) if test_id not in ignore}
     except UsageError as error:
         return fail_usage(str(error))
 

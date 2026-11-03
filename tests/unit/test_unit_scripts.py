@@ -62,7 +62,7 @@ def test_context_holds_every_sha_and_config_hash(gate, tmp_path):
     env = gate.env(
         GATE_REPOSITORY="example/app", GATE_HEAD_REPOSITORY="example/app", GATE_PR="3", GATE_RUN_ID="9", GATE_RUN_ATTEMPT="2",
         GATE_EVENT="pull_request_target", GATE_BASE_SHA="d" * 40, GATE_HEAD_SHA="e" * 40, GATE_SHA="f" * 40, GATE_HEAD_REF="ai/3-x",
-        GATE_TRUSTED_SHA="1" * 40, ImageOS="ubuntu24", ImageVersion="20261101.1.0",
+        GATE_TRUSTED_SHA="1" * 40, GATE_PR_AUTHOR="example-executor[bot]", ImageOS="ubuntu24", ImageVersion="20261101.1.0",
     )
     process = gate.run("publish", "context", "--config", config, "--hash", config, "--out", out, env=env)
     assert process.returncode == 0, process.stderr
@@ -72,6 +72,7 @@ def test_context_holds_every_sha_and_config_hash(gate, tmp_path):
     assert context["head_sha"] == "e" * 40
     assert context["gate_sha"] == "f" * 40
     assert context["trusted_sha"] == "1" * 40
+    assert context["author"] == "example-executor[bot]"
     assert len(context["config_hashes"]["quality.toml"]) == 64
     assert context["execution_environment"] == {"image_os": "ubuntu24", "image_version": "20261101.1.0"}
 
@@ -114,7 +115,8 @@ def test_extras_count_only_the_owners_time_comments(gate, stub, tmp_path):
     env = gate.env(GITHUB_API_URL=stub.url, GITHUB_REPOSITORY="example/app")
     out = tmp_path / "extras.json"
     (tmp_path / "r").mkdir()
-    assert gate.run("publish", "extras", "--reports-dir", tmp_path / "r", "--pr", 5, "--integration", "candidate/a", "--out", out, env=env).returncode == 0
+    actors = write_json(tmp_path / "actors.json", {"actors_ok": True})
+    assert gate.run("publish", "extras", "--reports-dir", tmp_path / "r", "--actors", actors, "--pr", 5, "--integration", "candidate/a", "--out", out, env=env).returncode == 0
     assert json.loads(out.read_text(encoding="utf-8"))["human"] == [{"minutes": 12}]
 
 
@@ -137,11 +139,12 @@ def test_extras_collect_merges_for_the_bypass_flag(gate, stub, tmp_path):
     env = gate.env(GITHUB_API_URL=stub.url, GITHUB_REPOSITORY="example/app")
     out = tmp_path / "extras.json"
     (tmp_path / "r").mkdir()
-    process = gate.run("publish", "extras", "--reports-dir", tmp_path / "r", "--pr", 5, "--integration", "candidate/a", "--out", out, env=env)
+    actors = write_json(tmp_path / "actors.json", {"actors_ok": True})
+    process = gate.run("publish", "extras", "--reports-dir", tmp_path / "r", "--actors", actors, "--pr", 5, "--integration", "candidate/a", "--out", out, env=env)
     assert process.returncode == 0, process.stderr
     merges = json.loads(out.read_text(encoding="utf-8"))["merges"]
     assert merges == [
-        {"pr": 2, "merge_sha": "m" * 40, "merged_by": "someone", "head_sha": head, "final_conclusion": "failure", "approvals": 1, "via_pr": True}
+        {"pr": 2, "merge_sha": "m" * 40, "merged_by": "someone", "head_sha": head, "final_conclusion": "failure", "approvals": 1, "via_pr": True, "security_review_changed": False}
     ]
 
 
@@ -390,7 +393,8 @@ def test_a_judged_repository_cannot_shadow_the_gate(gate, tmp_path):
 
 def test_extras_refuse_a_missing_folder_of_stored_runs(gate, stub, tmp_path):
     env = gate.env(GITHUB_API_URL=stub.url, GITHUB_REPOSITORY="example/app")
-    process = gate.run("publish", "extras", "--reports-dir", tmp_path / "absent", "--pr", 5, "--integration", "candidate/a", "--out", tmp_path / "e.json", env=env)
+    actors = write_json(tmp_path / "actors.json", {"actors_ok": True})
+    process = gate.run("publish", "extras", "--reports-dir", tmp_path / "absent", "--actors", actors, "--pr", 5, "--integration", "candidate/a", "--out", tmp_path / "e.json", env=env)
     assert process.returncode == 2
     assert not (tmp_path / "e.json").exists()
 
@@ -406,7 +410,7 @@ def test_the_guard_refuses_a_missing_folder_of_stored_runs(gate, tmp_path):
     config = tmp_path / "quality.toml"
     config.write_text("", encoding="utf-8")
     out = tmp_path / "g.json"
-    process = gate.run("guard", "--repo", repo, "--base", sha, "--head", sha, "--branch", "ai/1-x", "--config", config, "--out", out, "--reports-dir", tmp_path / "absent", "--pr", 1)
+    process = gate.run("guard", "--repo", repo, "--base", sha, "--head", sha, "--branch", "ai/1-x", "--author", "a-person", "--config", config, "--out", out, "--reports-dir", tmp_path / "absent", "--pr", 1)
     assert process.returncode == 2
     assert not out.exists()
 
@@ -417,7 +421,8 @@ def test_feedback_refuses_a_missing_folder_of_stored_runs(gate, tmp_path):
     config = tmp_path / "quality.toml"
     config.write_text('[feedback]\nreviewer_app = "r"\n', encoding="utf-8")
     out = tmp_path / "d.json"
-    process = gate.run("feedback", "decide", "--event-name", "status", "--event", event, "--pulls", pulls, "--reports-dir", tmp_path / "absent", "--config", config, "--out", out)
+    actors = write_json(tmp_path / "actors.json", {"actors_ok": True})
+    process = gate.run("feedback", "decide", "--event-name", "status", "--event", event, "--pulls", pulls, "--reports-dir", tmp_path / "absent", "--actors", actors, "--config", config, "--out", out)
     assert process.returncode == 2
     assert not out.exists()
 
@@ -450,17 +455,24 @@ def test_the_prompt_holds_the_trusted_template_the_issue_and_the_note(gate, stub
     assert lines[-1] == delimiter
     # A text cannot end the value early: the delimiter is new each time and long.
     assert len(delimiter) > 30 and delimiter not in "\n".join(lines[1:-1])
+    second = tmp_path / "second.txt"
+    assert gate.run("publish", "prompt", "--template", template, "--output", second, env=env).returncode == 0
+    assert second.read_text(encoding="utf-8").splitlines()[0].removeprefix("text<<") != delimiter
     text = "\n".join(lines[1:-1])
     for expected in ("Read SPEC.md and TASK.md.", "issue #9", "A task", "the body", "the gate's note"):
         assert expected in text
 
 
-def test_the_pr_is_opened_only_for_a_pushed_branch_and_only_once(gate, stub):
+def test_the_pr_is_opened_only_for_the_branch_the_model_pushed_and_only_once(gate, stub):
     env = gate.env(GITHUB_API_URL=stub.url, GITHUB_REPOSITORY="example/app", GATE_TOKEN=SECRET)
-    arguments = ("publish", "create-pull-request", "--prefix", "ai/9-", "--base", "main-line", "--issue", 9)
-    stub.routes[("GET", "/repos/example/app/git/matching-refs/heads/ai/9-")] = (200, [])
+    arguments = ("publish", "create-pull-request", "--branch", "ai/9-fix", "--prefix", "ai/9-", "--base", "main-line", "--issue", 9)
+    # The model ended on the default branch, or on a name it should not use: no PR.
+    assert gate.run("publish", "create-pull-request", "--branch", "main-line", "--prefix", "ai/9-", "--base", "main-line", env=env).returncode == 1
+    # Not pushed: no PR.
+    stub.routes[("GET", "/repos/example/app/git/ref/heads/ai/9-fix")] = (404, {})
     assert gate.run(*arguments, env=env).returncode == 1
-    stub.routes[("GET", "/repos/example/app/git/matching-refs/heads/ai/9-")] = (200, [{"ref": "refs/heads/ai/9-fix"}])
+    assert not [r for r in stub.requests if r["method"] == "POST"]
+    stub.routes[("GET", "/repos/example/app/git/ref/heads/ai/9-fix")] = (200, {"object": {"sha": "a" * 40}})
     stub.routes[("GET", "/repos/example/app/issues/9")] = (200, {"title": "A task"})
     stub.routes[("GET", "/repos/example/app/pulls?state=open&head=example%3Aai%2F9-fix")] = (200, [])
     stub.routes[("POST", "/repos/example/app/pulls")] = (201, {})
@@ -503,7 +515,8 @@ def test_a_direct_push_since_the_baseline_is_flagged(gate, stub, tmp_path):
     (tmp_path / "r").mkdir()
     out = tmp_path / "extras.json"
     env = gate.env(GITHUB_API_URL=stub.url, GITHUB_REPOSITORY="example/app")
-    process = gate.run("publish", "extras", "--reports-dir", tmp_path / "r", "--pr", 5, "--integration", "candidate/a", "--context", context, "--out", out, env=env)
+    actors = write_json(tmp_path / "actors.json", {"actors_ok": True})
+    process = gate.run("publish", "extras", "--reports-dir", tmp_path / "r", "--actors", actors, "--pr", 5, "--integration", "candidate/a", "--context", context, "--out", out, env=env)
     assert process.returncode == 0, process.stderr
     merges = json.loads(out.read_text(encoding="utf-8"))["merges"]
     flagged = [item for item in merges if item["via_pr"] is False]
@@ -541,7 +554,7 @@ def test_seal_leaves_a_symbolic_link_out_of_the_sums(gate, tmp_path, monkeypatch
 
 def _ready_inputs(gate, tmp_path, setup_conclusion: str):
     artifact = tmp_path / "artifact"
-    artifact.mkdir()
+    artifact.mkdir(parents=True)
     steps = ["gate/env", "gate/guard", "gate/tests", "gate/acceptance", "gate/security"]
     rows = ["check\tindex\texit_code\tduration_seconds\traw_path\targv_json"]
     rows += [f"{step}\t0\t0\t0.1\t\t[]" for step in steps]
@@ -574,3 +587,173 @@ def test_a_failed_setup_is_never_ready(gate, tmp_path, conclusion, verdict):
     # Every report shows the accepted foreign commits (decision V).
     assert report["accepted_foreign_commits"][0]["sha"] == "e" * 40
     assert "a stray commit" in (out / "report.md").read_text(encoding="utf-8")
+
+
+# Review round 2: what the repairs of decision X must hold.
+
+
+def _extras(gate, stub, tmp_path, actors_ok=True, context=None):
+    stub.routes[("GET", "/repos/example/app/issues/5/comments?per_page=100")] = stub.routes.get(("GET", "/repos/example/app/issues/5/comments?per_page=100"), (200, []))
+    stub.routes[("GET", "/repos/example/app/pulls?state=closed&base=candidate%2Fa&per_page=100")] = stub.routes.get(("GET", "/repos/example/app/pulls?state=closed&base=candidate%2Fa&per_page=100"), (200, []))
+    actors = write_json(tmp_path / "actors.json", {"actors_ok": actors_ok})
+    reports = tmp_path / "reports"
+    reports.mkdir(exist_ok=True)
+    context_path = write_json(tmp_path / "context.json", context or {})
+    out = tmp_path / "extras.json"
+    env = gate.env(GITHUB_API_URL=stub.url, GITHUB_REPOSITORY="example/app", GATE_TOKEN=SECRET)
+    process = gate.run("publish", "extras", "--reports-dir", reports, "--actors", actors, "--context", context_path, "--pr", 5, "--integration", "candidate/a", "--out", out, env=env)
+    assert process.returncode == 0, process.stderr
+    return json.loads(out.read_text(encoding="utf-8")), reports
+
+
+@pytest.mark.req("P-3")
+def test_extras_read_no_stored_run_when_the_reports_cannot_be_trusted(gate, stub, tmp_path):
+    (tmp_path / "reports" / "5" / "1-1").mkdir(parents=True)
+    write_json(tmp_path / "reports" / "5" / "1-1" / "context.json", {"head_sha": "a" * 40})
+    extras, _ = _extras(gate, stub, tmp_path, actors_ok=False)
+    assert extras["reports_untrusted"] is True
+    assert extras["rounds"] == []
+
+
+def test_extras_count_a_stored_run_even_with_no_guard_record(gate, stub, tmp_path):
+    (tmp_path / "reports" / "5" / "1-1").mkdir(parents=True)
+    write_json(tmp_path / "reports" / "5" / "1-1" / "context.json", {"head_sha": "a" * 40})
+    extras, _ = _extras(gate, stub, tmp_path)
+    assert extras["reports_untrusted"] is False
+    assert extras["rounds"] == [{"head_sha": "a" * 40, "round": None, "cumulative": None}]
+
+
+@pytest.mark.req("P-5")
+def test_a_refused_read_of_statuses_says_unknown_and_blocks_nothing(gate, stub, tmp_path):
+    head = "a" * 40
+    stub.routes[("GET", f"/repos/example/app/commits/{head}/statuses?per_page=100")] = (403, {})
+    extras, _ = _extras(gate, stub, tmp_path, context={"head_sha": head})
+    assert extras["independent_review"] == "unknown"
+
+
+def test_the_review_status_of_this_head_is_in_the_extras(gate, stub, tmp_path):
+    head = "a" * 40
+    stub.routes[("GET", f"/repos/example/app/commits/{head}/statuses?per_page=100")] = (
+        200,
+        [{"context": "other", "state": "success"}, {"context": "independent-review", "state": "failure", "creator": {"login": "r[bot]"}}],
+    )
+    extras, _ = _extras(gate, stub, tmp_path, context={"head_sha": head})
+    assert extras["independent_review"] == {"state": "failure", "creator": "r[bot]", "head_sha": head}
+
+
+@pytest.mark.req("B-1")
+def test_a_merge_that_changed_the_security_review_is_flagged_however_green(gate, stub, tmp_path):
+    head = "a" * 40
+    stub.routes[("GET", "/repos/example/app/pulls?state=closed&base=candidate%2Fa&per_page=100")] = (
+        200,
+        [{"number": 2, "merged_at": "2026-11-03T10:00:00Z", "merge_commit_sha": "m" * 40, "merged_by": {"login": "someone"}, "head": {"sha": head}}],
+    )
+    stub.routes[("GET", f"/repos/example/app/commits/{head}/check-runs?check_name=gate%2Ffinal")] = (200, {"check_runs": [{"conclusion": "success"}]})
+    stub.routes[("GET", "/repos/example/app/pulls/2/reviews?per_page=100")] = (200, [{"state": "APPROVED", "commit_id": head}])
+    stub.routes[("GET", "/repos/example/app/pulls/2/files?per_page=100")] = (200, [{"filename": "security-review.md"}])
+    extras, _ = _extras(gate, stub, tmp_path)
+    assert extras["merges"][0]["security_review_changed"] is True
+    context, jobs, artifact, config = _ready_inputs(gate, tmp_path / "r", "success")
+    source = write_json(tmp_path / "extras-given.json", extras)
+    out = tmp_path / "publish"
+    assert gate.run("report", "generate", "--context", context, "--jobs", jobs, "--artifact", artifact, "--config", config, "--extras", source, "--out", out).returncode == 0
+    report = json.loads((out / "report.json").read_text(encoding="utf-8"))
+    assert [item["pr"] for item in report["bypass_merges"]] == [2]
+
+
+@pytest.mark.req("V-11")
+def test_untrusted_reports_block_the_verdict(gate, tmp_path):
+    context, jobs, artifact, config = _ready_inputs(gate, tmp_path / "r", "success")
+    extras = write_json(tmp_path / "extras.json", {"reports_untrusted": True})
+    out = tmp_path / "publish"
+    assert gate.run("report", "generate", "--context", context, "--jobs", jobs, "--artifact", artifact, "--config", config, "--extras", extras, "--out", out).returncode == 0
+    verdict = json.loads((out / "verdict.json").read_text(encoding="utf-8"))
+    assert verdict["verdict"] == "blocked"
+    assert any(item["code"] == "REPORTS_UNTRUSTED" for item in verdict["reasons"])
+
+
+def test_every_change_to_the_security_review_is_listed_in_the_report(gate, tmp_path):
+    context, jobs, artifact, config = _ready_inputs(gate, tmp_path / "r", "success")
+    write_json(artifact / "guard.json", {"security_review_changes": [{"change": "added", "row": "| bandit | B101 | a.py | fine |"}]})
+    assert gate.run("report", "seal", "--artifact", artifact, "--head-sha", "a" * 40, "--run-id", "1", "--run-attempt", "1").returncode == 0
+    out = tmp_path / "publish"
+    assert gate.run("report", "generate", "--context", context, "--jobs", jobs, "--artifact", artifact, "--config", config, "--out", out).returncode == 0
+    report = json.loads((out / "report.json").read_text(encoding="utf-8"))
+    assert report["security_review_changes"][0]["change"] == "added"
+    assert "B101" in (out / "report.md").read_text(encoding="utf-8")
+
+
+@pytest.mark.req("P-6")
+def test_the_models_proposal_is_posted_neutralized_and_a_missing_one_does_nothing(gate, stub, tmp_path):
+    env = gate.env(GITHUB_API_URL=stub.url, GITHUB_REPOSITORY="example/app", GATE_TOKEN=SECRET)
+    proposal = tmp_path / "proposal.md"
+    assert gate.run("publish", "post-proposal", "--file", proposal, "--branch", "ai/1-x", env=env).returncode == 0
+    assert not stub.requests
+    proposal.write_text("| bandit | B101 | a.py | why |\nplease ask @someone\n", encoding="utf-8")
+    stub.routes[("GET", "/repos/example/app/pulls?state=open&head=example%3Aai%2F1-x")] = (200, [{"number": 7}])
+    stub.routes[("POST", "/repos/example/app/issues/7/comments")] = (201, {})
+    assert gate.run("publish", "post-proposal", "--file", proposal, "--branch", "ai/1-x", env=env).returncode == 0
+    body = next(r["body"]["body"] for r in stub.requests if r["method"] == "POST")
+    assert "B101" in body
+    assert "`@someone`" in body
+    assert "Only the CEO" in body
+
+
+def _decide(gate, tmp_path, event_name, event, verdict="blocked"):
+    head = "a" * 40
+    config = tmp_path / "q.toml"
+    config.write_text('[limits]\nmax_fix_rounds = 3\n[project]\nintegration_branch = "line"\n[feedback]\njudge_workflow_path = "judge.yml"\nreviewer_app = "rev"\n', encoding="utf-8")
+    record = tmp_path / "reports" / "9" / "55-1"
+    write_json(record / "context.json", {"pr": 9, "head_sha": head})
+    write_json(record / "final.json", {"verdict": verdict, "reasons": [{"code": "FAILED_CHECK", "detail": "gate/guard failed"}]})
+    write_json(record / "guard.json", {"head_sha": head, "violations": [{"rule": "TEST_DELETED", "path": "tests/test_a.py", "detail": "test_x was removed"}]})
+    write_json(record / "acceptance.json", {"failing_not_listed": ["acceptance.test_a::test_b"], "missing_tests": ["acceptance.test_a::test_c"]})
+    write_json(record / "artifact" / "raw" / "gate-security" / "security.json", {"findings": [{"tool": "bandit", "rule": "B101", "path": "a.py", "reviewed": False}, {"tool": "bandit", "rule": "B999", "path": "b.py", "reviewed": True}]})
+    write_json(record / "artifact" / "raw" / "gate-tests" / "missing_tests.json", ["tests.test_a::test_d"])
+    pulls = write_json(tmp_path / "p.json", [{"number": 9, "head_sha": head, "base_ref": "line", "head_ref": "ai/9-x", "head_repository": "e/a", "repository": "e/a"}])
+    actors = write_json(tmp_path / "actors.json", {"actors_ok": True})
+    statuses = write_json(tmp_path / "s.json", [{"context": "independent-review", "state": "failure", "creator": {"login": "rev[bot]"}}])
+    source = write_json(tmp_path / "e.json", event)
+    out = tmp_path / "d.json"
+    process = gate.run("feedback", "decide", "--event-name", event_name, "--event", source, "--pulls", pulls, "--reports-dir", tmp_path / "reports", "--actors", actors, "--statuses", statuses, "--config", config, "--out", out)
+    assert process.returncode == 0, process.stderr
+    return json.loads(out.read_text(encoding="utf-8"))
+
+
+@pytest.mark.req("D-6a")
+def test_the_note_of_a_judge_failure_says_what_is_wrong(gate, tmp_path):
+    decision = _decide(gate, tmp_path, "workflow_run", {"workflow_run": {"path": "judge.yml", "event": "pull_request_target", "id": 55, "run_attempt": 1}})
+    assert decision["act"] is True
+    for expected in ("TEST_DELETED", "test_x was removed", "acceptance.test_a::test_b", "acceptance.test_a::test_c", "B101", "tests.test_a::test_d"):
+        assert expected in decision["comment"], expected
+    assert "B999" not in decision["comment"], "a reviewed finding is not a failure"
+
+
+@pytest.mark.req("D-6a")
+def test_the_note_of_a_review_holds_its_findings_and_no_bare_mention(gate, tmp_path):
+    head = "a" * 40
+    body = f"<!-- gate-review sha={head} verdict=changes_requested -->\nIndependent review\n- high, src/a.py: the rule is wrong, ask @someone"
+    event = {"action": "created", "issue": {"number": 9, "pull_request": {"url": "x"}}, "sender": {"login": "rev[bot]"}, "comment": {"body": body}}
+    decision = _decide(gate, tmp_path, "issue_comment", event)
+    assert decision["act"] is True
+    assert "the rule is wrong" in decision["comment"]
+    assert "`@someone`" in decision["comment"]
+    assert "gate-review" not in decision["comment"]
+
+
+def test_a_changed_test_file_that_cannot_be_parsed_is_refused(gate, tmp_path):
+    repo = tmp_path / "repo"
+    (repo / "tests").mkdir(parents=True)
+    gate.git(repo, "init", "--quiet")
+    (repo / "tests" / "test_a.py").write_text("def test_a():\n    assert 1 == 1\n", encoding="utf-8")
+    gate.git(repo, "add", "-A")
+    gate.git(repo, "commit", "--quiet", "-m", "base")
+    base = gate.git(repo, "rev-parse", "HEAD")
+    (repo / "tests" / "test_a.py").write_text("def test_a(:\n", encoding="utf-8")
+    gate.git(repo, "add", "-A")
+    gate.git(repo, "commit", "--quiet", "-m", "change")
+    config = tmp_path / "quality.toml"
+    config.write_text("", encoding="utf-8")
+    out = tmp_path / "g.json"
+    assert gate.run("guard", "--repo", repo, "--base", base, "--head", "HEAD", "--branch", "ai/1-x", "--author", "a-person", "--config", config, "--out", out).returncode == 1
+    assert any(item["rule"] == "TEST_WEAKENED" for item in json.loads(out.read_text(encoding="utf-8"))["violations"])

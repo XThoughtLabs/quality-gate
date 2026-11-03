@@ -159,6 +159,9 @@ jobs:
           name: ${{ inputs.fix-note-artifact }}
           path: ${{ runner.temp }}/note
 
+      - name: Keep the model's proposal out of its commits
+        run: echo ".gate-security-proposal.md" >> .git/info/exclude
+
       - name: Build the prompt
         id: prompt
         env:
@@ -193,4 +196,9 @@ jobs:
         if: ${{ inputs.issue-number != '' }}
         env:
           GATE_TOKEN: ${{ steps.app-token.outputs.token }}
-        run: python -P -m gate.publish create-pull-request --prefix "ai/$GATE_ISSUE-" --base "$GATE_INTEGRATION_BRANCH" --issue "$GATE_ISSUE"
+        run: python -P -m gate.publish create-pull-request --branch "$(git branch --show-current)" --prefix "ai/$GATE_ISSUE-" --base "$GATE_INTEGRATION_BRANCH" --issue "$GATE_ISSUE"
+
+      - name: Post the model's proposal for a security entry
+        env:
+          GATE_TOKEN: ${{ steps.app-token.outputs.token }}
+        run: python -P -m gate.publish post-proposal --file .gate-security-proposal.md --branch "$(git branch --show-current)"

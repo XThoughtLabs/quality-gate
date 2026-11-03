@@ -10,15 +10,21 @@ from __future__ import annotations
 
 import argparse
 import os
+import re
 import shutil
 import subprocess
 import sys
 from pathlib import Path
 
 from gate import report as report_module
+from gate.archive import ApiRemote, actors_status, load_accepted
 from gate.common import DIAGNOSTIC_CHECKS, EXIT_OK, EXIT_RULE_FAILED, UsageError, fail_usage, read_json, read_json_or_none, write_json
 
 GATE_ROOT = Path(__file__).resolve().parent.parent
+
+
+class Untrusted(Exception):
+    """The reports branch holds a commit the gate did not write."""
 
 
 def git(*args: str, cwd: Path | None = None) -> str:
@@ -26,6 +32,22 @@ def git(*args: str, cwd: Path | None = None) -> str:
     if process.returncode != 0:
         raise UsageError(f"git {args[0]} failed: {process.stderr.decode('utf-8', 'replace').strip()[:300]}")
     return process.stdout.decode("utf-8", "replace").strip()
+
+
+def github_repository(repo: str) -> str | None:
+    """OWNER/NAME of a GitHub URL, or None for any other remote."""
+    match = re.fullmatch(r"(?:https://github\.com/|git@github\.com:)([^/]+/[^/]+?)(?:\.git)?/?", repo)
+    return match.group(1) if match else None
+
+
+def check_stored_evidence(repository: str | None, config: Path) -> None:
+    """Stored evidence on GitHub is read only after the check every other read makes."""
+    if repository is None:
+        print("note: this remote is not on GitHub, so the authors of its reports branch cannot be checked")
+        return
+    status = actors_status(ApiRemote(repository, "reports"), load_accepted(str(config)))
+    if not status["actors_ok"]:
+        raise Untrusted(str(status["reason"]))
 
 
 def find_stored(reports: Path, sha: str) -> Path:
@@ -85,6 +107,9 @@ def reproduce(args: argparse.Namespace) -> int:
     pr_dir = work / "pr"
     git("clone", "--quiet", args.repo, str(pr_dir))
     git("fetch", "--quiet", "--no-tags", "origin", "+refs/heads/reports:refs/remotes/origin/reports", cwd=pr_dir)
+    default_tree = work / "default"
+    git("worktree", "add", "--quiet", "--detach", str(default_tree), git("symbolic-ref", "--short", "refs/remotes/origin/HEAD", cwd=pr_dir), cwd=pr_dir)
+    check_stored_evidence(args.api_repo or github_repository(args.repo), default_tree / "quality.toml")
     stored_tree = work / "stored"
     git("worktree", "add", "--quiet", "--detach", str(stored_tree), "origin/reports", cwd=pr_dir)
     stored = find_stored(stored_tree / "reports", args.sha)
@@ -175,9 +200,13 @@ def main(argv: list[str] | None = None) -> int:
     parser.add_argument("--repo", required=True)
     parser.add_argument("--sha", required=True)
     parser.add_argument("--out", required=True)
+    parser.add_argument("--api-repo", help="OWNER/NAME, when --repo does not say it")
     args = parser.parse_args(argv)
     try:
         code = reproduce(args)
+    except Untrusted as error:
+        print(f"REPORTS_UNTRUSTED: {error}", file=sys.stderr)
+        return EXIT_RULE_FAILED
     except (UsageError, OSError, KeyError, ValueError) as error:
         return fail_usage(str(error))
     print("reproduced: equal except for the times" if code == EXIT_OK else "not reproduced")

@@ -34,7 +34,7 @@ def write_config(path: Path, reviewer: str = "example-reviewer") -> None:
     )
     tests = toml_list([python, "-m", "pytest", "-q", "-p", "no:cacheprovider", "--import-mode=importlib", "tests", "--junitxml={raw}/junit.xml"])
     acceptance = toml_list(
-        [python, "-P", "-m", "gate.acceptance", "--junit", "{raw}/junit.xml", "--known-failing", "{env:GATE_KNOWN_FAILING}", "--mode", "{env:GATE_ACCEPTANCE_MODE}", "--out", "{raw}/acceptance.json", "--", python, "-m", "pytest", "-q", "-p", "no:cacheprovider", "--import-mode=importlib", "acceptance", "--junitxml={raw}/junit.xml"]
+        [python, "-P", "-m", "gate.acceptance", "--junit", "{raw}/junit.xml", "--known-failing", "{env:GATE_KNOWN_FAILING}", "--mode", "{env:GATE_ACCEPTANCE_MODE}", "--out", "{raw}/acceptance.json", "--tests-dir", "acceptance", "--", python, "-m", "pytest", "-q", "-p", "no:cacheprovider", "--import-mode=importlib", "acceptance", "--junitxml={raw}/junit.xml"]
     )
     security = toml_list(
         [python, "-P", "-m", "gate.security_check", "--bandit", "{raw}/bandit.json", "--pip-audit", "{raw}/pip-audit.json", "--gitleaks", "{raw}/gitleaks.json", "--review", "security-review.md", "--repo", ".", "--base", "{env:GATE_BASE_SHA}", "--head", "{env:GATE_HEAD_SHA}", "--out", "{raw}/security.json", "--tool-command", security_tool]
@@ -58,6 +58,7 @@ class = "mandatory"
 commands = [{tests}]
 junit = "junit.xml"
 forbid_skips = true
+expected_tests_from_base = true
 required_outputs = ["junit.xml"]
 
 [checks."gate/acceptance"]
@@ -304,3 +305,41 @@ def test_reproduce_refuses_a_commit_with_no_stored_evidence(world, short_tmp):
     process = world.gate.run("reproduce", "--repo", world.remote, "--sha", world.base, "--out", short_tmp / "rerun", env=reproduce_env(world))
     assert process.returncode == 2
     assert head != world.base
+
+
+@pytest.mark.req("X-0")
+def test_reproduce_refuses_a_reports_branch_written_by_another_actor(world, short_tmp, stub):
+    head = world.change()
+    world.judge(world.run_job())
+    stub.routes[("GET", "/repos/example/app/git/ref/heads/reports")] = (200, {"object": {"sha": "f" * 40}})
+    stub.routes[("GET", "/repos/example/app/commits?sha=reports&per_page=100")] = (
+        200,
+        [{"sha": "f" * 40, "author": {"login": "someone-else[bot]"}, "commit": {"verification": {"verified": True}}}],
+    )
+    env = world.gate.env(GATE_PY=sys.executable, GITHUB_API_URL=stub.url)
+    process = world.gate.run("reproduce", "--repo", world.remote, "--api-repo", "example/app", "--sha", head, "--out", short_tmp / "rerun", env=env)
+    assert process.returncode == 1
+    assert "REPORTS_UNTRUSTED" in process.stderr
+
+
+@pytest.mark.req("X-1")
+def test_reproduce_finds_a_closed_prs_head_after_its_branch_is_gone(world, short_tmp):
+    head = world.change()
+    assert world.judge(world.run_job())["verdict"] == "ready-for-human"
+    world.gate.git(world.remote, "update-ref", "refs/pull/7/head", head)
+    world.gate.git(world.remote, "update-ref", "-d", "refs/heads/ai/1-change")
+    # Nothing else in the remote holds that commit now but refs/pull.
+    process = world.gate.run("reproduce", "--repo", world.remote, "--sha", head, "--out", short_tmp / "rerun", env=reproduce_env(world))
+    assert process.returncode == 0, process.stdout + process.stderr
+
+
+@pytest.mark.req("X-1")
+def test_reproduce_uses_the_default_branchs_security_review(world, short_tmp):
+    """A PR's own copy must not decide the rerun any more than it decided the run."""
+    review = "| tool | rule | path | reason |\n|---|---|---|---|\n"
+    (world.repo / "security-review.md").write_text(review + "| bandit | B999 | x.py | the PR's own |\n", encoding="utf-8")
+    head = world.change()
+    assert world.judge(world.run_job())["verdict"] == "blocked", "the guard refuses the file"
+    out = short_tmp / "rerun"
+    world.gate.run("reproduce", "--repo", world.remote, "--sha", head, "--out", out, env=reproduce_env(world))
+    assert not (out / "work" / "pr" / "security-review.md").exists()

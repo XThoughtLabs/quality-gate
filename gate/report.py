@@ -41,7 +41,7 @@ NEEDS_HUMAN = "needs-human"
 INCOMPLETE = "incomplete"
 
 RUN_STEPS = ("gate/env", "gate/guard", "gate/tests", "gate/acceptance", "gate/security")
-CONTRADICTIONS = {"FORK_PR", "SHA_MISMATCH", "EXIT_CODE_MISMATCH", "CHECKSUM_MISMATCH", "CLAIM_MISMATCH"}
+CONTRADICTIONS = {"FORK_PR", "SHA_MISMATCH", "EXIT_CODE_MISMATCH", "CHECKSUM_MISMATCH", "CLAIM_MISMATCH", "REPORTS_UNTRUSTED"}
 GAPS = {"UNFINISHED_STAGE", "NO_ARTIFACT", "MISSING_OUTPUT"}
 CONTEXT_FIELDS = (
     "repository",
@@ -233,6 +233,8 @@ def judge(context: dict, jobs: dict, artifact: Path, config: dict, extras: dict)
 
     for check in failed_checks:
         reason("FAILED_CHECK", f"{check} failed")
+    if extras.get("reports_untrusted") is True:
+        reason("REPORTS_UNTRUSTED", "the reports branch holds a commit the gate did not write, so its records were not read")
     if steps.get("setup", {}).get("conclusion") == "failure":
         reason("FAILED_CHECK", "setup failed, so the checks did not run on a prepared application")
     env_failures = extras.get("env_failures", [])
@@ -314,7 +316,12 @@ def bypass_merges(merges: list[Any]) -> list[dict]:
     for merge in merges:
         if not isinstance(merge, dict):
             continue
-        if merge.get("via_pr") is not True or not merge.get("approvals") or merge.get("final_conclusion") != "success":
+        if (
+            merge.get("via_pr") is not True
+            or not merge.get("approvals")
+            or merge.get("final_conclusion") != "success"
+            or merge.get("security_review_changed") is True
+        ):
             flagged.append(merge)
     return flagged
 
@@ -372,6 +379,7 @@ def build_report(
     dependency_changes = guard.get("dependency_changes")
     needs_code_owner = guard.get("needs_code_owner")
     marked_tests = guard.get("marked_tests")
+    security_changes = guard.get("security_review_changes")
     setup_rows = facts["rows"].get("setup", [])
     setup: Any = "not-configured"
     if setup_rows:
@@ -391,6 +399,7 @@ def build_report(
         "setup": setup,
         "needs_code_owner": needs_code_owner if isinstance(needs_code_owner, list) else [],
         "marked_tests": marked_tests if isinstance(marked_tests, list) else [],
+        "security_review_changes": security_changes if isinstance(security_changes, list) else [],
         "accepted_foreign_commits": accepted if isinstance(accepted, list) else [],
         "independent_review": extras.get("independent_review", "unknown"),
         "environment": object_or_unknown(artifact_json("environment.json")),
@@ -455,6 +464,13 @@ def render_markdown(report: dict) -> str:
         if isinstance(item, dict)
     ]
 
+    lines += ["", "## Changes to security-review.md, flagged", ""]
+    lines += [
+        f"- {cell(item.get('change'))}: {cell(item.get('row'))}"
+        for item in report["security_review_changes"]
+        if isinstance(item, dict)
+    ] or ["None."]
+
     lines += ["", "## Accepted foreign commits on the reports branch", ""]
     lines += [
         f"- {cell(item.get('sha'))}, {cell(item.get('date'))}: {cell(item.get('reason'))}"
@@ -471,7 +487,7 @@ def render_markdown(report: dict) -> str:
 
     lines += ["", "## Findings", ""]
     lines += [
-        f"- {cell(item.get('tool', ''))} {cell(item.get('rule', ''))} {cell(item.get('path', ''))} {cell(item.get('detail', ''))}".rstrip()
+        f"- {cell(item.get('tool', ''))} {cell(item.get('rule', ''))} {cell(item.get('path', ''))} {cell(item.get('detail', ''))}{' (reviewed)' if item.get('reviewed') is True else ''}".rstrip()
         for item in report["findings"]
     ] or ["None."]
 

@@ -35,8 +35,12 @@ FIXED_PROTECTED = (
     "evidence/",
     "security-review.md",
 )
-# What controls which tests are collected or how the security tools run (decision W).
+# What controls which tests are collected or how the security tools run (decisions W, X).
+# The pytest names are those of CONFIG_LOADERS_BY_NAME in pytest 9.2.0, the pinned version,
+# which looks for them in every folder from a test's path upwards.
 PROTECTED_NAMES_ANY_FOLDER = {
+    "pytest.toml",
+    ".pytest.toml",
     "pytest.ini",
     ".pytest.ini",
     ".bandit",
@@ -46,12 +50,15 @@ PROTECTED_NAMES_ANY_FOLDER = {
     ".gitleaksignore",
 }
 PROTECTED_ROOT_CONFTEST = "conftest.py"
+# `python -m pytest` runs from the working folder, so these would stand in for pytest itself.
+PROTECTED_ROOT_SHADOWS = ("pytest.py", "pytest/", "_pytest/")
 PROTECTED_INI_SECTIONS = {
     "setup.cfg": ("tool:*", "coverage:*", "bandit", "flake8", "mypy*"),
     "tox.ini": ("pytest", "tox*", "testenv*", "coverage:*", "bandit", "flake8", "mypy*"),
 }
 FIXED_THRESHOLD_KEYS = ("fail_under", "fail-under", "cov-fail-under")
 KNOWN_FAILING_PATH = "acceptance/known-failing.txt"
+SECURITY_REVIEW_PATH = "security-review.md"
 # The action's default git identity, for commits that do not name the app.
 ACTION_DEFAULT_BOT = "claude[bot]"
 
@@ -95,6 +102,7 @@ class Result:
     violations: list[dict] = field(default_factory=list)
     needs_code_owner: list[str] = field(default_factory=list)
     marked_tests: list[dict] = field(default_factory=list)
+    security_review_changes: list[dict] = field(default_factory=list)
     dependency_changes: list[dict] = field(default_factory=list)
     fingerprint: dict = field(default_factory=dict)
     repeated_fix: bool = False
@@ -224,7 +232,7 @@ def is_protected(path: str, protected: list[str]) -> bool:
 
 def is_protected_control_file(path: str) -> bool:
     lowered = path.lower()
-    if lowered == PROTECTED_ROOT_CONFTEST:
+    if lowered == PROTECTED_ROOT_CONFTEST or is_protected(lowered, list(PROTECTED_ROOT_SHADOWS)):
         return True
     return PurePosixPath(lowered).name in PROTECTED_NAMES_ANY_FOLDER
 
@@ -244,15 +252,20 @@ def _ini_sections(text: str, patterns: tuple[str, ...]) -> dict[str, dict[str, s
 
 def protected_section_changed(path: str, base_text: str | None, head_text: str | None) -> str | None:
     """Say which protected section of a root configuration file changed, or None."""
-    lowered = path.lower()
+    lowered = PurePosixPath(path.lower()).name
     if lowered == "pyproject.toml":
         try:
-            before = tomllib.loads(base_text or "").get("tool", {})
-            after = tomllib.loads(head_text or "").get("tool", {})
+            before_doc = tomllib.loads(base_text or "")
+            after_doc = tomllib.loads(head_text or "")
         except tomllib.TOMLDecodeError:
             return "the file cannot be parsed"
+        before = before_doc.get("tool", {})
+        after = after_doc.get("tool", {})
         changed = sorted(key for key in set(before) | set(after) if before.get(key) != after.get(key))
-        return f"[tool.{changed[0]}] changed" if changed else None
+        if changed:
+            return f"[tool.{changed[0]}] changed"
+        plugins = [doc.get("project", {}).get("entry-points", {}).get("pytest11") for doc in (before_doc, after_doc)]
+        return "[project.entry-points.pytest11] changed" if plugins[0] != plugins[1] else None
     patterns = PROTECTED_INI_SECTIONS.get(lowered)
     if patterns is None:
         return None
@@ -687,6 +700,19 @@ def check_known_failing(git: Git, base: str, head: str, kind: str, args: argpars
             result.add("KNOWN_FAILING_REMOVED_NOT_PASSED", KNOWN_FAILING_PATH, f"{test_id} has no stored pass")
 
 
+def security_review_changes(git: Git, base: str, head: str) -> list[dict]:
+    """Each table row of security-review.md that a PR adds or removes, whoever made the PR."""
+
+    def rows(text: str | None) -> list[str]:
+        return [line.strip() for line in (text or "").splitlines() if line.strip().startswith("|")]
+
+    before = rows(git.show(base, SECURITY_REVIEW_PATH))
+    after = rows(git.show(head, SECURITY_REVIEW_PATH))
+    changes = [{"change": "added", "row": row} for row in after if row not in before]
+    changes += [{"change": "removed", "row": row} for row in before if row not in after]
+    return changes
+
+
 def check_ai_rules(git: Git, base: str, head: str, changes: list[tuple[str, str]], guard: dict, result: Result) -> None:
     protected = [*FIXED_PROTECTED, *guard.get("extra_protected", [])]
     keys = [*FIXED_THRESHOLD_KEYS, *guard.get("threshold_keys", [])]
@@ -737,6 +763,7 @@ def judge(args: argparse.Namespace, config: dict) -> Result:
         result.repeated_fix = False
 
     check_known_failing(git, base, head, kind, args, result)
+    result.security_review_changes = security_review_changes(git, base, head)
     return result
 
 
@@ -767,6 +794,7 @@ def main(argv: list[str] | None = None) -> int:
             "violations": result.violations,
             "needs_code_owner": sorted(set(result.needs_code_owner)),
             "marked_tests": result.marked_tests,
+            "security_review_changes": result.security_review_changes,
             "dependency_changes": result.dependency_changes,
             "fingerprint": result.fingerprint,
             "repeated_fix": result.repeated_fix,

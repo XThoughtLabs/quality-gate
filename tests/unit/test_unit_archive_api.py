@@ -36,6 +36,7 @@ class FakeGit:
         self.refuse_moves = 0
         self.corrupt_blobs = False
         self.commits_status = 200
+        self.commit_details: dict[str, dict] = {}
         self.lock = threading.Lock()
 
     def new_sha(self, kind: str) -> str:
@@ -105,6 +106,12 @@ class Handler(BaseHTTPRequestHandler):
                 if fake.corrupt_blobs:
                     data = data + b"x"
                 return self._reply(200, {"content": base64.b64encode(data).decode(), "encoding": "base64"})
+            if self.command == "GET" and route.startswith("/commits/"):
+                sha = route.rsplit("/", 1)[1]
+                page = int(query.get("page", ["1"])[0])
+                detail = fake.commit_details.get(sha, {"parents": fake.commits[sha]["parents"], "files": []})
+                files = detail["files"][(page - 1) * 100 : page * 100]
+                return self._reply(200, {"parents": detail["parents"], "files": files})
             if self.command == "GET" and route == "/commits":
                 if fake.commits_status != 200:
                     return self._reply(fake.commits_status, {})
@@ -361,6 +368,42 @@ def test_more_commits_than_the_pages_can_hold_are_not_trusted(gate, github, inpu
     status = archive_module.actors_status(remote, {})
     assert status["actors_ok"] is False
     assert status["reason"] == "the authors of reports could not be checked"
+
+
+def accepted_config(tmp_path: Path, sha: str) -> Path:
+    config = tmp_path / "quality.toml"
+    config.write_text(f'[[archive.accepted_foreign_commits]]\nsha = "{sha}"\nreason = "a stray commit"\ndate = "2026-11-03"\n', encoding="utf-8")
+    return config
+
+
+def test_append_reads_the_recovery_list_too(gate, github, inputs, tmp_path):
+    store(gate, github, inputs)
+    head = github.refs["refs/heads/reports"]
+    foreign = github.add_commit({"reports/7/99-1/x": b"stray"}, "someone-else[bot]", True, head)
+    github.commit_details[foreign] = {"parents": [head], "files": [{"filename": "reports/7/99-1/x", "status": "added"}]}
+    final = tmp_path / "final.json"
+    final.write_text("{}", encoding="utf-8")
+    env = gate.env(GITHUB_API_URL=github.url, GATE_TOKEN=SECRET)
+    process = gate.run(
+        "archive", "append", "--api-repo", "example/app", "--branch", "reports", "--path", "reports/7/11-1/final.json",
+        "--file", final, "--config", accepted_config(tmp_path, foreign), "--out", inputs["out"], env=env,
+    )
+    assert process.returncode == 0, process.stderr
+    assert json.loads(inputs["out"].read_text(encoding="utf-8"))["accepted_commits"] == [foreign]
+
+
+def test_a_listed_commit_is_read_to_its_last_page_of_files(gate, github, inputs, tmp_path):
+    """A hundred added files must not hide a changed record on the next page."""
+    store(gate, github, inputs)
+    head = github.refs["refs/heads/reports"]
+    foreign = github.add_commit({"reports/7/99-1/x": b"stray"}, "someone-else[bot]", True, head)
+    added = [{"filename": f"reports/7/99-1/{index}", "status": "added"} for index in range(100)]
+    github.commit_details[foreign] = {"parents": [head], "files": [*added, {"filename": "reports/7/11-1/report.json", "status": "modified"}]}
+    env = gate.env(GITHUB_API_URL=github.url, GATE_TOKEN=SECRET)
+    out = tmp_path / "actors.json"
+    process = gate.run("archive", "check-actors", "--api-repo", "example/app", "--branch", "reports", "--config", accepted_config(tmp_path, foreign), "--out", out, env=env)
+    assert process.returncode == 1
+    assert json.loads(out.read_text(encoding="utf-8"))["foreign_commits"] == [foreign]
 
 
 def test_a_git_remote_on_github_is_refused(gate, inputs):

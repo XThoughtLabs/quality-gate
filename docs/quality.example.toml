@@ -42,6 +42,8 @@ commands = [["python", "-m", "pytest", "-q", "-p", "no:cacheprovider", "--ignore
 junit = "junit.xml"
 forbid_skips = true
 expected_tests_from_base = true
+# expected_tests_ignore = ["tests/manual/"]   # what pytest treats differently in this repository
+# expected_tests_root = "backend"             # when a configuration file there makes it pytest's root
 required_outputs = ["junit.xml"]
 
 [checks."gate/acceptance"]

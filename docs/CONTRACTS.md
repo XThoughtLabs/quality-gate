@@ -114,6 +114,10 @@ Runs every command of one check, in order, in the working directory.
 - **R-9** `argv_json` holds the command as configured, with its placeholders, so that a rerun on another machine records the same text.
 - **R-10** With `--if-configured`, a check that is not configured exits 0 and records nothing.
 - **R-11 Each test of the base (decision W).** A check with `expected_tests_from_base = true` and `junit` also requires each test of the base in the JUnit file. The base is the merge base of `GATE_BASE_SHA` and `HEAD`, in the working directory's git repository. Its tests are read by parsing, without running, every file named `test_*.py` or `*_test.py`: top-level functions whose names start with `test`, and methods whose names start with `test` in classes whose names start with `Test` or that inherit from a `TestCase`. A test's ID is `<dotted path of the file without .py>[.<class>...]::<name>`, and a JUnit name's `[...]` part is ignored when comparing. A test that is absent appends a row with index `post` and exit code 1, the script exits non-zero, and `missing_tests.json` in the raw folder lists them. `GATE_BASE_SHA` not set, or a base that cannot be read, exits 2.
+  - `acceptance/` is always left out: `gate/acceptance` has its own rule (A-11).
+  - As pytest does, the parsing passes over: a function decorated as a fixture, a `Test*` class with its own `__init__`, and anything with `__test__ = False` (a module, a class, or `name.__test__ = False` on a function).
+  - `expected_tests_ignore`, a trusted list of folders, files or test IDs, leaves out what pytest treats differently in one repository, such as a file outside `testpaths`.
+  - `expected_tests_root` is the folder pytest counts IDs from, when a configuration file in it makes it the root.
 
 ## 4. `gate.acceptance` (decision O)
 
@@ -133,7 +137,7 @@ The test ID is `<classname>::<name>` from the JUnit file. The list holds one ent
 - **A-8** `list_size` and `remove_from_list` are always written.
 - **A-9** A command after `--` runs first, and its exit code goes into `test_command_exit_code`. Exit codes 0, 1 and 5 are what pytest gives for passed, failed and no tests; any other fails the check, code `TEST_COMMAND_ERROR`. This keeps one exit code for the check: a listed failure makes pytest exit 1 and must not turn the check red.
 - **A-10** `[acceptance] require_empty = true` in the file given by `--config` acts as `--require-empty`. The workflow gives the configuration from the default branch, which the executor cannot change. No label and no environment variable sets it.
-- **A-11 Each acceptance test (decision W).** With `--tests-dir DIR`, each test found under `DIR` by the parsing of R-11, not on the list and absent from the JUnit file, fails the check, code `MISSING_TEST`, and goes into `missing_tests`. IDs are as in R-11, with paths relative to the working folder.
+- **A-11 Each acceptance test (decision W).** With `--tests-dir DIR`, each test found under `DIR` by the parsing of R-11, not on the list and absent from the JUnit file, fails the check, code `MISSING_TEST`, and goes into `missing_tests`. IDs are as in R-11, with paths relative to the working folder, or to `--tests-root` when given. `[acceptance] expected_tests_ignore` in the file given by `--config` works like `expected_tests_ignore`.
 
 ## 5. `gate.guard`
 
@@ -141,7 +145,7 @@ The test ID is `<classname>::<name>` from the JUnit file. The list holds one ent
 
 Reads git objects only and runs no code from the repository, nor any command that the repository's git settings name (an external diff, a textconv, an fsmonitor). It compares the merge base of `--base` and `--head` with `--head`, with renames shown as a delete and an add.
 
-`--out` writes `{"kind", "head_sha", "violations": [{"rule", "path", "detail"}], "needs_code_owner": [path], "marked_tests": [{"path", "name"}], "dependency_changes": [{"name", "old", "new", "changelog"}], "fingerprint": {"round", "cumulative"}, "repeated_fix"}`.
+`--out` writes `{"kind", "head_sha", "violations": [{"rule", "path", "detail"}], "needs_code_owner": [path], "marked_tests": [{"path", "name"}], "security_review_changes": [{"change", "row"}], "dependency_changes": [{"name", "old", "new", "changelog"}], "fingerprint": {"round", "cumulative"}, "repeated_fix"}`.
 
 Exit 1 when `violations` is non-empty, otherwise 0.
 
@@ -154,8 +158,8 @@ Exit 1 when `violations` is non-empty, otherwise 0.
 **Rules for `ai` PRs:**
 
 - **G-1 `PROTECTED_PATH`.** Touching any of these, added, changed or deleted, in any letter case: `.github/`, `acceptance/`, `quality.toml`, `CODEOWNERS`, `SPEC.md`, `TASK.md`, `BASELINE.md`, `OPEN-ISSUES.md`, `SOURCE-MANIFEST.json`, `evidence/`, `security-review.md`, and everything in `guard.extra_protected`. A renamed file is checked under both names.
-- **G-1a What controls the tests and the security tools (decision W), also `PROTECTED_PATH`.** In any folder: `pytest.ini`, `.pytest.ini`, `.bandit`, `bandit.yaml`, `bandit.yml`, `.gitleaks.toml`, `.gitleaksignore`. In the root only: `conftest.py`.
-- **G-1b Sections, also `PROTECTED_PATH`.** A changed section, added, changed or removed, in the root's `pyproject.toml` (`[tool.*]`), `setup.cfg` (`[tool:*]`, `[coverage:*]`, `[bandit]`, `[flake8]`, `[mypy*]`) or `tox.ini` (`[pytest]`, `[tox*]`, `[testenv*]`, `[coverage:*]`, `[bandit]`, `[flake8]`, `[mypy*]`). A change to any other section of those files is allowed. A file that cannot be parsed counts as changed.
+- **G-1a What controls the tests and the security tools (decisions W and X), also `PROTECTED_PATH`.** In any folder: `pytest.toml`, `.pytest.toml`, `pytest.ini`, `.pytest.ini`, `.bandit`, `bandit.yaml`, `bandit.yml`, `.gitleaks.toml`, `.gitleaksignore`. In the root only: `conftest.py`, `pytest.py`, `pytest/`, `_pytest/`. The pytest names come from `CONFIG_LOADERS_BY_NAME` in `_pytest/config/findpaths.py` of pytest 9.2.0, the pinned version, which reads them in every folder from a test's path upwards. A change of the pinned version means checking this list again.
+- **G-1b Sections, also `PROTECTED_PATH`.** A changed section, added, changed or removed, in a `pyproject.toml` (`[tool.*]`, `[project.entry-points.pytest11]`), `setup.cfg` (`[tool:*]`, `[coverage:*]`, `[bandit]`, `[flake8]`, `[mypy*]`) or `tox.ini` (`[pytest]`, `[tox*]`, `[testenv*]`, `[coverage:*]`, `[bandit]`, `[flake8]`, `[mypy*]`), in any folder, because pytest reads those three in every folder too. A change to any other section of those files is allowed. A file that cannot be parsed counts as changed.
 - **G-1c** A change to any other `conftest.py` is no violation. Its path goes into `needs_code_owner`.
 - **G-2 `TEST_DELETED`.** A test file (`test_*.py`, `*_test.py`, or any `.py` under a `tests/` folder) deleted, or a test present in the base and absent in the head. A test is a function whose name starts with `test_`, or a method whose name starts with `test`.
 - **G-3 `TEST_SKIPPED`.** A `test_*` function present in the base that gains `pytest.mark.skip`, `pytest.mark.skipif`, `pytest.mark.xfail`, `unittest.skip`, a `pytest.skip(` call or a `pytest.xfail(` call. A reason line does not excuse this.
@@ -182,6 +186,8 @@ Exit 1 when `violations` is non-empty, otherwise 0.
 - **G-11 `SPEC_OUTSIDE_ACCEPTANCE`.** Touching anything outside `acceptance/`.
 
 **Rules for `other` PRs:** only G-12 to G-14 apply.
+
+**For every kind of PR (decision X):** G-15: each table row of `security-review.md` that the PR adds or removes goes into `security_review_changes`. It is no violation by itself on `other` PRs: the report flags it.
 
 **The known-failing list, for every kind of PR (decision O).** Stored passes are the `passed` lists in `<reports-dir>/*/*/acceptance.json`.
 
@@ -257,13 +263,14 @@ Exit 0 when the files were written, whatever the verdict. Exit 2 on a usage erro
 - **V-7** `gate/report` in `checks` is `success` only when no `MISSING_OUTPUT`, `NO_ARTIFACT` or `UNFINISHED_STAGE` reason exists.
 - **V-8** A diagnostic check that failed changes no verdict and is listed in the report with its numeric exit code.
 - **V-9** `extras.env_failures`, a list of job names whose own `env_check` failed, adds `FAILED_CHECK` and makes `gate/env` a failure.
+- **V-11 (decision X).** `extras.reports_untrusted` true adds `REPORTS_UNTRUSTED`, in the group of V-1: `blocked`.
 - **V-10 A failed setup (decision U).** A step named `setup` in the `run` job with a conclusion of `failure` adds `FAILED_CHECK`, and a verdict that would be ready is `blocked`.
 
 **`report.json`** validates against `gate/schema/report.schema.json` and holds:
 
 - `verification`: every field of the context, with `trusted_sha` and `execution_environment` when the context gives them, otherwise `"unknown"`;
 - `setup`: `{"conclusion", "exit_codes"}`, or `"not-configured"`;
-- `needs_code_owner`, `marked_tests`: from `guard.json`, or empty lists;
+- `needs_code_owner`, `marked_tests`, `security_review_changes`: from `guard.json`, or empty lists;
 - `accepted_foreign_commits`: the list in the configuration (W-14), shown on every report;
 - `independent_review`: from `extras`, or `"unknown"`;
 - `environment`: from `environment.json` in the artifact, or `"unknown"`;
@@ -278,7 +285,7 @@ Exit 0 when the files were written, whatever the verdict. Exit 2 on a usage erro
 - `semi_automatic_steps`;
 - `generated_at`.
 
-**Bypass.** **B-1** A merge in `extras.merges` goes into `bypass_merges` when `via_pr` is false, or `approvals` is 0, or `final_conclusion` is not `success`.
+**Bypass.** **B-1** A merge in `extras.merges` goes into `bypass_merges` when `via_pr` is false, or `approvals` is 0, or `final_conclusion` is not `success`, or `security_review_changed` is true: every change to `security-review.md` is flagged, approved or not (decision X).
 
 **Markdown.** **M-1** `report.md` is rendered from the JSON only and obeys C-4 and C-5.
 
@@ -316,12 +323,17 @@ Writes `{"verdict", "reasons", "conclusions": {"gate/archive", "gate/final"}}`.
 The GitHub side of the judge: `context`, `jobs`, `extras`, `post-checks`, `post-final`, `comment`, `pulls`, `limits`, `hide-paths`. It reads its token from `GATE_TOKEN` and prints only the kind of a failure, never a token.
 
 - **P-1** `extras` counts `/time <minutes>` comments only from the repository's owner, and an approval only on the merged head.
+- **P-3 (decision X)** `extras` requires `--actors`. When they are not `actors_ok`, it reads no stored run and sets `reports_untrusted`.
+- **P-4 (F9)** `create-pull-request --branch NAME --prefix TEXT --base BRANCH` opens a PR for the branch the model ended on, the one in the working tree. A name without the prefix, or a branch not on the remote, exits 1.
+- **P-5 (F10)** A refused read of a commit's statuses gives `independent_review` `"unknown"` in `extras`, and an empty list in `review-statuses`. It blocks nothing by itself.
+- **P-6 (W.2)** `post-proposal --file FILE --branch NAME` posts the model's proposed security entry, neutralized, on its open PR. A missing or empty file does nothing.
 - **P-2** `hide-paths` takes `spec_tests.deny_read` out of the working folder with a sparse checkout, so that they do not show as deleted. An empty list exits 2.
 
 ## 8b. `gate.reproduce`
 
 `python -P -m gate.reproduce --repo URL --sha SHA --out DIR`
 
+- **X-0 (decision X)** On a GitHub remote, or with `--api-repo`, it makes the check of W-12 and W-14 before it reads the stored evidence. Any foreign commit, or a failed read, exits 1 with `REPORTS_UNTRUSTED`. On another remote the authors cannot be checked, and it says so.
 - **X-1** It takes the stored context and extras of the newest attempt for the SHA, the configuration and acceptance tests at that run's `trusted_sha`, and only the runs stored before that attempt.
 - **X-2** It reruns the mandatory checks of the `run` job, seals, regenerates the report and compares it with the stored one by K-1. Exit 0 when equal, 1 when not, 2 when no evidence is stored for the SHA.
 
@@ -400,6 +412,7 @@ Writes `{"act", "post", "pr", "head_sha", "round", "reason_code", "comment"}`. E
 - **D-3** Done fix rounds are the distinct `head_sha` values in `<reports-dir>/<pr>/*/context.json`, minus one. At or past `limits.max_fix_rounds` gives `ROUND_CAP`.
 - **D-4** A stored `guard.json` for this head with `repeated_fix` true gives `REPEATED_FIX`.
 - **D-5** Otherwise `act` is true and `round` is the done rounds plus one.
+- **D-6a (F4)** When it acts, `comment` holds what is wrong, because the model has no other way to read it. For `workflow_run`: the verdict's reasons, and from the record `guard.json`'s violations, `acceptance.json`'s `failing_not_listed` and `missing_tests`, `artifact/raw/gate-security/security.json`'s unreviewed findings, and `artifact/raw/gate-tests/missing_tests.json`. For `issue_comment`: the lines of the reviewer's comment. At most 60 lines of them.
 - **D-6** `comment` always says what happened and why, in plain text, obeys C-4 and C-5, and writes the mention as `` `@claude` ``.
 - **D-7** `post` is true, so that the PR is told why, except for `NOT_A_FAILURE`, `NOT_A_REVIEW` and `UNEXPECTED_SENDER`. Anyone can comment on a public repository, and the gate must not answer each one.
 
@@ -458,4 +471,5 @@ Routes it uses:
 - **Y-19** In `judge.yml`, the guard gets the PR's author from the trusted context, and no label sets a requirement. As with every check, the `gate/guard` step runs `gate.run_checks`, so that its exit code is recorded, here with the gate's own `gate/builtin_checks.toml`. That file's guard command passes `--author {env:GATE_PR_AUTHOR}`, and the workflow's `env` sets `GATE_PR_AUTHOR` from `github.event.pull_request.user.login`.
 - **Y-20** In `judge.yml`, the `archive` job installs nothing: it runs on the standard library alone.
 - **Y-21** `feedback.yml`'s `fix` job has a `concurrency` group per PR, and `executor.yml` refuses to start the model when `expected-head` is given and the PR's head has moved.
+- **Y-22 (decision X)** In `judge.yml`'s `run` and `publish` jobs, the stored runs are fetched only after `gate.archive check-actors` said they can be trusted. In `spec-tests.yml`, the default branch's copy is removed before the model starts.
 - **Y-15** `executor.yml` passes its `allowed-bots` input to the action's `allowed_bots`. At this action's pin, a bot's event is refused without it. It holds named apps, never `*`.

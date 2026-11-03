@@ -18,6 +18,7 @@ from gate.common import EXIT_OK, MENTION, UsageError, fail_usage, load_config, n
 
 REVIEW_CONTEXT = "independent-review"
 SAFE_REF = re.compile(r"[A-Za-z0-9._/-]+")
+MAX_NOTE_LINES = 60
 # Written by gate.review_local. Only its SHA is used, and that SHA is then checked.
 MARKER = re.compile(r"<!-- gate-review sha=([0-9a-f]{40}) verdict=(pass|changes_requested) -->")
 
@@ -92,6 +93,36 @@ def latest_review_status(statuses: Any) -> dict | None:
     return None
 
 
+def details_of_the_record(record: Path) -> list[str]:
+    """What the stored run says is wrong, rule by rule, for the model that must fix it."""
+    details: list[str] = []
+    guard = read_json_or_none(record / "guard.json")
+    if isinstance(guard, dict):
+        for violation in guard.get("violations", []) if isinstance(guard.get("violations"), list) else []:
+            if isinstance(violation, dict):
+                details.append(f"{violation.get('rule')}: {violation.get('path')}: {violation.get('detail')}")
+    acceptance = read_json_or_none(record / "acceptance.json")
+    if isinstance(acceptance, dict):
+        for key, label in (("failing_not_listed", "acceptance test failing"), ("missing_tests", "acceptance test did not run")):
+            for test_id in acceptance.get(key, []) if isinstance(acceptance.get(key), list) else []:
+                details.append(f"{label}: {test_id}")
+    security = read_json_or_none(record / "artifact" / "raw" / "gate-security" / "security.json")
+    if isinstance(security, dict):
+        for finding in security.get("findings", []) if isinstance(security.get("findings"), list) else []:
+            if isinstance(finding, dict) and finding.get("reviewed") is False:
+                details.append(f"unreviewed finding: {finding.get('tool')} {finding.get('rule')} {finding.get('path')}")
+    missing = read_json_or_none(record / "artifact" / "raw" / "gate-tests" / "missing_tests.json")
+    if isinstance(missing, list):
+        details += [f"test of the base did not run: {test_id}" for test_id in missing]
+    return details[:MAX_NOTE_LINES]
+
+
+def findings_of_the_comment(body: str) -> list[str]:
+    """The reviewer's findings, from a comment whose sender and status were already checked."""
+    lines = [line.strip() for line in body.splitlines() if line.strip() and not MARKER.search(line)]
+    return lines[:MAX_NOTE_LINES]
+
+
 def reports_trusted(actors: Any) -> bool:
     return isinstance(actors, dict) and actors.get("actors_ok") is True
 
@@ -121,7 +152,7 @@ def read_comment_event(event: dict, feedback: dict, statuses: Any, actors: Any) 
     creator = status.get("creator") if isinstance(status.get("creator"), dict) else {}
     if creator.get("login") != expected:
         return "STATUS_WRONG_CREATOR", pr, head_sha, []
-    return None, pr, head_sha, ["the independent review requested changes; its findings are in the PR's comments"]
+    return None, pr, head_sha, ["the independent review requested changes:", *findings_of_the_comment(str(comment.get("body") or ""))]
 
 
 def read_run_event(event: dict, feedback: dict, reports_dir: Path, actors: Any) -> tuple[str | None, Any, Any, list[str]]:
@@ -150,7 +181,7 @@ def read_run_event(event: dict, feedback: dict, reports_dir: Path, actors: Any) 
     if verdict != "blocked":
         return "NOT_ACTIONABLE", pr, head_sha, []
     failures = [f"{item.get('code')}: {item.get('detail')}" for item in final.get("reasons", []) if isinstance(item, dict)]
-    return None, pr, head_sha, failures
+    return None, pr, head_sha, [*failures, *details_of_the_record(record)]
 
 
 def decide(

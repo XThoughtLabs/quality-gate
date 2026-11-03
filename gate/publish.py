@@ -35,6 +35,8 @@ from gate.common import (
 )
 
 MAX_COMMENT = 60_000
+MAX_PROPOSAL = 10_000
+PROPOSAL_FILE = ".gate-security-proposal.md"
 DEFAULT_SEMI_AUTOMATIC = [
     "The independent review is started by hand on the laptop.",
     "A person approves and merges each PR.",
@@ -160,6 +162,8 @@ def collect_merges(repository: str, integration: str) -> list[dict]:
         conclusion = next((run.get("conclusion") for run in runs), None)
         reviews = get_all(f"/repos/{repository}/pulls/{number}/reviews")
         approvals = sum(review.get("state") == "APPROVED" and review.get("commit_id") == head for review in reviews)
+        files = get_all(f"/repos/{repository}/pulls/{number}/files")
+        changed_review = any(str(item.get("filename", "")).lower() == "security-review.md" for item in files)
         merges.append(
             {
                 "pr": number,
@@ -169,6 +173,7 @@ def collect_merges(repository: str, integration: str) -> list[dict]:
                 "final_conclusion": conclusion,
                 "approvals": approvals,
                 "via_pr": True,
+                "security_review_changed": changed_review,
             }
         )
     return merges
@@ -239,6 +244,8 @@ def cmd_extras(args: argparse.Namespace) -> int:
         raise UsageError("the folder of stored runs is missing")
     environment = read_json_or_none(args.env_result) if args.env_result else {"ok": True}
     env_failures = [] if isinstance(environment, dict) and environment.get("ok") is True else ["publish"]
+    actors = read_json_or_none(args.actors)
+    trusted = isinstance(actors, dict) and actors.get("actors_ok") is True
     context = read_json_or_none(args.context) if args.context else None
     context = context if isinstance(context, dict) else {}
     config = load_config(args.config) if args.config else {}
@@ -254,16 +261,21 @@ def cmd_extras(args: argparse.Namespace) -> int:
             if match:
                 verdicts.append({"sha": match.group(1), "verdict": match.group(2)})
 
+    # F10: this read only informs the report. Refused, it says unknown and blocks nothing.
     independent_review: Any = "unknown"
     head = context.get("head_sha")
     if head:
-        statuses = get_all(f"/repos/{repository}/commits/{head}/statuses")
-        latest = next((item for item in statuses if item.get("context") == "independent-review"), None)
-        independent_review = (
-            {"state": latest.get("state"), "creator": (latest.get("creator") or {}).get("login"), "head_sha": head}
-            if latest
-            else {"state": "pending", "head_sha": head}
-        )
+        try:
+            statuses = get_all(f"/repos/{repository}/commits/{head}/statuses")
+        except (urllib.error.URLError, OSError, ValueError):
+            statuses = None
+        if statuses is not None:
+            latest = next((item for item in statuses if item.get("context") == "independent-review"), None)
+            independent_review = (
+                {"state": latest.get("state"), "creator": (latest.get("creator") or {}).get("login"), "head_sha": head}
+                if latest
+                else {"state": "pending", "head_sha": head}
+            )
 
     merges = collect_merges(repository, args.integration)
     resources: dict[str, Any] = {"actions_minutes": actions_minutes(args.jobs)}
@@ -273,7 +285,8 @@ def cmd_extras(args: argparse.Namespace) -> int:
         args.out,
         {
             "env_failures": env_failures,
-            "rounds": stored_rounds(Path(args.reports_dir), args.pr),
+            "reports_untrusted": not trusted,
+            "rounds": stored_rounds(Path(args.reports_dir), args.pr) if trusted else [],
             "human": collect_human(comments),
             "merges": merges + collect_direct_pushes(repository, args.integration, context.get("baseline_sha"), merges),
             "resources": resources,
@@ -375,6 +388,11 @@ def cmd_prompt(args: argparse.Namespace) -> int:
         parts += [f"This is a fix round for PR #{args.pr}. Push to this branch, the PR's own.", ""]
     if args.note and Path(args.note).is_file():
         parts += [Path(args.note).read_text(encoding="utf-8"), ""]
+    if args.issue or args.pr:
+        parts += [
+            f"Never edit security-review.md. To propose an entry for a finding, write it to the file {PROPOSAL_FILE}. Do not commit that file: the gate posts it on your PR for the CEO.",
+            "",
+        ]
     text = "\n".join(parts)
     delimiter = f"GATE_PROMPT_{secrets.token_hex(16)}"
     with open(args.output, "a", encoding="utf-8", newline="\n") as handle:
@@ -397,12 +415,17 @@ def cmd_open_pr(args: argparse.Namespace) -> int:
     """Open the PR for what the model pushed. The model holds no token for this."""
     repository = os.environ["GITHUB_REPOSITORY"]
     owner = repository.split("/", 1)[0]
-    refs = call("GET", f"/repos/{repository}/git/matching-refs/heads/{urllib.parse.quote(args.prefix, safe='/')}")
-    names = sorted(item["ref"].removeprefix("refs/heads/") for item in refs)
-    if not names:
-        print(f"the model pushed no branch starting {args.prefix}", file=sys.stderr)
+    branch = args.branch
+    if not branch.startswith(args.prefix) or not re.fullmatch(r"[A-Za-z0-9._/-]+", branch):
+        print(f"the model ended on a branch that does not start {args.prefix}", file=sys.stderr)
         return EXIT_RULE_FAILED
-    branch = names[-1]
+    try:
+        call("GET", f"/repos/{repository}/git/ref/heads/{urllib.parse.quote(branch, safe='/')}")
+    except urllib.error.HTTPError as error:
+        if error.code != 404:
+            raise
+        print(f"the model did not push {branch}", file=sys.stderr)
+        return EXIT_RULE_FAILED
     head = urllib.parse.quote(f"{owner}:{branch}", safe="")
     if call("GET", f"/repos/{repository}/pulls?state=open&head={head}"):
         print(f"a PR for {branch} is already open")
@@ -418,6 +441,24 @@ def cmd_open_pr(args: argparse.Namespace) -> int:
     return EXIT_OK
 
 
+def cmd_post_proposal(args: argparse.Namespace) -> int:
+    """Post the model's proposed security entry as text on its PR. Only the CEO can add one."""
+    proposal = Path(args.file)
+    if not proposal.is_file() or not proposal.read_text(encoding="utf-8", errors="replace").strip():
+        return EXIT_OK
+    repository = os.environ["GITHUB_REPOSITORY"]
+    owner = repository.split("/", 1)[0]
+    head = urllib.parse.quote(f"{owner}:{args.branch}", safe="")
+    pulls = call("GET", f"/repos/{repository}/pulls?state=open&head={head}")
+    if not pulls:
+        print("no open PR to post the proposal on", file=sys.stderr)
+        return EXIT_RULE_FAILED
+    text = neutralize(proposal.read_text(encoding="utf-8", errors="replace"))[:MAX_PROPOSAL]
+    body = f"The executor proposes this entry for `security-review.md`. Only the CEO can add it.\n\n{text}"
+    call("POST", f"/repos/{repository}/issues/{pulls[0]['number']}/comments", {"body": body})
+    return EXIT_OK
+
+
 def cmd_review_statuses(args: argparse.Namespace) -> int:
     """Fetch the statuses of the commit a reviewer's comment names, once its SHA is validated."""
     statuses: list[Any] = []
@@ -426,7 +467,10 @@ def cmd_review_statuses(args: argparse.Namespace) -> int:
         match = REVIEW_MARKER.search(str((event.get("comment") or {}).get("body") or ""))
         if match:
             repository = os.environ["GITHUB_REPOSITORY"]
-            statuses = get_all(f"/repos/{repository}/commits/{match.group(1)}/statuses")
+            try:
+                statuses = get_all(f"/repos/{repository}/commits/{match.group(1)}/statuses")
+            except (urllib.error.URLError, OSError, ValueError):
+                statuses = []
     write_json(args.out, statuses)
     return EXIT_OK
 
@@ -497,6 +541,7 @@ def main(argv: list[str] | None = None) -> int:
     extras.add_argument("--pr", type=int, required=True)
     extras.add_argument("--integration", required=True)
     extras.add_argument("--env-result")
+    extras.add_argument("--actors", required=True, help="the result of gate.archive check-actors")
     extras.add_argument("--context")
     extras.add_argument("--jobs")
     extras.add_argument("--config")
@@ -528,6 +573,11 @@ def main(argv: list[str] | None = None) -> int:
     review_statuses.add_argument("--out", required=True)
     review_statuses.set_defaults(handler=cmd_review_statuses)
 
+    proposal = commands.add_parser("post-proposal")
+    proposal.add_argument("--file", required=True)
+    proposal.add_argument("--branch", required=True)
+    proposal.set_defaults(handler=cmd_post_proposal)
+
     head_check = commands.add_parser("head-check")
     head_check.add_argument("--pr", required=True)
     head_check.add_argument("--sha", required=True)
@@ -547,6 +597,7 @@ def main(argv: list[str] | None = None) -> int:
     bot.set_defaults(handler=cmd_bot_identity)
 
     open_pr = commands.add_parser("create-pull-request")
+    open_pr.add_argument("--branch", required=True, help="the branch the model is on")
     open_pr.add_argument("--prefix", required=True)
     open_pr.add_argument("--base", required=True)
     open_pr.add_argument("--issue", default="")

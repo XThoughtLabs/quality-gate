@@ -11,7 +11,7 @@ import sys
 import xml.etree.ElementTree as ElementTree
 from pathlib import Path
 
-from gate.collected import ids_in_source, is_collected_file, junit_ids
+from gate.collected import ids_in_source, is_collected_file, is_ignored, junit_ids
 from gate.common import (
     EXIT_OK,
     EXIT_RULE_FAILED,
@@ -78,19 +78,32 @@ def _git(workdir: str | None, *args: str) -> str:
     return process.stdout.decode("utf-8", "replace")
 
 
-def tests_of_the_base(workdir: str | None) -> set[str]:
-    """Each test the base holds, read by parsing, before any of this check's commands run."""
+def tests_of_the_base(workdir: str | None, check: dict) -> set[str]:
+    """Each test the base holds, read by parsing, before any of this check's commands run.
+
+    acceptance/ is always left out: gate/acceptance has its own rule for those tests.
+    """
     base_sha = os.environ.get("GATE_BASE_SHA")
     if not base_sha:
         raise UsageError("expected_tests_from_base needs the variable GATE_BASE_SHA")
+    ignore = ["acceptance/", *check.get("expected_tests_ignore", [])]
+    root = str(check.get("expected_tests_root", "")).strip("/")
     base = _git(workdir, "merge-base", base_sha, "HEAD").strip()
     found: set[str] = set()
     for path in _git(workdir, "ls-tree", "-r", "--name-only", base).splitlines():
-        if is_collected_file(path):
-            try:
-                found |= ids_in_source(_git(workdir, "show", f"{base}:{path}"), path)
-            except (SyntaxError, ValueError):
-                continue
+        if not is_collected_file(path) or is_ignored(path, ignore):
+            continue
+        if root and not path.startswith(root + "/"):
+            continue
+        relative = path[len(root) + 1 :] if root else path
+        try:
+            found |= {
+                test_id
+                for test_id in ids_in_source(_git(workdir, "show", f"{base}:{path}"), relative)
+                if test_id not in ignore
+            }
+        except (SyntaxError, ValueError):
+            continue
     return found
 
 
@@ -170,7 +183,7 @@ def main(argv: list[str] | None = None) -> int:
     expected: set[str] | None = None
     if check.get("expected_tests_from_base"):
         try:
-            expected = tests_of_the_base(args.workdir)
+            expected = tests_of_the_base(args.workdir, check)
         except UsageError as error:
             return fail_usage(str(error))
 

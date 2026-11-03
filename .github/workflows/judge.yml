@@ -68,9 +68,6 @@ jobs:
           fetch-depth: 0
           persist-credentials: false
 
-      - name: Get the stored runs
-        run: bash "$GATE_HOME/scripts/get_stored_runs.sh" pr "$GITHUB_WORKSPACE/.stored"
-
       - name: Set up Python
         uses: actions/setup-python@6d4fd22b20465ccc0f7354476588e8df7c9ca0e0 # v7.1.0
         with:
@@ -94,7 +91,17 @@ jobs:
           } >> "$GITHUB_ENV"
           echo "$RUNNER_TEMP/app-venv/bin" >> "$GITHUB_PATH"
 
-      # Before any PR code runs.
+      # Before any PR code runs. Stored evidence is read only after the branch was checked;
+      # when it was not, the folder stays absent and gate/guard stops.
+      - name: Get the stored runs
+        if: ${{ !cancelled() }}
+        env:
+          GATE_TOKEN: ${{ github.token }}
+        run: |
+          mkdir -p "$GATE_OUT"
+          "$GATE_PY" -P -m gate.archive check-actors --api-repo "$GATE_REPOSITORY" --branch reports --config "$GATE_CONFIG" --out "$GATE_OUT/actors.json"
+          bash "$GATE_HOME/scripts/get_stored_runs.sh" pr "$GITHUB_WORKSPACE/.stored"
+
       - name: gate/env
         if: ${{ !cancelled() }}
         env:
@@ -241,7 +248,12 @@ jobs:
 
       - name: Get the stored runs
         if: ${{ always() }}
-        run: bash "$GATE_HOME/scripts/get_stored_runs.sh" .trusted "$GITHUB_WORKSPACE/.stored"
+        run: |
+          mkdir -p "$GITHUB_WORKSPACE/.stored/reports"
+          if "$GATE_PY" -P -m gate.archive check-actors --api-repo "$GATE_REPOSITORY" --branch reports --config "$GATE_CONFIG" --out actors.json; then
+            rm -rf "$GITHUB_WORKSPACE/.stored"
+            bash "$GATE_HOME/scripts/get_stored_runs.sh" .trusted "$GITHUB_WORKSPACE/.stored"
+          fi
 
       - name: Generate the report
         id: generate
@@ -251,7 +263,7 @@ jobs:
         run: |
           "$GATE_PY" -P -m gate.publish context --config "$GATE_CONFIG" --hash-root .trusted --hash quality.toml --hash CODEOWNERS --hash .github/workflows/judge.yml --hash .github/workflows/executor.yml --hash .github/workflows/spec-tests.yml --hash .github/workflows/feedback.yml --hash prompts/executor.md --hash prompts/spec-tests.md --hash security-review.md --out context.json
           "$GATE_PY" -P -m gate.publish jobs --run-id "$GATE_RUN_ID" --attempt "$GATE_RUN_ATTEMPT" --out jobs.json
-          "$GATE_PY" -P -m gate.publish extras --reports-dir "$GATE_REPORTS_DIR" --pr "$GATE_PR" --integration "$GATE_INTEGRATION_BRANCH" --env-result publish-env.json --context context.json --jobs jobs.json --config "$GATE_CONFIG" --out extras.json
+          "$GATE_PY" -P -m gate.publish extras --reports-dir "$GATE_REPORTS_DIR" --pr "$GATE_PR" --integration "$GATE_INTEGRATION_BRANCH" --env-result publish-env.json --actors actors.json --context context.json --jobs jobs.json --config "$GATE_CONFIG" --out extras.json
           "$GATE_PY" -P -m gate.report generate --context context.json --jobs jobs.json --artifact evidence --config "$GATE_CONFIG" --extras extras.json --out publish-out
           cp extras.json publish-out/extras.json
           echo "verdict-sha256=$(sha256sum publish-out/verdict.json | cut -d' ' -f1)" >> "$GITHUB_OUTPUT"

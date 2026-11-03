@@ -132,6 +132,10 @@ jobs:
           GATE_TOKEN: ${{ steps.app-token.outputs.token }}
         run: python -P -m gate.publish prompt --template "$RUNNER_TEMP/trusted/$GATE_PROMPT_FILE" --output "$GITHUB_OUTPUT"
 
+      # The default branch's copy holds the application's code, so it leaves before the model comes.
+      - name: Remove the default branch's copy
+        run: rm -rf "$RUNNER_TEMP/trusted"
+
       - name: Read the app's identity
         id: identity
         env:
@@ -159,4 +163,4 @@ jobs:
       - name: Open the PR for what was pushed
         env:
           GATE_TOKEN: ${{ steps.app-token.outputs.token }}
-        run: python -P -m gate.publish create-pull-request --prefix "spec/" --base "$GATE_INTEGRATION_BRANCH"
+        run: python -P -m gate.publish create-pull-request --branch "$(git branch --show-current)" --prefix "spec/" --base "$GATE_INTEGRATION_BRANCH"
