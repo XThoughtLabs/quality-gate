@@ -31,9 +31,9 @@ ROUND3 = "tests/unit/test_unit_repairs_round3.py"
 ROUND4 = "tests/unit/test_unit_repairs_round4.py"
 ROUND5 = "tests/unit/test_unit_repairs_round5.py"
 TESTS_FOR = {
-    "GUARD": ["tests/spec/test_guard.py", "tests/spec/test_guard_v.py", "tests/spec/test_guard_r4.py", "tests/spec/test_guard_r5.py", "tests/spec/test_guard_r6.py", ROUND5, ROUND4, ROUND3, REAL, UNIT, E2E],
+    "GUARD": [ROUND5, ROUND4, ROUND3, "tests/spec/test_guard_r6.py", "tests/spec/test_guard_r5.py", "tests/spec/test_guard_r4.py", "tests/spec/test_guard.py", "tests/spec/test_guard_v.py", REAL, UNIT, E2E],
     "COL": [ROUND5, REAL, "tests/spec/test_run_checks_base.py", "tests/spec/test_acceptance.py"],
-    "PUB": [UNIT, ROUND3, "tests/spec/test_publish_r4.py", "tests/spec/test_reproduce.py"],
+    "PUB": [ROUND3, "tests/spec/test_publish_r4.py", UNIT, "tests/spec/test_reproduce.py"],
     "WF": ["tests/unit/test_unit_workflows.py", "tests/spec/test_workflows.py"],
     "REPRO": [ROUND5, "tests/spec/test_reproduce_x0.py", "tests/spec/test_reproduce_x0b.py", E2E, ROUND3],
     "ENV": ["tests/spec/test_env_check.py", UNIT],

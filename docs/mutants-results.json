@@ -4,1274 +4,1700 @@
     "rule": "G-1 protected path",
     "outcome": "killed",
     "killed_by": "FAILED tests/spec/test_guard.py::test_runs_no_code_from_the_repository",
-    "seconds": 23.0
+    "run_at": "232ff66"
   },
   {
     "id": "GUARD-G1-case",
     "rule": "G-1 any letter case",
     "outcome": "killed",
     "killed_by": "FAILED tests/spec/test_guard.py::test_g1_protected_path_fires[CODEOWNERS]",
-    "seconds": 33.0
+    "run_at": "232ff66"
   },
   {
     "id": "GUARD-G2-file",
     "rule": "G-2 test file deleted",
     "outcome": "killed",
     "killed_by": "FAILED tests/spec/test_guard.py::test_g2_deleted_test_file_fires[tests/test_app.py]",
-    "seconds": 81.3
+    "run_at": "232ff66"
   },
   {
     "id": "GUARD-G2-func",
     "rule": "G-2 test function removed",
     "outcome": "killed",
     "killed_by": "FAILED tests/spec/test_guard.py::test_runs_no_code_from_the_repository",
-    "seconds": 23.7
+    "run_at": "232ff66"
   },
   {
     "id": "GUARD-G3",
     "rule": "G-3 test skipped",
     "outcome": "killed",
     "killed_by": "FAILED tests/spec/test_guard.py::test_g3_skip_added_to_an_existing_test_fires[mark.skip]",
-    "seconds": 99.6
+    "run_at": "232ff66"
   },
   {
     "id": "GUARD-G4-count",
     "rule": "G-4 fewer checks",
     "outcome": "killed",
     "killed_by": "FAILED tests/spec/test_guard.py::test_g4_weakened_test_fires[fewer-asserts]",
-    "seconds": 114.4
+    "run_at": "232ff66"
   },
   {
     "id": "GUARD-G4-true",
     "rule": "G-4 always-true assert",
     "outcome": "killed",
     "killed_by": "FAILED tests/spec/test_guard.py::test_g4_weakened_test_fires[assert-True-swapped-in]",
-    "seconds": 113.5
+    "run_at": "232ff66"
   },
   {
     "id": "GUARD-G4-raises",
     "rule": "G-4 broad raises",
     "outcome": "killed",
     "killed_by": "FAILED tests/spec/test_guard.py::test_g4_weakened_test_fires[raises-Exception]",
-    "seconds": 117.3
+    "run_at": "232ff66"
   },
   {
     "id": "GUARD-G5",
     "rule": "G-5 no reason line",
     "outcome": "killed",
     "killed_by": "FAILED tests/spec/test_guard.py::test_g5_suppression_without_reason_fires[noqa]",
-    "seconds": 121.1
+    "run_at": "232ff66"
   },
   {
     "id": "GUARD-G5-spelling",
     "rule": "G-5 another spelling of noqa",
     "outcome": "killed",
     "killed_by": "FAILED tests/spec/test_guard_v.py::test_g5_each_spelling_without_a_reason_fires[noqa-no-space]",
-    "seconds": 519.6
+    "run_at": "232ff66"
   },
   {
     "id": "GUARD-G6-lower",
     "rule": "G-6 threshold lowered",
     "outcome": "killed",
     "killed_by": "FAILED tests/spec/test_guard.py::test_g6_lowered_or_removed_threshold_fires[fail_under-in-pyproject]",
-    "seconds": 139.2
+    "run_at": "232ff66"
   },
   {
     "id": "GUARD-G6-removed",
     "rule": "G-6 threshold removed",
     "outcome": "killed",
     "killed_by": "FAILED tests/spec/test_guard.py::test_g6_lowered_or_removed_threshold_fires[removed-fail-under]",
-    "seconds": 141.8
+    "run_at": "232ff66"
   },
   {
     "id": "GUARD-G7",
     "rule": "G-7 no hash",
     "outcome": "killed",
     "killed_by": "FAILED tests/spec/test_guard.py::test_g7_requirement_without_hash_fires[new-line-without-hash-text0]",
-    "seconds": 176.6
+    "run_at": "232ff66"
   },
   {
     "id": "GUARD-G7-source",
     "rule": "G-7 source without lock",
     "outcome": "killed",
     "killed_by": "FAILED tests/spec/test_guard.py::test_g7_changed_dependency_source_without_a_dependency_file_change_fires",
-    "seconds": 185.9
+    "run_at": "232ff66"
   },
   {
     "id": "GUARD-G8",
     "rule": "G-8 code-owner approval",
     "outcome": "killed",
     "killed_by": "FAILED tests/spec/test_guard.py::test_g7_control_hashed_requirements_are_not_a_violation[hash-after-a-continuation-text0]",
-    "seconds": 182.0
+    "run_at": "232ff66"
   },
   {
     "id": "GUARD-G9",
     "rule": "G-9 repeated fix",
     "outcome": "killed",
     "killed_by": "FAILED tests/spec/test_guard.py::test_g9_the_same_fix_in_a_later_round_is_a_repeated_fix",
-    "seconds": 191.4
+    "run_at": "232ff66"
   },
   {
     "id": "GUARD-G10",
     "rule": "G-10 unpinned action",
     "outcome": "killed",
     "killed_by": "FAILED tests/spec/test_guard.py::test_g10_unpinned_action_fires[tag-yml]",
-    "seconds": 224.1
+    "run_at": "232ff66"
   },
   {
     "id": "GUARD-G11",
     "rule": "G-11 spec outside acceptance",
     "outcome": "killed",
     "killed_by": "FAILED tests/spec/test_guard.py::test_kind_follows_the_branch_prefix[spec/tests-1-spec]",
-    "seconds": 5.2
+    "run_at": "232ff66"
   },
   {
     "id": "GUARD-G12",
     "rule": "G-12 add a passed test",
     "outcome": "killed",
     "killed_by": "FAILED tests/spec/test_guard.py::test_g12_adding_an_entry_for_a_test_that_has_a_stored_pass_fires",
-    "seconds": 258.5
+    "run_at": "232ff66"
   },
   {
     "id": "GUARD-G13-kind",
     "rule": "G-13 add outside a spec PR",
     "outcome": "killed",
     "killed_by": "FAILED tests/spec/test_guard.py::test_g13_entry_added_on_a_pr_that_is_not_spec_fires[maint/lists]",
-    "seconds": 267.5
+    "run_at": "232ff66"
   },
   {
     "id": "GUARD-G13-def",
     "rule": "G-13 add without a defect ID",
     "outcome": "killed",
     "killed_by": "FAILED tests/spec/test_guard.py::test_g13_with_an_existing_list_only_def_ids_are_allowed[acceptance.test_new::test_new_defect PUB-04]",
-    "seconds": 269.4
+    "run_at": "232ff66"
   },
   {
     "id": "GUARD-G13-new",
     "rule": "G-13 add an old test",
     "outcome": "killed",
     "killed_by": "FAILED tests/spec/test_guard.py::test_g13_with_an_existing_list_a_test_that_already_exists_in_the_base_is_refused",
-    "seconds": 243.6
+    "run_at": "232ff66"
   },
   {
     "id": "GUARD-G14",
     "rule": "G-14 remove without a pass",
     "outcome": "killed",
     "killed_by": "FAILED tests/spec/test_guard.py::test_g14_removing_an_entry_without_a_stored_pass_fires[maint/lists]",
-    "seconds": 240.1
+    "run_at": "232ff66"
   },
   {
     "id": "GUARD-no-ext-diff",
     "rule": "the guard starts an external diff",
     "outcome": "killed",
     "killed_by": "FAILED tests/spec/test_guard.py::test_runs_no_code_from_the_repository",
-    "seconds": 17.1
+    "run_at": "232ff66"
   },
   {
     "id": "ENV-E1",
     "rule": "E-1 missing key",
     "outcome": "killed",
     "killed_by": "FAILED tests/spec/test_env_check.py::test_e1_missing_or_empty_names_the_part[missing-secret:EXECUTOR_APP_PRIVATE_KEY-executor]",
-    "seconds": 2.1
+    "run_at": "2026-11-03, this code unchanged since"
   },
   {
     "id": "ENV-E1-pem",
     "rule": "E-1 malformed key",
     "outcome": "killed",
     "killed_by": "FAILED tests/spec/test_env_check.py::test_e1_private_key_without_pem_header_is_broken[SENTINEL-VALUE-2222]",
-    "seconds": 4.6
+    "run_at": "2026-11-03, this code unchanged since"
   },
   {
     "id": "ENV-E2",
     "rule": "E-2 secret in the run job",
     "outcome": "killed",
     "killed_by": "FAILED tests/spec/test_env_check.py::test_e2_each_listed_word_is_flagged[DEPLOY_TOKEN]",
-    "seconds": 7.7
+    "run_at": "2026-11-03, this code unchanged since"
   },
   {
     "id": "ENV-E3-allowed",
     "rule": "E-3 write allowed when it must be denied",
     "outcome": "killed",
     "killed_by": "FAILED tests/spec/test_env_check.py::test_e3_wrong_permission_breaks_exactly_that_item[run-contents-write]",
-    "seconds": 12.3
+    "run_at": "2026-11-03, this code unchanged since"
   },
   {
     "id": "ENV-E3-denied",
     "rule": "E-3 write denied when it must be allowed",
     "outcome": "killed",
     "killed_by": "FAILED tests/spec/test_env_check.py::test_e3_wrong_permission_breaks_exactly_that_item[publish-checks-write]",
-    "seconds": 13.2
+    "run_at": "2026-11-03, this code unchanged since"
   },
   {
     "id": "ENV-E3-other",
     "rule": "E-3 another status passes",
     "outcome": "killed",
     "killed_by": "FAILED tests/spec/test_env_check.py::test_e3_write_expected_denied_other_statuses_are_broken[200]",
-    "seconds": 16.5
+    "run_at": "2026-11-03, this code unchanged since"
   },
   {
     "id": "ENV-E5-pem",
     "rule": "E-5 prints a malformed key",
     "outcome": "killed",
     "killed_by": "FAILED tests/spec/test_env_check.py::test_e5_malformed_secrets_are_never_printed[executor]",
-    "seconds": 57.2
+    "run_at": "2026-11-03, this code unchanged since"
   },
   {
     "id": "ENV-E5-id",
     "rule": "E-5 prints a malformed value",
     "outcome": "killed",
     "killed_by": "FAILED tests/spec/test_env_check.py::test_e1_app_id_not_positive_integer_is_broken[ ]",
-    "seconds": 7.0
+    "run_at": "2026-11-03, this code unchanged since"
   },
   {
     "id": "ENV-E5-name",
     "rule": "E-5 prints a present secret",
     "outcome": "killed",
     "killed_by": "FAILED tests/spec/test_env_check.py::test_e2_each_listed_word_is_flagged[DEPLOY_TOKEN]",
-    "seconds": 7.5
+    "run_at": "2026-11-03, this code unchanged since"
   },
   {
     "id": "RUN-R3",
     "rule": "R-3 failure hidden",
     "outcome": "killed",
     "killed_by": "FAILED tests/spec/test_run_checks.py::test_logs_and_rows_for_each_command",
-    "seconds": 1.4
+    "run_at": "232ff66"
   },
   {
     "id": "RUN-R5",
     "rule": "R-5 skips allowed",
     "outcome": "killed",
     "killed_by": "FAILED tests/spec/test_run_checks.py::test_forbid_skips_makes_a_skip_a_failure",
-    "seconds": 7.5
+    "run_at": "232ff66"
   },
   {
     "id": "RUN-R6",
     "rule": "R-6 missing output",
     "outcome": "killed",
     "killed_by": "FAILED tests/spec/test_run_checks.py::test_required_output_missing_appends_a_post_row_and_fails",
-    "seconds": 8.6
+    "run_at": "232ff66"
   },
   {
     "id": "RUN-R4",
     "rule": "R-4 timeout passes",
     "outcome": "killed",
     "killed_by": "FAILED tests/spec/test_run_checks.py::test_command_past_timeout_is_killed_and_records_124",
-    "seconds": 5.6
+    "run_at": "232ff66"
   },
   {
     "id": "RUN-Q2",
     "rule": "Q-2 a check reclassified",
     "outcome": "killed",
     "killed_by": "FAILED tests/spec/test_run_checks.py::test_q2_reclassified_known_check_is_refused_with_exit_2[gate/tests-diagnostic]",
-    "seconds": 8.8
+    "run_at": "232ff66"
   },
   {
     "id": "ACC-A1",
     "rule": "A-1 unlisted failure",
     "outcome": "killed",
     "killed_by": "FAILED tests/spec/test_acceptance.py::test_failing_test_not_on_the_list_fails_the_check[fail]",
-    "seconds": 1.6
+    "run_at": "2026-11-03, this code unchanged since"
   },
   {
     "id": "ACC-A4",
     "rule": "A-4 listed test missing",
     "outcome": "killed",
     "killed_by": "FAILED tests/spec/test_acceptance.py::test_listed_test_absent_from_junit_fails",
-    "seconds": 2.5
+    "run_at": "2026-11-03, this code unchanged since"
   },
   {
     "id": "ACC-A5",
     "rule": "A-5 list not exact",
     "outcome": "killed",
     "killed_by": "FAILED tests/spec/test_acceptance.py::test_exact_mode_listed_test_that_passes_fails_the_check",
-    "seconds": 2.8
+    "run_at": "2026-11-03, this code unchanged since"
   },
   {
     "id": "ACC-A6",
     "rule": "A-6 list not empty",
     "outcome": "killed",
     "killed_by": "FAILED tests/spec/test_acceptance.py::test_require_empty_with_a_non_empty_list_fails_even_when_every_listed_test_fails",
-    "seconds": 3.8
+    "run_at": "2026-11-03, this code unchanged since"
   },
   {
     "id": "ACC-A7",
     "rule": "A-7 no map ID",
     "outcome": "killed",
     "killed_by": "FAILED tests/spec/test_acceptance.py::test_entry_without_a_valid_map_id_exits_2[acceptance.test_status::test_history]",
-    "seconds": 4.2
+    "run_at": "2026-11-03, this code unchanged since"
   },
   {
     "id": "REP-V1-sha",
     "rule": "V-1 another SHA",
     "outcome": "killed",
     "killed_by": "FAILED tests/spec/test_report_generate.py::test_v1_a_contradiction_gives_blocked[other-head-sha]",
-    "seconds": 3.0
+    "run_at": "2026-11-03, this code unchanged since"
   },
   {
     "id": "REP-V1-exit",
     "rule": "V-1 success with a failed exit code",
     "outcome": "killed",
     "killed_by": "FAILED tests/spec/test_report_generate.py::test_v1_a_contradiction_gives_blocked[success-with-a-nonzero-row]",
-    "seconds": 3.8
+    "run_at": "2026-11-03, this code unchanged since"
   },
   {
     "id": "REP-V1-exit2",
     "rule": "V-1 failure with all zero",
     "outcome": "killed",
     "killed_by": "FAILED tests/spec/test_report_generate.py::test_v1_a_contradiction_gives_blocked[failure-with-all-rows-zero]",
-    "seconds": 4.3
+    "run_at": "2026-11-03, this code unchanged since"
   },
   {
     "id": "REP-V1-sum",
     "rule": "V-1 checksum",
     "outcome": "killed",
     "killed_by": "FAILED tests/spec/test_report_generate.py::test_v1_a_contradiction_gives_blocked[checksum-of-a-log]",
-    "seconds": 5.6
+    "run_at": "2026-11-03, this code unchanged since"
   },
   {
     "id": "REP-V1-claim",
     "rule": "V-1 false claim",
     "outcome": "killed",
     "killed_by": "FAILED tests/spec/test_report_generate.py::test_v1_a_contradiction_gives_blocked[success-claimed-on-a-failed-step]",
-    "seconds": 6.3
+    "run_at": "2026-11-03, this code unchanged since"
   },
   {
     "id": "REP-V1-fork",
     "rule": "V-1 fork",
     "outcome": "killed",
     "killed_by": "FAILED tests/spec/test_report_generate.py::test_v1_a_contradiction_gives_blocked[fork]",
-    "seconds": 2.4
+    "run_at": "2026-11-03, this code unchanged since"
   },
   {
     "id": "REP-V2-step",
     "rule": "V-2 absent step",
     "outcome": "killed",
     "killed_by": "FAILED tests/spec/test_report_generate.py::test_v2_absent_mandatory_step_is_unfinished[gate/env]",
-    "seconds": 8.4
+    "run_at": "2026-11-03, this code unchanged since"
   },
   {
     "id": "REP-V2-unfinished",
     "rule": "V-2 unfinished step",
     "outcome": "killed",
     "killed_by": "FAILED tests/spec/test_report_generate.py::test_v2_step_not_completed_with_success_or_failure_is_unfinished[in_progress-None]",
-    "seconds": 10.8
+    "run_at": "2026-11-03, this code unchanged since"
   },
   {
     "id": "REP-V2-art",
     "rule": "V-2 no artifact",
     "outcome": "killed",
     "killed_by": "FAILED tests/spec/test_report_generate.py::test_v2_no_artifact_folder",
-    "seconds": 14.6
+    "run_at": "2026-11-03, this code unchanged since"
   },
   {
     "id": "REP-V2-file",
     "rule": "V-2 missing output",
     "outcome": "killed",
     "killed_by": "FAILED tests/spec/test_report_generate.py::test_v2_missing_output[file-named-in-SHA256SUMS-missing-<lambda>]",
-    "seconds": 16.6
+    "run_at": "2026-11-03, this code unchanged since"
   },
   {
     "id": "REP-V3",
     "rule": "V-3 needs-human",
     "outcome": "killed",
     "killed_by": "FAILED tests/spec/test_report_generate.py::test_v3_repeated_fix_gives_needs_human",
-    "seconds": 17.5
+    "run_at": "2026-11-03, this code unchanged since"
   },
   {
     "id": "REP-V4",
     "rule": "V-4 a failed check",
     "outcome": "killed",
     "killed_by": "FAILED tests/spec/test_report_generate.py::test_v1_control_a_failed_step_with_a_mix_of_rows_is_consistent",
-    "seconds": 7.3
+    "run_at": "2026-11-03, this code unchanged since"
   },
   {
     "id": "REP-F1",
     "rule": "F-1 ready without a stored archive",
     "outcome": "killed",
     "killed_by": "FAILED tests/spec/test_report_final_compare.py::test_f1_ready_needs_both_stored_and_matching[stored-false-archive0]",
-    "seconds": 48.8
+    "run_at": "2026-11-03, this code unchanged since"
   },
   {
     "id": "REP-F1-own",
     "rule": "F-1 a failed check listed by the verdict",
     "outcome": "killed",
     "killed_by": "FAILED tests/spec/test_report_final_compare.py::test_f1a_a_preliminary_whose_own_checks_hold_anything_but_success_never_becomes_ready[failure]",
-    "seconds": 50.6
+    "run_at": "2026-11-03, this code unchanged since"
   },
   {
     "id": "REP-F3",
     "rule": "F-3 a verdict published as neutral",
     "outcome": "killed",
     "killed_by": "FAILED tests/spec/test_report_final_compare.py::test_f1_a_stored_archive_never_upgrades_a_verdict_that_is_not_ready[blocked]",
-    "seconds": 48.6
+    "run_at": "2026-11-03, this code unchanged since"
   },
   {
     "id": "REP-B1",
     "rule": "B-1 a direct push not flagged",
     "outcome": "killed",
     "killed_by": "FAILED tests/spec/test_report_generate.py::test_b1_a_bypass_merge_is_flagged[not-via-a-pr-kw0]",
-    "seconds": 35.1
+    "run_at": "2026-11-03, this code unchanged since"
   },
   {
     "id": "REP-CONTEXT",
     "rule": "the verification record lacks a SHA",
     "outcome": "killed",
     "killed_by": "FAILED tests/spec/test_report_generate.py::test_v5_everything_green_is_ready_for_human",
-    "seconds": 1.6
+    "run_at": "2026-11-03, this code unchanged since"
   },
   {
     "id": "REP-RES",
     "rule": "a cost not given reported as 0",
     "outcome": "killed",
     "killed_by": "FAILED tests/spec/test_report_generate.py::test_report_json_resources_say_unknown_for_what_was_not_given_never_zero",
-    "seconds": 33.6
+    "run_at": "2026-11-03, this code unchanged since"
   },
   {
     "id": "COMMON-C4",
     "rule": "C-4 a bare mention",
     "outcome": "killed",
     "killed_by": "FAILED tests/spec/test_report_generate.py::test_c4_c5_no_bare_mention_in_the_markdown_whatever_the_source",
-    "seconds": 42.6
+    "run_at": "2026-11-03, this code unchanged since"
   },
   {
     "id": "ARC-W3",
     "rule": "W-3 an attempt overwritten",
     "outcome": "killed",
     "killed_by": "FAILED tests/spec/test_archive.py::test_w3_append_only_a_second_store_of_the_same_attempt_changes_nothing",
-    "seconds": 23.9
+    "run_at": "232ff66"
   },
   {
     "id": "ARC-actor",
     "rule": "W-12 reports written by another actor",
     "outcome": "killed",
     "killed_by": "FAILED tests/spec/test_archive_api.py::test_w12_a_commit_by_another_author_is_found",
-    "seconds": 90.9
+    "run_at": "232ff66"
   },
   {
     "id": "ARC-actor-append",
     "rule": "the actor check in append",
     "outcome": "killed",
     "killed_by": "FAILED tests/unit/test_unit_archive_api.py::test_append_also_checks_the_actors",
-    "seconds": 124.3
+    "run_at": "232ff66"
   },
   {
     "id": "ARC-page-limit",
     "rule": "an unending list of commits reads as all clear",
     "outcome": "killed",
     "killed_by": "FAILED tests/unit/test_unit_archive_api.py::test_more_commits_than_the_pages_can_hold_are_not_trusted",
-    "seconds": 124.0
+    "run_at": "232ff66"
   },
   {
     "id": "ARC-accept-only-adds",
     "rule": "W-14 a listed commit that changes a record",
     "outcome": "killed",
     "killed_by": "FAILED tests/spec/test_archive_api.py::test_w14_a_listed_commit_that_changes_deletes_adds_elsewhere_or_merges_stays_foreign[foreign_modifying]",
-    "seconds": 97.6
+    "run_at": "232ff66"
   },
   {
     "id": "REP-seal-symlink",
     "rule": "seal follows a symbolic link",
     "outcome": "killed",
     "killed_by": "FAILED tests/unit/test_unit_scripts.py::test_seal_leaves_a_symbolic_link_out_of_the_sums",
-    "seconds": 115.8
+    "run_at": "2026-11-03, this code unchanged since"
   },
   {
     "id": "REP-V10",
     "rule": "V-10 a failed setup gives ready",
     "outcome": "killed",
     "killed_by": "FAILED tests/spec/test_report_generate.py::test_v10_a_failed_setup_adds_failed_check_and_a_ready_verdict_is_blocked",
-    "seconds": 45.3
+    "run_at": "2026-11-03, this code unchanged since"
   },
   {
     "id": "GUARD-V-author",
     "rule": "V: the executor on an innocent branch name",
-    "outcome": "killed",
-    "killed_by": "FAILED tests/spec/test_guard_v.py::test_kind_strict_cases_are_ai_and_refuse_a_harmful_change[executor-on-an-innocent-branch]",
-    "seconds": 255.0
+    "outcome": "not run at 232ff66, the CEO's deadline",
+    "killed_by": "",
+    "run_at": ""
   },
   {
     "id": "GUARD-V-commits",
     "rule": "V: a person's PR with the executor's commit",
-    "outcome": "killed",
-    "killed_by": "FAILED tests/spec/test_guard_v.py::test_kind_strict_cases_are_ai_and_refuse_a_harmful_change[person-with-a-commit-authored-by-the-executor]",
-    "seconds": 267.2
+    "outcome": "not run at 232ff66, the CEO's deadline",
+    "killed_by": "",
+    "run_at": ""
   },
   {
     "id": "GUARD-V-branch",
     "rule": "V: a branch name in another letter case",
-    "outcome": "killed",
-    "killed_by": "FAILED tests/spec/test_guard_v.py::test_kind_strict_cases_are_ai_and_refuse_a_harmful_change[AI/1-by-a-person]",
-    "seconds": 273.6
+    "outcome": "not run at 232ff66, the CEO's deadline",
+    "killed_by": "",
+    "run_at": ""
   },
   {
     "id": "GUARD-W-file",
     "rule": "W: the executor edits the security review",
-    "outcome": "killed",
-    "killed_by": "FAILED tests/spec/test_guard.py::test_g1_protected_path_fires[security-review.md0]",
-    "seconds": 28.9
+    "outcome": "not run at 232ff66, the CEO's deadline",
+    "killed_by": "",
+    "run_at": ""
   },
   {
     "id": "GUARD-W-names",
     "rule": "W: pytest.ini and the tools' configs",
-    "outcome": "killed",
-    "killed_by": "FAILED tests/spec/test_guard_v.py::test_g1a_files_that_control_the_tests_and_the_security_tools_are_protected_in_any_folder[pytest.toml-root]",
-    "seconds": 337.8
+    "outcome": "not run at 232ff66, the CEO's deadline",
+    "killed_by": "",
+    "run_at": ""
   },
   {
     "id": "GUARD-W-conftest",
     "rule": "W: the root conftest.py",
-    "outcome": "killed",
-    "killed_by": "FAILED tests/spec/test_guard_v.py::test_g1a_conftest_in_the_root_is_protected[added]",
-    "seconds": 430.8
+    "outcome": "not run at 232ff66, the CEO's deadline",
+    "killed_by": "",
+    "run_at": ""
   },
   {
     "id": "GUARD-W-sections",
     "rule": "W: the test sections of pyproject.toml",
-    "outcome": "killed",
-    "killed_by": "FAILED tests/spec/test_guard_v.py::test_g1b_a_changed_added_or_removed_section_of_a_root_config_file_is_protected[pyproject-tool-pytest-changed]",
-    "seconds": 442.4
+    "outcome": "not run at 232ff66, the CEO's deadline",
+    "killed_by": "",
+    "run_at": ""
   },
   {
     "id": "GUARD-U-marks",
     "rule": "U: a changed test is not marked",
-    "outcome": "killed",
-    "killed_by": "FAILED tests/spec/test_guard_v.py::test_g4a_a_changed_expected_value_is_marked_not_refused",
-    "seconds": 680.0
+    "outcome": "not run at 232ff66, the CEO's deadline",
+    "killed_by": "",
+    "run_at": ""
   },
   {
     "id": "GUARD-G4-return",
     "rule": "G-4 an early return",
-    "outcome": "killed",
-    "killed_by": "FAILED tests/spec/test_guard_v.py::test_g4_each_weakening_fires[early-return-ahead-of-the-checks]",
-    "seconds": 658.9
+    "outcome": "not run at 232ff66, the CEO's deadline",
+    "killed_by": "",
+    "run_at": ""
   },
   {
     "id": "GUARD-G4-cases",
     "rule": "G-4 fewer parametrized cases",
-    "outcome": "killed",
-    "killed_by": "FAILED tests/spec/test_guard_v.py::test_g4_each_weakening_fires[fewer-parametrize-cases]",
-    "seconds": 664.5
+    "outcome": "not run at 232ff66, the CEO's deadline",
+    "killed_by": "",
+    "run_at": ""
   },
   {
     "id": "GUARD-G4-taut",
     "rule": "G-4 a tautology",
-    "outcome": "killed",
-    "killed_by": "FAILED tests/spec/test_guard_v.py::test_g4_each_weakening_fires[tautology-same-call-both-sides]",
-    "seconds": 642.1
+    "outcome": "not run at 232ff66, the CEO's deadline",
+    "killed_by": "",
+    "run_at": ""
   },
   {
     "id": "GUARD-G6-comment",
     "rule": "G-6 a commented-out threshold",
-    "outcome": "killed",
-    "killed_by": "FAILED tests/spec/test_guard.py::test_g6_lowered_or_removed_threshold_fires[commented-out]",
-    "seconds": 199.5
+    "outcome": "not run at 232ff66, the CEO's deadline",
+    "killed_by": "",
+    "run_at": ""
   },
   {
     "id": "GUARD-G6-nocov",
     "rule": "G-6 an added --no-cov",
-    "outcome": "killed",
-    "killed_by": "FAILED tests/spec/test_guard.py::test_g6_lowered_or_removed_threshold_fires[no-cov-added-to-a-command]",
-    "seconds": 216.4
+    "outcome": "not run at 232ff66, the CEO's deadline",
+    "killed_by": "",
+    "run_at": ""
   },
   {
     "id": "GUARD-G9-merge",
     "rule": "G-9 a merge from the base as a repeat",
-    "outcome": "killed",
-    "killed_by": "FAILED tests/spec/test_guard_v.py::test_g9_a_merge_from_the_base_with_nothing_else_is_not_a_repeat_but_the_same_fix_with_its_own_commit_is",
-    "seconds": 745.4
+    "outcome": "not run at 232ff66, the CEO's deadline",
+    "killed_by": "",
+    "run_at": ""
   },
   {
     "id": "GUARD-G9-text",
     "rule": "G-9 a .gitattributes hides a change",
-    "outcome": "killed",
-    "killed_by": "FAILED tests/spec/test_guard_v.py::test_g9_a_gitattributes_with_minus_diff_neither_changes_nor_hides_a_fingerprint",
-    "seconds": 718.7
+    "outcome": "not run at 232ff66, the CEO's deadline",
+    "killed_by": "",
+    "run_at": ""
   },
   {
     "id": "RUN-R11",
     "rule": "R-11 a test of the base did not run",
-    "outcome": "killed",
-    "killed_by": "FAILED tests/spec/test_run_checks_base.py::test_r11_a_test_of_the_base_absent_from_the_junit_file_fails_and_is_listed[tests.test_app::test_add]",
-    "seconds": 25.8
+    "outcome": "not run at 232ff66, the CEO's deadline",
+    "killed_by": "",
+    "run_at": ""
   },
   {
     "id": "ACC-A11",
     "rule": "A-11 an acceptance test did not run",
     "outcome": "killed",
     "killed_by": "FAILED tests/spec/test_acceptance.py::test_a11_a_test_absent_from_junit_and_not_on_the_list_fails[acceptance.test_status::test_history]",
-    "seconds": 18.3
+    "run_at": "2026-11-03, this code unchanged since"
   },
   {
     "id": "ACC-A10",
     "rule": "A-10 the list on the final PR",
     "outcome": "killed",
     "killed_by": "FAILED tests/spec/test_acceptance.py::test_a10_require_empty_true_in_the_configuration_acts_as_the_flag",
-    "seconds": 16.6
+    "run_at": "2026-11-03, this code unchanged since"
   },
   {
     "id": "FB-D0",
     "rule": "D-0 untrusted reports are read",
     "outcome": "killed",
     "killed_by": "FAILED tests/spec/test_feedback.py::test_d0_actors_that_are_not_ok_or_cannot_be_read_mean_reports_untrusted[actors-not-ok-workflow_run]",
-    "seconds": 44.8
+    "run_at": "2026-11-03, this code unchanged since"
   },
   {
     "id": "FB-D2a-fork",
     "rule": "D-2a a fork",
     "outcome": "killed",
     "killed_by": "FAILED tests/spec/test_feedback.py::test_d2a_a_pull_request_from_another_repository_is_a_fork[someone-else/example-app-workflow_run]",
-    "seconds": 51.0
+    "run_at": "2026-11-03, this code unchanged since"
   },
   {
     "id": "FB-D2a-ai",
     "rule": "D-2a a spec or maintenance PR",
     "outcome": "killed",
     "killed_by": "FAILED tests/spec/test_feedback.py::test_d2a_only_an_ai_branch_gets_a_fix_round[spec/tests-1-workflow_run]",
-    "seconds": 50.9
+    "run_at": "2026-11-03, this code unchanged since"
   },
   {
     "id": "FB-cancelled",
     "rule": "a cancelled run starts a model",
     "outcome": "killed",
     "killed_by": "FAILED tests/spec/test_feedback.py::test_workflow_run_cancelled_is_not_actionable_whatever_is_stored[with-a-blocked-record]",
-    "seconds": 45.0
+    "run_at": "2026-11-03, this code unchanged since"
   },
   {
     "id": "FB-verdict",
     "rule": "a lost run starts a model",
     "outcome": "killed",
     "killed_by": "FAILED tests/spec/test_feedback.py::test_workflow_run_with_any_other_verdict_than_blocked_is_not_actionable[incomplete]",
-    "seconds": 2.2
+    "run_at": "2026-11-03, this code unchanged since"
   },
   {
     "id": "FB-record",
     "rule": "a record in two PR folders",
     "outcome": "killed",
     "killed_by": "FAILED tests/spec/test_feedback.py::test_workflow_run_a_record_in_two_pr_folders_is_ambiguous_and_is_no_record",
-    "seconds": 47.8
+    "run_at": "2026-11-03, this code unchanged since"
   },
   {
     "id": "GUARD-X-toml",
     "rule": "F2 pytest.toml",
-    "outcome": "killed",
-    "killed_by": "FAILED tests/spec/test_guard_v.py::test_g1a_files_that_control_the_tests_and_the_security_tools_are_protected_in_any_folder[pytest.toml-root]",
-    "seconds": 418.9
+    "outcome": "not run at 232ff66, the CEO's deadline",
+    "killed_by": "",
+    "run_at": ""
   },
   {
     "id": "GUARD-X-dot-toml",
     "rule": "F2 .pytest.toml",
-    "outcome": "killed",
-    "killed_by": "FAILED tests/spec/test_guard_v.py::test_g1a_files_that_control_the_tests_and_the_security_tools_are_protected_in_any_folder[.pytest.toml-root]",
-    "seconds": 421.4
+    "outcome": "not run at 232ff66, the CEO's deadline",
+    "killed_by": "",
+    "run_at": ""
   },
   {
     "id": "GUARD-X-any-folder",
-    "rule": "F2 a configuration file in a subfolder",
-    "outcome": "killed",
-    "killed_by": "FAILED tests/spec/test_guard_v.py::test_g1b_the_three_files_are_watched_by_section_in_any_folder[sub/pyproject.toml]",
-    "seconds": 514.1
+    "rule": "F2 pytest's section in a subfolder",
+    "outcome": "not run at 232ff66, the CEO's deadline",
+    "killed_by": "",
+    "run_at": ""
   },
   {
     "id": "GUARD-X-shadow",
     "rule": "F2 a module standing in for pytest",
-    "outcome": "killed",
-    "killed_by": "FAILED tests/spec/test_guard_v.py::test_g1a_changed_and_deleted_count_too[pytest.py-changed]",
-    "seconds": 442.8
+    "outcome": "not run at 232ff66, the CEO's deadline",
+    "killed_by": "",
+    "run_at": ""
   },
   {
     "id": "GUARD-X-plugin",
     "rule": "F2 a plugin entry point",
+    "outcome": "not run at 232ff66, the CEO's deadline",
+    "killed_by": "",
+    "run_at": ""
+  },
+  {
+    "id": "GUARD-R3-mention",
+    "rule": "H1 a file pytest reads differently",
     "outcome": "killed",
-    "killed_by": "FAILED tests/spec/test_guard_v.py::test_g1b_the_pytest11_entry_points_section_is_watched[root-added]",
-    "seconds": 421.3
+    "killed_by": "FAILED tests/spec/test_guard_v.py::test_g1b_a_changed_added_or_removed_section_of_a_root_config_file_is_protected[setup-cfg-tool-pytest]",
+    "run_at": "232ff66"
+  },
+  {
+    "id": "GUARD-R3-spec-delete",
+    "rule": "H3 a spec PR takes a test away",
+    "outcome": "killed",
+    "killed_by": "FAILED tests/spec/test_guard_r4.py::test_g11a_deleting_a_test_file_is_refused",
+    "run_at": "232ff66"
+  },
+  {
+    "id": "GUARD-R3-named",
+    "rule": "M1 an ordinary section refused",
+    "outcome": "killed",
+    "killed_by": "FAILED tests/spec/test_guard_v.py::test_g1b_control_a_change_to_any_other_section_is_allowed_and_marked_in_the_root[pyproject-tool-ruff-changed]",
+    "run_at": "232ff66"
+  },
+  {
+    "id": "GUARD-R3-sub-ini",
+    "rule": "M1 an ordinary subfolder file refused",
+    "outcome": "killed",
+    "killed_by": "FAILED tests/spec/test_guard_v.py::test_g1b_control_another_section_of_the_same_files_in_a_subfolder_is_neither_refused_nor_marked[sub/setup.cfg]",
+    "run_at": "232ff66"
+  },
+  {
+    "id": "GUARD-R3-mark",
+    "rule": "M1 another tool's section not marked",
+    "outcome": "killed",
+    "killed_by": "FAILED tests/spec/test_guard_v.py::test_g1b_control_a_change_to_any_other_section_is_allowed_and_marked_in_the_root[pyproject-project]",
+    "run_at": "232ff66"
+  },
+  {
+    "id": "GUARD-R3-table",
+    "rule": "a traceback on an odd pyproject.toml",
+    "outcome": "killed",
+    "killed_by": "FAILED tests/unit/test_unit_repairs_round4.py::test_an_added_symbolic_link_is_refused[pyproject.toml-a=1]",
+    "run_at": "232ff66"
+  },
+  {
+    "id": "PUB-R3-link",
+    "rule": "H2 a link or a second name is followed",
+    "outcome": "killed",
+    "killed_by": "FAILED tests/unit/test_unit_repairs_round3.py::test_a_link_is_refused_without_reading_it",
+    "run_at": "232ff66"
+  },
+  {
+    "id": "PUB-R3-value",
+    "rule": "H2 a token's value is posted",
+    "outcome": "killed",
+    "killed_by": "FAILED tests/unit/test_unit_repairs_round3.py::test_a_text_holding_the_tokens_value_is_not_posted",
+    "run_at": "232ff66"
+  },
+  {
+    "id": "PUB-R3-pattern",
+    "rule": "H2 a token's shape is posted",
+    "outcome": "killed",
+    "killed_by": "FAILED tests/unit/test_unit_repairs_round3.py::test_a_text_shaped_like_a_secret_is_not_posted[app-token]",
+    "run_at": "232ff66"
+  },
+  {
+    "id": "REPRO-R3-host",
+    "rule": "M2 a GitHub URL taken for another remote",
+    "outcome": "killed",
+    "killed_by": "FAILED tests/spec/test_reproduce_x0.py::test_x0_a_foreign_commit_exits_1_with_reports_untrusted_in_every_github_url_form[ssh-url]",
+    "run_at": "232ff66"
+  },
+  {
+    "id": "REPRO-R3-scp",
+    "rule": "M2 the git@ form",
+    "outcome": "killed",
+    "killed_by": "FAILED tests/spec/test_reproduce_x0.py::test_x0_a_foreign_commit_exits_1_with_reports_untrusted_in_every_github_url_form[scp-like]",
+    "run_at": "232ff66"
+  },
+  {
+    "id": "REPRO-R3-tip",
+    "rule": "X-0 another history than git read",
+    "outcome": "not run at 232ff66, the CEO's deadline",
+    "killed_by": "",
+    "run_at": ""
+  },
+  {
+    "id": "GUARD-R6-chain",
+    "rule": "R5-H1 an attribute chain",
+    "outcome": "not run at 232ff66, the CEO's deadline",
+    "killed_by": "",
+    "run_at": ""
+  },
+  {
+    "id": "GUARD-R6-known",
+    "rule": "R6-M2 a module turned into a package",
+    "outcome": "not run at 232ff66, the CEO's deadline",
+    "killed_by": "",
+    "run_at": ""
+  },
+  {
+    "id": "GUARD-R6-head-name",
+    "rule": "R6-M2 a package turned into a module",
+    "outcome": "not run at 232ff66, the CEO's deadline",
+    "killed_by": "",
+    "run_at": ""
+  },
+  {
+    "id": "GUARD-R6-package",
+    "rule": "R6-M3 inside a package",
+    "outcome": "not run at 232ff66, the CEO's deadline",
+    "killed_by": "",
+    "run_at": ""
+  },
+  {
+    "id": "GUARD-R6-root",
+    "rule": "G-1h the root and src",
+    "outcome": "not run at 232ff66, the CEO's deadline",
+    "killed_by": "",
+    "run_at": ""
+  },
+  {
+    "id": "GUARD-R5-link",
+    "rule": "R4-H1 a link is read by its target's name",
+    "outcome": "not run at 232ff66, the CEO's deadline",
+    "killed_by": "",
+    "run_at": ""
+  },
+  {
+    "id": "GUARD-R5-hidden-submodule",
+    "rule": "R5-M2 a submodule hidden by .gitmodules",
+    "outcome": "not run at 232ff66, the CEO's deadline",
+    "killed_by": "",
+    "run_at": ""
+  },
+  {
+    "id": "GUARD-R5-encoding",
+    "rule": "R5-H2 another encoding",
+    "outcome": "not run at 232ff66, the CEO's deadline",
+    "killed_by": "",
+    "run_at": ""
+  },
+  {
+    "id": "GUARD-R5-encoding-unknown",
+    "rule": "R5-H2 an encoding Python does not know",
+    "outcome": "not run at 232ff66, the CEO's deadline",
+    "killed_by": "",
+    "run_at": ""
+  },
+  {
+    "id": "GUARD-R5-encoding-newline",
+    "rule": "R5-H2 a cookie after a lone CR",
+    "outcome": "not run at 232ff66, the CEO's deadline",
+    "killed_by": "",
+    "run_at": ""
+  },
+  {
+    "id": "GUARD-R5-not-source",
+    "rule": "R5-H4 and R5-H6 no source to read",
+    "outcome": "not run at 232ff66, the CEO's deadline",
+    "killed_by": "",
+    "run_at": ""
+  },
+  {
+    "id": "GUARD-R5-bytecode",
+    "rule": "R5-H6 a bytecode file",
+    "outcome": "not run at 232ff66, the CEO's deadline",
+    "killed_by": "",
+    "run_at": ""
+  },
+  {
+    "id": "GUARD-R5-pycache",
+    "rule": "R5-H6 anything under __pycache__",
+    "outcome": "not run at 232ff66, the CEO's deadline",
+    "killed_by": "",
+    "run_at": ""
+  },
+  {
+    "id": "GUARD-R5-metadata",
+    "rule": "R5-H4 a dist-info folder",
+    "outcome": "not run at 232ff66, the CEO's deadline",
+    "killed_by": "",
+    "run_at": ""
+  },
+  {
+    "id": "GUARD-R5-egg-info",
+    "rule": "R5-H4 an egg-info folder",
+    "outcome": "not run at 232ff66, the CEO's deadline",
+    "killed_by": "",
+    "run_at": ""
+  },
+  {
+    "id": "GUARD-R5-plugins",
+    "rule": "R5-H3 pytest_plugins",
+    "outcome": "not run at 232ff66, the CEO's deadline",
+    "killed_by": "",
+    "run_at": ""
+  },
+  {
+    "id": "GUARD-R5-plugins-star",
+    "rule": "R5-H3 a star import in a new test file",
+    "outcome": "not run at 232ff66, the CEO's deadline",
+    "killed_by": "",
+    "run_at": ""
+  },
+  {
+    "id": "GUARD-R5-root-shadow",
+    "rule": "R5-H6 a new top-level name",
+    "outcome": "not run at 232ff66, the CEO's deadline",
+    "killed_by": "",
+    "run_at": ""
+  },
+  {
+    "id": "GUARD-R5-root-known",
+    "rule": "G-1g a name the base has is refused",
+    "outcome": "not run at 232ff66, the CEO's deadline",
+    "killed_by": "",
+    "run_at": ""
+  },
+  {
+    "id": "GUARD-R5-root-package",
+    "rule": "R5-H6 a new top-level package",
+    "outcome": "not run at 232ff66, the CEO's deadline",
+    "killed_by": "",
+    "run_at": ""
+  },
+  {
+    "id": "GUARD-R5-stand-in",
+    "rule": "R5-H3 a module under tests stands in",
+    "outcome": "not run at 232ff66, the CEO's deadline",
+    "killed_by": "",
+    "run_at": ""
+  },
+  {
+    "id": "GUARD-R5-stand-in-new",
+    "rule": "G-1h a shadow the base has is refused",
+    "outcome": "not run at 232ff66, the CEO's deadline",
+    "killed_by": "",
+    "run_at": ""
+  },
+  {
+    "id": "GUARD-R5-src-layout",
+    "rule": "R5-H3 a src layout's module",
+    "outcome": "not run at 232ff66, the CEO's deadline",
+    "killed_by": "",
+    "run_at": ""
+  },
+  {
+    "id": "GUARD-R5-star",
+    "rule": "R5-H1 a star import",
+    "outcome": "not run at 232ff66, the CEO's deadline",
+    "killed_by": "",
+    "run_at": ""
+  },
+  {
+    "id": "GUARD-R5-global",
+    "rule": "R5-H1 a global",
+    "outcome": "not run at 232ff66, the CEO's deadline",
+    "killed_by": "",
+    "run_at": ""
+  },
+  {
+    "id": "GUARD-R5-match",
+    "rule": "R5-H1 a match pattern",
+    "outcome": "not run at 232ff66, the CEO's deadline",
+    "killed_by": "",
+    "run_at": ""
+  },
+  {
+    "id": "GUARD-R5-swap",
+    "rule": "R5-H1 a binding replaced",
+    "outcome": "not run at 232ff66, the CEO's deadline",
+    "killed_by": "",
+    "run_at": ""
+  },
+  {
+    "id": "GUARD-R5-comprehension",
+    "rule": "R5-H1 a := in a comprehension",
+    "outcome": "not run at 232ff66, the CEO's deadline",
+    "killed_by": "",
+    "run_at": ""
+  },
+  {
+    "id": "GUARD-R5-outside",
+    "rule": "R5-H1 a default or a decorator",
+    "outcome": "not run at 232ff66, the CEO's deadline",
+    "killed_by": "",
+    "run_at": ""
+  },
+  {
+    "id": "GUARD-R5-lambda",
+    "rule": "R5-H1 a lambda's default",
+    "outcome": "not run at 232ff66, the CEO's deadline",
+    "killed_by": "",
+    "run_at": ""
+  },
+  {
+    "id": "GUARD-R5-attribute-in-class",
+    "rule": "R5-H1 an attribute set in the test's own class",
+    "outcome": "not run at 232ff66, the CEO's deadline",
+    "killed_by": "",
+    "run_at": ""
+  },
+  {
+    "id": "GUARD-R5-attribute-chain",
+    "rule": "R5-H1 test.__code__ set",
+    "outcome": "not run at 232ff66, the CEO's deadline",
+    "killed_by": "",
+    "run_at": ""
+  },
+  {
+    "id": "GUARD-R5-bom",
+    "rule": "R5-M4 a byte-order mark",
+    "outcome": "not run at 232ff66, the CEO's deadline",
+    "killed_by": "",
+    "run_at": ""
+  },
+  {
+    "id": "COL-R5-bom",
+    "rule": "R5-M4 a byte-order mark",
+    "outcome": "not run at 232ff66, the CEO's deadline",
+    "killed_by": "",
+    "run_at": ""
+  },
+  {
+    "id": "RUN-R5-junit-failed",
+    "rule": "R5-H7 pytest.exit with code 0",
+    "outcome": "not run at 232ff66, the CEO's deadline",
+    "killed_by": "",
+    "run_at": ""
+  },
+  {
+    "id": "RUN-R5-junit-errors",
+    "rule": "R-12 errors in the file",
+    "outcome": "not run at 232ff66, the CEO's deadline",
+    "killed_by": "",
+    "run_at": ""
+  },
+  {
+    "id": "REPRO-R5-secret",
+    "rule": "R5-H5 a rerun with a secret",
+    "outcome": "not run at 232ff66, the CEO's deadline",
+    "killed_by": "",
+    "run_at": ""
+  },
+  {
+    "id": "REPRO-R5-empty",
+    "rule": "X-0b an empty variable",
+    "outcome": "not run at 232ff66, the CEO's deadline",
+    "killed_by": "",
+    "run_at": ""
+  },
+  {
+    "id": "REPRO-R5-credential",
+    "rule": "X-0a a credential in the URL",
+    "outcome": "not run at 232ff66, the CEO's deadline",
+    "killed_by": "",
+    "run_at": ""
+  },
+  {
+    "id": "REPRO-R5-ssh-user",
+    "rule": "X-0a ssh://git@ refused",
+    "outcome": "not run at 232ff66, the CEO's deadline",
+    "killed_by": "",
+    "run_at": ""
+  },
+  {
+    "id": "REPRO-R5-scp",
+    "rule": "a look-alike taken for GitHub",
+    "outcome": "not run at 232ff66, the CEO's deadline",
+    "killed_by": "",
+    "run_at": ""
+  },
+  {
+    "id": "GUARD-R4-submodule",
+    "rule": "R4-H1 a submodule passes",
+    "outcome": "not run at 232ff66, the CEO's deadline",
+    "killed_by": "",
+    "run_at": ""
+  },
+  {
+    "id": "GUARD-R4-attributes",
+    "rule": "R4-H2 the checkout differs from the blob",
+    "outcome": "not run at 232ff66, the CEO's deadline",
+    "killed_by": "",
+    "run_at": ""
+  },
+  {
+    "id": "GUARD-R4-newlines",
+    "rule": "R4-H5 a lone CR splits the guard from pytest",
+    "outcome": "not run at 232ff66, the CEO's deadline",
+    "killed_by": "",
+    "run_at": ""
+  },
+  {
+    "id": "GUARD-R4-plugin-any",
+    "rule": "R4-M3 another tool's plugin table",
+    "outcome": "not run at 232ff66, the CEO's deadline",
+    "killed_by": "",
+    "run_at": ""
+  },
+  {
+    "id": "GUARD-R4-dynamic",
+    "rule": "R4-M3 entry points declared dynamic",
+    "outcome": "not run at 232ff66, the CEO's deadline",
+    "killed_by": "",
+    "run_at": ""
+  },
+  {
+    "id": "GUARD-R4-spec-conftest",
+    "rule": "R4-H3 a conftest.py in a spec PR",
+    "outcome": "not run at 232ff66, the CEO's deadline",
+    "killed_by": "",
+    "run_at": ""
+  },
+  {
+    "id": "GUARD-R4-spec-names",
+    "rule": "R4-H3 pytest.ini under acceptance/ in a spec PR",
+    "outcome": "not run at 232ff66, the CEO's deadline",
+    "killed_by": "",
+    "run_at": ""
+  },
+  {
+    "id": "GUARD-R4-spec-sections",
+    "rule": "R4-H3 a section under acceptance/ in a spec PR",
+    "outcome": "not run at 232ff66, the CEO's deadline",
+    "killed_by": "",
+    "run_at": ""
   },
   {
     "id": "GUARD-X-review",
     "rule": "F8 a change to the security review",
-    "outcome": "killed",
-    "killed_by": "FAILED tests/unit/test_unit_real_pytest.py::test_a_change_to_the_security_review_is_listed_in_any_kind_of_pr",
-    "seconds": 540.7
+    "outcome": "not run at 232ff66, the CEO's deadline",
+    "killed_by": "",
+    "run_at": ""
   },
   {
     "id": "GUARD-X-parse",
     "rule": "an unparsable test file",
-    "outcome": "killed",
-    "killed_by": "FAILED tests/unit/test_unit_scripts.py::test_a_changed_test_file_that_cannot_be_parsed_is_refused",
-    "seconds": 588.1
+    "outcome": "not run at 232ff66, the CEO's deadline",
+    "killed_by": "",
+    "run_at": ""
   },
   {
     "id": "RUN-X-acceptance",
     "rule": "F1 acceptance tests expected of gate/tests",
-    "outcome": "killed",
-    "killed_by": "FAILED tests/unit/test_unit_real_pytest.py::test_a_suite_of_every_shape_passes_with_nothing_missing",
-    "seconds": 65.1
+    "outcome": "not run at 232ff66, the CEO's deadline",
+    "killed_by": "",
+    "run_at": ""
   },
   {
     "id": "RUN-X-ignore",
     "rule": "F3 the trusted ignore list",
-    "outcome": "killed",
-    "killed_by": "FAILED tests/unit/test_unit_real_pytest.py::test_a_file_outside_the_run_is_named_in_the_trusted_ignore_list",
-    "seconds": 68.2
+    "outcome": "not run at 232ff66, the CEO's deadline",
+    "killed_by": "",
+    "run_at": ""
   },
   {
     "id": "RUN-X-root",
     "rule": "F3 a moved root",
-    "outcome": "killed",
-    "killed_by": "FAILED tests/unit/test_unit_real_pytest.py::test_a_configuration_file_in_a_subfolder_moves_pytests_root",
-    "seconds": 69.3
+    "outcome": "not run at 232ff66, the CEO's deadline",
+    "killed_by": "",
+    "run_at": ""
   },
   {
     "id": "COL-fixture",
     "rule": "F3 a fixture named test_",
-    "outcome": "killed",
-    "killed_by": "FAILED tests/unit/test_unit_real_pytest.py::test_a_suite_of_every_shape_passes_with_nothing_missing",
-    "seconds": 2.3
+    "outcome": "not run at 232ff66, the CEO's deadline",
+    "killed_by": "",
+    "run_at": ""
   },
   {
     "id": "COL-init",
     "rule": "F3 a class with __init__",
-    "outcome": "killed",
-    "killed_by": "FAILED tests/unit/test_unit_real_pytest.py::test_a_suite_of_every_shape_passes_with_nothing_missing",
-    "seconds": 2.1
+    "outcome": "not run at 232ff66, the CEO's deadline",
+    "killed_by": "",
+    "run_at": ""
   },
   {
     "id": "COL-class-off",
     "rule": "F3 __test__ = False on a class",
-    "outcome": "killed",
-    "killed_by": "FAILED tests/unit/test_unit_real_pytest.py::test_a_suite_of_every_shape_passes_with_nothing_missing",
-    "seconds": 2.1
+    "outcome": "not run at 232ff66, the CEO's deadline",
+    "killed_by": "",
+    "run_at": ""
   },
   {
     "id": "COL-module-off",
     "rule": "F3 __test__ = False on a module",
-    "outcome": "killed",
-    "killed_by": "FAILED tests/unit/test_unit_real_pytest.py::test_a_suite_of_every_shape_passes_with_nothing_missing",
-    "seconds": 2.1
+    "outcome": "not run at 232ff66, the CEO's deadline",
+    "killed_by": "",
+    "run_at": ""
   },
   {
     "id": "COL-function-off",
     "rule": "F3 __test__ = False on a function",
-    "outcome": "killed",
-    "killed_by": "FAILED tests/unit/test_unit_real_pytest.py::test_a_suite_of_every_shape_passes_with_nothing_missing",
-    "seconds": 2.2
+    "outcome": "not run at 232ff66, the CEO's deadline",
+    "killed_by": "",
+    "run_at": ""
   },
   {
     "id": "COL-helper-class",
     "rule": "F3 a class pytest does not collect",
-    "outcome": "killed",
-    "killed_by": "FAILED tests/unit/test_unit_real_pytest.py::test_a_suite_of_every_shape_passes_with_nothing_missing",
-    "seconds": 2.2
+    "outcome": "not run at 232ff66, the CEO's deadline",
+    "killed_by": "",
+    "run_at": ""
   },
   {
     "id": "FB-note-record",
     "rule": "F4 the note says what is wrong",
     "outcome": "killed",
     "killed_by": "FAILED tests/unit/test_unit_scripts.py::test_the_note_of_a_judge_failure_says_what_is_wrong",
-    "seconds": 70.4
+    "run_at": "2026-11-03, this code unchanged since"
   },
   {
     "id": "FB-note-comment",
     "rule": "F4 the note holds the review's findings",
     "outcome": "killed",
     "killed_by": "FAILED tests/unit/test_unit_scripts.py::test_the_note_of_a_review_holds_its_findings_and_no_bare_mention",
-    "seconds": 69.8
+    "run_at": "2026-11-03, this code unchanged since"
   },
   {
     "id": "REP-X-untrusted",
     "rule": "V-11 untrusted reports",
     "outcome": "killed",
     "killed_by": "FAILED tests/unit/test_unit_scripts.py::test_untrusted_reports_block_the_verdict",
-    "seconds": 123.6
+    "run_at": "2026-11-03, this code unchanged since"
   },
   {
     "id": "REP-X-review-flag",
     "rule": "F8 a green merge changing the review",
     "outcome": "killed",
     "killed_by": "FAILED tests/unit/test_unit_scripts.py::test_a_merge_that_changed_the_security_review_is_flagged_however_green",
-    "seconds": 116.7
+    "run_at": "2026-11-03, this code unchanged since"
   },
   {
     "id": "REP-X-review-list",
     "rule": "F8 the changes in the report",
     "outcome": "killed",
     "killed_by": "FAILED tests/unit/test_unit_scripts.py::test_every_change_to_the_security_review_is_listed_in_the_report",
-    "seconds": 118.9
+    "run_at": "2026-11-03, this code unchanged since"
   },
   {
     "id": "REPRO-check",
     "rule": "F7 reproduce reads unchecked",
-    "outcome": "killed",
-    "killed_by": "FAILED tests/unit/test_unit_end_to_end.py::test_reproduce_refuses_a_reports_branch_written_by_another_actor",
-    "seconds": 105.5
+    "outcome": "not run at 232ff66, the CEO's deadline",
+    "killed_by": "",
+    "run_at": ""
   },
   {
     "id": "REPRO-review",
     "rule": "reproduce keeps the PR's own review",
-    "outcome": "killed",
-    "killed_by": "FAILED tests/unit/test_unit_end_to_end.py::test_reproduce_uses_the_default_branchs_security_review",
-    "seconds": 127.7
+    "outcome": "not run at 232ff66, the CEO's deadline",
+    "killed_by": "",
+    "run_at": ""
   },
   {
     "id": "REPRO-pull-ref",
     "rule": "reproduce loses a closed PR's head",
-    "outcome": "killed",
-    "killed_by": "FAILED tests/unit/test_unit_end_to_end.py::test_reproduce_finds_a_closed_prs_head_after_its_branch_is_gone",
-    "seconds": 75.3,
-    "note": "First run survived: a clone from a plain path copies every object, so the test passed without the fetch. The test now clones through file://, and the mutant was run again."
+    "outcome": "not run at 232ff66, the CEO's deadline",
+    "killed_by": "",
+    "run_at": ""
   },
   {
     "id": "ARC-X-append-list",
     "rule": "append ignores the recovery list",
-    "outcome": "killed",
-    "killed_by": "FAILED tests/unit/test_unit_archive_api.py::test_append_reads_the_recovery_list_too",
-    "seconds": 129.4
+    "outcome": "not run at 232ff66, the CEO's deadline",
+    "killed_by": "",
+    "run_at": ""
   },
   {
     "id": "ARC-X-file-pages",
     "rule": "W-14 only the first page of a commit's files",
-    "outcome": "killed",
-    "killed_by": "FAILED tests/unit/test_unit_archive_api.py::test_a_listed_commit_is_read_to_its_last_page_of_files",
-    "seconds": 129.2
+    "outcome": "not run at 232ff66, the CEO's deadline",
+    "killed_by": "",
+    "run_at": ""
   },
   {
     "id": "PUB-branch",
     "rule": "F9 a branch outside the prefix",
-    "outcome": "killed",
-    "killed_by": "FAILED tests/unit/test_unit_scripts.py::test_the_pr_is_opened_only_for_the_branch_the_model_pushed_and_only_once",
-    "seconds": 14.7
+    "outcome": "not run at 232ff66, the CEO's deadline",
+    "killed_by": "",
+    "run_at": ""
   },
   {
     "id": "PUB-not-pushed",
     "rule": "F9 a branch not pushed",
-    "outcome": "killed",
-    "killed_by": "FAILED tests/unit/test_unit_scripts.py::test_the_pr_is_opened_only_for_the_branch_the_model_pushed_and_only_once",
-    "seconds": 15.1
+    "outcome": "not run at 232ff66, the CEO's deadline",
+    "killed_by": "",
+    "run_at": ""
   },
   {
     "id": "PUB-once",
     "rule": "a second PR for one branch",
-    "outcome": "killed",
-    "killed_by": "FAILED tests/unit/test_unit_scripts.py::test_the_pr_is_opened_only_for_the_branch_the_model_pushed_and_only_once",
-    "seconds": 14.4
+    "outcome": "not run at 232ff66, the CEO's deadline",
+    "killed_by": "",
+    "run_at": ""
   },
   {
     "id": "PUB-delimiter",
     "rule": "a fixed delimiter",
-    "outcome": "killed",
-    "killed_by": "FAILED tests/unit/test_unit_scripts.py::test_the_prompt_holds_the_trusted_template_the_issue_and_the_note",
-    "seconds": 13.1
+    "outcome": "not run at 232ff66, the CEO's deadline",
+    "killed_by": "",
+    "run_at": ""
   },
   {
     "id": "PUB-head-state",
     "rule": "head-check passes all",
-    "outcome": "killed",
-    "killed_by": "FAILED tests/unit/test_unit_scripts.py::test_head_check_passes_only_on_the_open_pr_at_this_commit",
-    "seconds": 13.1
+    "outcome": "not run at 232ff66, the CEO's deadline",
+    "killed_by": "",
+    "run_at": ""
   },
   {
     "id": "PUB-rounds",
     "rule": "rounds from guard records only",
-    "outcome": "killed",
-    "killed_by": "FAILED tests/unit/test_unit_scripts.py::test_extras_count_a_stored_run_even_with_no_guard_record",
-    "seconds": 19.3
+    "outcome": "not run at 232ff66, the CEO's deadline",
+    "killed_by": "",
+    "run_at": ""
   },
   {
     "id": "PUB-review",
     "rule": "the review status not read",
-    "outcome": "killed",
-    "killed_by": "FAILED tests/unit/test_unit_scripts.py::test_the_review_status_of_this_head_is_in_the_extras",
-    "seconds": 21.4
+    "outcome": "not run at 232ff66, the CEO's deadline",
+    "killed_by": "",
+    "run_at": ""
   },
   {
     "id": "PUB-refused",
     "rule": "F10 a refused read stops the report",
-    "outcome": "killed",
-    "killed_by": "FAILED tests/unit/test_unit_scripts.py::test_a_refused_read_of_statuses_says_unknown_and_blocks_nothing",
-    "seconds": 19.3
+    "outcome": "not run at 232ff66, the CEO's deadline",
+    "killed_by": "",
+    "run_at": ""
   },
   {
     "id": "PUB-author",
     "rule": "the context lacks the author",
-    "outcome": "killed",
-    "killed_by": "FAILED tests/unit/test_unit_scripts.py::test_context_holds_every_sha_and_config_hash",
-    "seconds": 3.3
+    "outcome": "not run at 232ff66, the CEO's deadline",
+    "killed_by": "",
+    "run_at": ""
   },
   {
     "id": "PUB-untrusted",
     "rule": "F7 untrusted reports not said",
-    "outcome": "killed",
-    "killed_by": "FAILED tests/unit/test_unit_scripts.py::test_extras_read_no_stored_run_when_the_reports_cannot_be_trusted",
-    "seconds": 18.6
+    "outcome": "not run at 232ff66, the CEO's deadline",
+    "killed_by": "",
+    "run_at": ""
   },
   {
     "id": "PUB-rounds-read",
     "rule": "F7 untrusted reports read",
-    "outcome": "killed",
-    "killed_by": "FAILED tests/unit/test_unit_scripts.py::test_extras_read_no_stored_run_when_the_reports_cannot_be_trusted",
-    "seconds": 18.8
+    "outcome": "not run at 232ff66, the CEO's deadline",
+    "killed_by": "",
+    "run_at": ""
   },
   {
     "id": "PUB-direct",
     "rule": "a direct push not flagged",
-    "outcome": "killed",
-    "killed_by": "FAILED tests/unit/test_unit_scripts.py::test_a_direct_push_since_the_baseline_is_flagged",
-    "seconds": 17.5
+    "outcome": "not run at 232ff66, the CEO's deadline",
+    "killed_by": "",
+    "run_at": ""
   },
   {
     "id": "PUB-review-file",
     "rule": "F8 a merge changing the review",
-    "outcome": "killed",
-    "killed_by": "FAILED tests/unit/test_unit_scripts.py::test_a_merge_that_changed_the_security_review_is_flagged_however_green",
-    "seconds": 21.5
+    "outcome": "not run at 232ff66, the CEO's deadline",
+    "killed_by": "",
+    "run_at": ""
   },
   {
     "id": "PUB-owner",
     "rule": "anyone's /time comment counts",
-    "outcome": "killed",
-    "killed_by": "FAILED tests/unit/test_unit_scripts.py::test_extras_count_only_the_owners_time_comments",
-    "seconds": 4.3
+    "outcome": "not run at 232ff66, the CEO's deadline",
+    "killed_by": "",
+    "run_at": ""
   },
   {
     "id": "PUB-proposal",
     "rule": "a proposal posted with bare mentions",
-    "outcome": "killed",
-    "killed_by": "FAILED tests/unit/test_unit_scripts.py::test_the_models_proposal_is_posted_neutralized_and_a_missing_one_does_nothing",
-    "seconds": 23.5
+    "outcome": "not run at 232ff66, the CEO's deadline",
+    "killed_by": "",
+    "run_at": ""
   },
   {
     "id": "PUB-hide",
     "rule": "an empty deny list passes",
-    "outcome": "killed",
-    "killed_by": "FAILED tests/unit/test_unit_scripts.py::test_hide_paths_refuses_an_empty_deny_list",
-    "seconds": 5.9
+    "outcome": "not run at 232ff66, the CEO's deadline",
+    "killed_by": "",
+    "run_at": ""
   },
   {
     "id": "WF-config-store",
     "rule": "--config dropped from the store",
     "outcome": "killed",
     "killed_by": "FAILED tests/unit/test_unit_workflows.py::test_the_archive_writes_to_github_only_through_the_api",
-    "seconds": 1.2
+    "run_at": "2026-11-03, this code unchanged since"
   },
   {
     "id": "WF-config-append",
     "rule": "--config dropped from the append",
     "outcome": "killed",
     "killed_by": "FAILED tests/unit/test_unit_workflows.py::test_the_archive_writes_to_github_only_through_the_api",
-    "seconds": 0.9
+    "run_at": "2026-11-03, this code unchanged since"
   },
   {
     "id": "WF-review-copy",
     "rule": "security-review.md never copied",
     "outcome": "killed",
     "killed_by": "FAILED tests/unit/test_unit_workflows.py::test_the_security_review_used_is_the_default_branchs_copy",
-    "seconds": 1.3
+    "run_at": "2026-11-03, this code unchanged since"
   },
   {
     "id": "WF-review-remove",
     "rule": "the PR's own security review stays",
     "outcome": "killed",
     "killed_by": "FAILED tests/unit/test_unit_workflows.py::test_a_prs_own_security_review_is_removed_when_the_default_branch_has_none",
-    "seconds": 1.4
+    "run_at": "2026-11-03, this code unchanged since"
   },
   {
     "id": "WF-head-off",
     "rule": "the head check turned off",
     "outcome": "killed",
     "killed_by": "FAILED tests/unit/test_unit_workflows.py::test_a_fix_is_one_at_a_time_and_stops_when_the_head_moved",
-    "seconds": 1.1
+    "run_at": "2026-11-03, this code unchanged since"
   },
   {
     "id": "WF-head-swallowed",
     "rule": "the head check swallowed",
     "outcome": "killed",
     "killed_by": "FAILED tests/unit/test_unit_workflows.py::test_a_fix_is_one_at_a_time_and_stops_when_the_head_moved",
-    "seconds": 1.1
+    "run_at": "2026-11-03, this code unchanged since"
   },
   {
     "id": "WF-trusted-move",
     "rule": "the prompt left for the wiping checkout",
     "outcome": "killed",
     "killed_by": "FAILED tests/unit/test_unit_workflows.py::test_the_trusted_copy_leaves_the_working_folder_before_the_checkout_that_wipes_it",
-    "seconds": 1.1
+    "run_at": "2026-11-03, this code unchanged since"
   },
   {
     "id": "WF-spec-copy",
     "rule": "F5 the code beside the spec-test author",
     "outcome": "killed",
     "killed_by": "FAILED tests/unit/test_unit_workflows.py::test_the_spec_test_author_never_has_the_default_branchs_code_beside_it",
-    "seconds": 1.2
+    "run_at": "2026-11-03, this code unchanged since"
   },
   {
     "id": "WF-run-actors",
     "rule": "F7 the guard reads unchecked",
     "outcome": "killed",
     "killed_by": "FAILED tests/unit/test_unit_workflows.py::test_stored_runs_are_fetched_only_after_the_check",
-    "seconds": 1.2
+    "run_at": "2026-11-03, this code unchanged since"
   },
   {
     "id": "WF-publish-actors",
     "rule": "F7 extras not given the check",
     "outcome": "killed",
     "killed_by": "FAILED tests/unit/test_unit_workflows.py::test_stored_runs_are_fetched_only_after_the_check",
-    "seconds": 1.3
+    "run_at": "2026-11-03, this code unchanged since"
   },
   {
     "id": "WF-branch",
     "rule": "F9 a branch not from the working tree",
     "outcome": "killed",
     "killed_by": "FAILED tests/unit/test_unit_workflows.py::test_the_prs_branch_comes_from_the_working_tree",
-    "seconds": 1.3
+    "run_at": "2026-11-03, this code unchanged since"
   },
   {
     "id": "REV-L1a",
     "rule": "L-1a untrusted reports reach the model",
     "outcome": "killed",
     "killed_by": "FAILED tests/spec/test_review_local.py::test_l1a_the_reports_branch_is_checked_before_the_judges_report_is_read",
-    "seconds": 18.7
+    "run_at": "2026-11-03, this code unchanged since"
   },
   {
     "id": "REV-L1-env",
     "rule": "L-1 the whole environment reaches the model",
     "outcome": "killed",
     "killed_by": "FAILED tests/spec/test_review_local.py::test_l1_the_models_environment_has_no_reviewer_variables_and_no_secret",
-    "seconds": 3.3
+    "run_at": "2026-11-03, this code unchanged since"
   },
   {
     "id": "SEC-S5-spelling",
     "rule": "S-5 another spelling of nosec",
     "outcome": "killed",
     "killed_by": "FAILED tests/spec/test_security_check.py::test_s5_each_nosec_spelling_without_a_row_exits_1[#nosec]",
-    "seconds": 29.8
+    "run_at": "2026-11-03, this code unchanged since"
   },
   {
     "id": "ARC-actor-author",
     "rule": "W-12 another author",
-    "outcome": "killed",
-    "killed_by": "FAILED tests/spec/test_archive_api.py::test_w12_a_commit_by_another_author_is_found",
-    "seconds": 91.9
+    "outcome": "not run at 232ff66, the CEO's deadline",
+    "killed_by": "",
+    "run_at": ""
   },
   {
     "id": "ARC-actor-signed",
     "rule": "W-12 an unsigned commit",
-    "outcome": "killed",
-    "killed_by": "FAILED tests/spec/test_archive_api.py::test_w12_an_unsigned_commit_is_found",
-    "seconds": 91.9
+    "outcome": "not run at 232ff66, the CEO's deadline",
+    "killed_by": "",
+    "run_at": ""
   },
   {
     "id": "ARC-actor-unknown",
     "rule": "W-12 authors unchecked",
-    "outcome": "killed",
-    "killed_by": "FAILED tests/spec/test_archive_api.py::test_w12_commits_that_cannot_be_read_give_actors_ok_false[404]",
-    "seconds": 94.4
+    "outcome": "not run at 232ff66, the CEO's deadline",
+    "killed_by": "",
+    "run_at": ""
   },
   {
     "id": "ARC-signed-body",
     "rule": "W-13 a custom author stops GitHub signing",
-    "outcome": "killed",
-    "killed_by": "FAILED tests/spec/test_archive_api.py::test_api_store_writes_the_documented_layout_and_keeps_binary_bytes",
-    "seconds": 84.5
+    "outcome": "not run at 232ff66, the CEO's deadline",
+    "killed_by": "",
+    "run_at": ""
   },
   {
     "id": "ARC-force",
     "rule": "W-4 a force move",
-    "outcome": "killed",
-    "killed_by": "FAILED tests/spec/test_archive_api.py::test_w4_an_existing_branch_is_moved_with_patch_and_force_false_on_top_of_its_head",
-    "seconds": 85.3
+    "outcome": "not run at 232ff66, the CEO's deadline",
+    "killed_by": "",
+    "run_at": ""
   },
   {
     "id": "ARC-github-remote",
     "rule": "W-11 a git push to GitHub",
-    "outcome": "killed",
-    "killed_by": "FAILED tests/spec/test_archive.py::test_w11_a_remote_on_github_exits_2_and_writes_nothing[https://github.com/example-org/example-app.git]",
-    "seconds": 76.1
+    "outcome": "not run at 232ff66, the CEO's deadline",
+    "killed_by": "",
+    "run_at": ""
   },
   {
     "id": "REP-F4",
     "rule": "F-4 another actor still ready",
     "outcome": "killed",
     "killed_by": "FAILED tests/spec/test_report_final_compare.py::test_f4_actors_not_ok_fails_the_archive_and_turns_a_ready_verdict_into_blocked",
-    "seconds": 81.9
+    "run_at": "2026-11-03, this code unchanged since"
   },
   {
     "id": "ARC-W6",
     "rule": "W-6 unsafe files stored",
-    "outcome": "killed",
-    "killed_by": "FAILED tests/spec/test_archive.py::test_w6_git_folders_in_the_artifact_are_not_stored_and_are_listed",
-    "seconds": 55.6
+    "outcome": "not run at 232ff66, the CEO's deadline",
+    "killed_by": "",
+    "run_at": ""
   },
   {
     "id": "ARC-W7",
     "rule": "W-7 too large",
-    "outcome": "killed",
-    "killed_by": "FAILED tests/spec/test_archive.py::test_w7_an_artifact_larger_than_max_bytes_is_not_stored",
-    "seconds": 61.1
+    "outcome": "not run at 232ff66, the CEO's deadline",
+    "killed_by": "",
+    "run_at": ""
   },
   {
     "id": "ARC-W5",
     "rule": "W-5 read-back skipped",
-    "outcome": "killed",
-    "killed_by": "FAILED tests/spec/test_archive.py::test_w5_read_back_notices_when_the_branch_does_not_hold_what_was_pushed",
-    "seconds": 53.8
+    "outcome": "not run at 232ff66, the CEO's deadline",
+    "killed_by": "",
+    "run_at": ""
   },
   {
     "id": "FB-D1",
     "rule": "D-1 not the head",
     "outcome": "killed",
     "killed_by": "FAILED tests/spec/test_feedback.py::test_d1_the_head_has_moved_on[workflow_run]",
-    "seconds": 5.8
+    "run_at": "2026-11-03, this code unchanged since"
   },
   {
     "id": "FB-D2",
     "rule": "D-2 another base",
     "outcome": "killed",
     "killed_by": "FAILED tests/spec/test_feedback.py::test_d2_pull_request_not_into_the_integration_branch[workflow_run]",
-    "seconds": 7.0
+    "run_at": "2026-11-03, this code unchanged since"
   },
   {
     "id": "FB-D3",
     "rule": "D-3 round cap",
     "outcome": "killed",
     "killed_by": "FAILED tests/spec/test_feedback.py::test_d3_at_the_cap_there_is_no_further_round[workflow_run]",
-    "seconds": 4.2
+    "run_at": "2026-11-03, this code unchanged since"
   },
   {
     "id": "FB-D4",
     "rule": "D-4 repeated fix",
     "outcome": "killed",
     "killed_by": "FAILED tests/spec/test_feedback.py::test_d4_repeated_fix_stored_for_this_head_stops_the_loop[workflow_run]",
-    "seconds": 5.3
+    "run_at": "2026-11-03, this code unchanged since"
   },
   {
     "id": "FB-sender",
     "rule": "R: the expected sender",
     "outcome": "killed",
     "killed_by": "FAILED tests/spec/test_feedback.py::test_issue_comment_from_another_sender_is_unexpected[someone-else]",
-    "seconds": 12.0
+    "run_at": "2026-11-03, this code unchanged since"
   },
   {
     "id": "FB-marker",
     "rule": "R: no marker",
     "outcome": "killed",
     "killed_by": "FAILED tests/spec/test_feedback.py::test_issue_comment_without_a_valid_marker_is_no_marker[no-marker-at-all-Independent review: changes requested.\\n]",
-    "seconds": 13.9
+    "run_at": "2026-11-03, this code unchanged since"
   },
   {
     "id": "FB-status",
     "rule": "R: the status is not a failure",
     "outcome": "killed",
     "killed_by": "FAILED tests/spec/test_feedback.py::test_issue_comment_status_not_failure_never_acts_whatever_the_comment_says[success]",
-    "seconds": 15.7
+    "run_at": "2026-11-03, this code unchanged since"
   },
   {
     "id": "FB-creator",
     "rule": "R: the status came from another app",
     "outcome": "killed",
     "killed_by": "FAILED tests/spec/test_feedback.py::test_issue_comment_status_created_by_someone_else_is_the_wrong_creator[statuses0]",
-    "seconds": 18.4
+    "run_at": "2026-11-03, this code unchanged since"
   },
   {
     "id": "FB-pr",
     "rule": "R: the marker's SHA on another PR",
     "outcome": "killed",
     "killed_by": "FAILED tests/spec/test_feedback.py::test_issue_comment_the_listed_pr_with_this_head_must_be_the_one_commented_on",
-    "seconds": 21.5
+    "run_at": "2026-11-03, this code unchanged since"
   },
   {
     "id": "FB-silent",
     "rule": "R: the gate answers every comment",
     "outcome": "killed",
     "killed_by": "FAILED tests/spec/test_feedback.py::test_workflow_run_from_the_wrong_workflow_or_event_is_an_unexpected_sender[other-workflow-event0]",
-    "seconds": 11.1
+    "run_at": "2026-11-03, this code unchanged since"
   },
   {
     "id": "FB-path",
     "rule": "the expected workflow",
     "outcome": "killed",
     "killed_by": "FAILED tests/spec/test_feedback.py::test_workflow_run_from_the_wrong_workflow_or_event_is_an_unexpected_sender[other-workflow-event0]",
-    "seconds": 12.3
+    "run_at": "2026-11-03, this code unchanged since"
   },
   {
     "id": "FB-mention",
     "rule": "C-5 a bare mention of the executor",
     "outcome": "killed",
     "killed_by": "FAILED tests/spec/test_feedback.py::test_d5_acts_on_a_current_head_with_round_one_and_writes_the_mention_in_backticks[workflow_run]",
-    "seconds": 1.4
+    "run_at": "2026-11-03, this code unchanged since"
   },
   {
     "id": "REV-R-marker",
     "rule": "R: no marker in the comment",
     "outcome": "killed",
     "killed_by": "FAILED tests/spec/test_review_local.py::test_l3_the_status_is_posted_first_then_the_comment_with_the_marker[pass-pass-success]",
-    "seconds": 18.6
+    "run_at": "2026-11-03, this code unchanged since"
   },
   {
     "id": "REV-L3",
     "rule": "L-3 changes requested posted as success",
     "outcome": "killed",
     "killed_by": "FAILED tests/spec/test_review_local.py::test_l3_changes_requested_posts_failure_and_a_comment_with_the_findings",
-    "seconds": 2.6
+    "run_at": "2026-11-03, this code unchanged since"
   },
   {
     "id": "REV-L5",
     "rule": "L-5 invalid output",
     "outcome": "killed",
     "killed_by": "FAILED tests/spec/test_review_local.py::test_l5_invalid_model_output_posts_nothing_and_fails_closed[not_object]",
-    "seconds": 11.7
+    "run_at": "2026-11-03, this code unchanged since"
   },
   {
     "id": "REV-L6",
     "rule": "L-6 no judge's report",
     "outcome": "killed",
     "killed_by": "FAILED tests/spec/test_review_local.py::test_l6_a_missing_input_runs_no_model_and_posts_nothing[no-judge-report-at-all-<lambda>]",
-    "seconds": 14.1
+    "run_at": "2026-11-03, this code unchanged since"
   },
   {
     "id": "HAR-H1",
     "rule": "H-1 a failed copy",
     "outcome": "killed",
     "killed_by": "FAILED tests/spec/test_concurrency_harness.py::test_h1_one_failing_copy_fails_the_whole_run",
-    "seconds": 2.4
+    "run_at": "2026-11-03, this code unchanged since"
   },
   {
     "id": "HAR-H2",
     "rule": "H-2 a hang passes",
     "outcome": "killed",
     "killed_by": "FAILED tests/spec/test_concurrency_harness.py::test_h2_a_copy_past_the_timeout_is_killed_and_reported_as_timeout",
-    "seconds": 6.7
+    "run_at": "2026-11-03, this code unchanged since"
   },
   {
     "id": "HAR-H4",
     "rule": "H-4 an exception passes",
     "outcome": "killed",
     "killed_by": "FAILED tests/spec/test_concurrency_harness.py::test_h4_an_exception_in_a_call_raises_concurrency_failure",
-    "seconds": 10.1
+    "run_at": "2026-11-03, this code unchanged since"
   },
   {
     "id": "SEC-S3",
     "rule": "S-3 unreviewed finding",
     "outcome": "killed",
     "killed_by": "FAILED tests/spec/test_security_check.py::test_s1_bandit_finding_is_read_with_rule_path_and_line",
-    "seconds": 1.8
+    "run_at": "2026-11-03, this code unchanged since"
   },
   {
     "id": "SEC-S4",
     "rule": "S-4 tool output missing",
     "outcome": "killed",
     "killed_by": "FAILED tests/spec/test_security_check.py::test_s4_missing_or_unparsable_tool_output_is_never_a_pass[missing-value0-bandit]",
-    "seconds": 10.5
+    "run_at": "2026-11-03, this code unchanged since"
   },
   {
     "id": "SEC-S5",
     "rule": "S-5 suppression without an entry",
     "outcome": "killed",
     "killed_by": "FAILED tests/spec/test_security_check.py::test_s5_added_suppression_without_a_row_exits_1[nosec]",
-    "seconds": 16.0
+    "run_at": "2026-11-03, this code unchanged since"
   },
   {
     "id": "SEC-S2",
     "rule": "S-2 a blank reason counts",
     "outcome": "killed",
     "killed_by": "FAILED tests/spec/test_security_check.py::test_s2_a_row_that_does_not_match_or_has_no_reason_does_not_review[blank-reason-row0]",
-    "seconds": 6.3
+    "run_at": "2026-11-03, this code unchanged since"
   }
 ]
