@@ -494,11 +494,12 @@ def collect_functions(source: str) -> tuple[dict[str, TestFacts], dict[str, str]
     return tests, others
 
 
-def _dotted(node: ast.AST) -> str | None:
+def _attribute_path(node: ast.AST) -> str | None:
+    """`a.b.c` for a chain that starts from a plain name, and None for anything else."""
     if isinstance(node, ast.Name):
         return node.id
     if isinstance(node, ast.Attribute):
-        base = _dotted(node.value)
+        base = _attribute_path(node.value)
         return f"{base}.{node.attr}" if base else None
     return None
 
@@ -547,7 +548,7 @@ def rebound_names(source: str) -> collections.Counter[tuple[str, str]]:
                     bound[(prefix + inner.target.id, ast.dump(statement))] += 1
         else:
             if isinstance(node, ast.Attribute) and isinstance(node.ctx, (ast.Store, ast.Del)):
-                dotted = _dotted(node)
+                dotted = _attribute_path(node)
                 if dotted:
                     # In a class body a bare name can mean that class's own attribute.
                     bound[(dotted, f"attribute: {ast.dump(statement)}")] += 1
@@ -933,7 +934,8 @@ def importable_names(files: list[str]) -> set[str]:
 
 
 def stands_in_for_a_module(path: str, test_folders: set[str], names: set[str]) -> bool:
-    """pytest puts a test's folder first on the path, so a module there replaces the real one."""
+    """pytest puts a test's folder first on the path, unless it is a package, so a module there
+    replaces the real one."""
     pure = PurePosixPath(path)
     module, folder = (pure.parent.name, pure.parent.parent) if pure.name == "__init__.py" else (pure.stem, pure.parent)
     return str(folder) in test_folders and module in names
@@ -941,12 +943,12 @@ def stands_in_for_a_module(path: str, test_folders: set[str], names: set[str]) -
 
 def new_root_shadows(git: Git, base: str, head: str, head_files: list[str]) -> list[str]:
     """New top-level names that `python -m pytest` would find before the real module."""
-    known = {PurePosixPath(path).parts[0] for path in git.files(base)}
+    known = {PurePosixPath(path).parts[0].removesuffix(".py") for path in git.files(base)}
     tools = {*sys.stdlib_module_names, *TOOL_MODULES}
     found = set()
     for path in head_files:
         parts = PurePosixPath(path).parts
-        if parts[0] in known:
+        if parts[0].removesuffix(".py") in known:
             continue
         if len(parts) == 1 and parts[0].endswith(".py") and parts[0].removesuffix(".py") in tools:
             found.add(path)
@@ -964,7 +966,8 @@ def check_what_runs(git: Git, base: str, head: str, changes: list[tuple[str, str
         result.add("PROTECTED_PATH", path, "a new top-level name that stands in for a module pytest or Python uses")
     names = importable_names(head_files)
     test_folders = {str(PurePosixPath(path).parent) for path in head_files if is_test_file(path) or is_protected(path, ["acceptance/"])}
-    test_folders -= {".", "src"}
+    packages = {str(PurePosixPath(path).parent) for path in head_files if PurePosixPath(path).name == "__init__.py"}
+    test_folders -= {".", "src", *packages}
     for status, path in changes:
         if status == "D":
             continue

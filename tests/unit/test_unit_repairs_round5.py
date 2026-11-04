@@ -6,6 +6,7 @@ or the rule would prove nothing. Links and odd names are built with git's plumbi
 
 from __future__ import annotations
 
+import ast
 import py_compile
 import subprocess
 import sys
@@ -193,6 +194,19 @@ def test_a_new_top_level_name_that_stands_in_is_refused(world, path, reported):
     refused(world, reported)
 
 
+@pytest.mark.parametrize(
+    ("before", "after"),
+    [("calendar.py", "calendar/__init__.py"), ("email/__init__.py", "email.py"), ("queue/notes.txt", "queue.py")],
+    ids=["module-to-package", "package-to-module", "folder-gains-a-module"],
+)
+def test_a_name_the_base_has_may_change_its_shape(gate, tmp_path, before, after):
+    world = World(gate, tmp_path, {"app.py": GOOD, before: "A = 1\n"})
+    (world.repo / before).unlink()
+    world.write({after: "A = 1\n"})
+    world.commit()
+    clean(world)
+
+
 def test_a_top_level_name_the_base_has_may_change(gate, tmp_path):
     world = World(gate, tmp_path, {"app.py": GOOD, "logging/__init__.py": "A = 1\n", "queue.py": "B = 1\n"})
     world.write({"logging/__init__.py": "A = 2\n", "queue.py": "B = 2\n"})
@@ -247,6 +261,32 @@ def test_other_new_modules_are_ordinary(world, path):
     world.write({path: "VALUE = 1\n"})
     world.commit()
     clean(world)
+
+
+@pytest.mark.parametrize(
+    ("base_files", "new"),
+    [
+        ({"src/app/__init__.py": "", "src/app/test_core.py": TEST}, "src/app/types.py"),
+        ({"src/app/__init__.py": "", "src/app/test_core.py": TEST}, "src/app/http/__init__.py"),
+        ({"tests/__init__.py": "", "tests/test_a.py": TEST, "utils.py": "A = 1\n"}, "tests/utils.py"),
+        ({"tests/__init__.py": "", "tests/test_a.py": TEST}, "tests/random.py"),
+    ],
+    ids=["module-in-a-package", "package-in-a-package", "named-like-a-root-module", "named-like-the-standard-library"],
+)
+def test_a_module_inside_a_package_stands_in_for_nothing(gate, tmp_path, base_files, new):
+    world = World(gate, tmp_path, {"app.py": GOOD, **base_files})
+    world.write({new: "A = 1\n"})
+    world.commit()
+    clean(world)
+
+
+def test_in_a_package_a_module_really_does_not_shadow(gate, tmp_path):
+    """Real pytest: with __init__.py the standard library's module is the one imported."""
+    test = "import wave\n\n\ndef test_real_module():\n    assert hasattr(wave, 'open')\n"
+    world = World(gate, tmp_path, {"tests/__init__.py": "", "tests/test_w.py": test})
+    world.write({"tests/wave.py": "VALUE = 1\n"})
+    world.commit()
+    assert world.real_pytest("tests") == 0
 
 
 def test_a_conftest_in_a_test_folder_stays_marked_not_refused(gate, tmp_path):
@@ -428,6 +468,52 @@ def test_rebinding_with_a_star_import_turns_a_failure_green_and_is_refused(world
     assert world.real_pytest("tests") == 0, "this attack must work, or the test proves nothing"
     code, _guard = world.guard()
     assert code == 1
+
+
+# C-2: the guard reads ordinary test code without a traceback (R6-M1).
+
+
+@pytest.mark.parametrize(
+    "call",
+    ['",".join(["a"])', "make().value()", "items[0].run()", "make()()", 'Path("x").read_text()', 'self.client.get("/").json()', "(a or b).c()", "x.y.z()", "plain()"],
+)
+def test_a_changed_test_with_any_form_of_a_call_gets_an_answer(gate, tmp_path, call):
+    source = f"def test_a():\n    assert {call} == 1\n"
+    world = World(gate, tmp_path, {"tests/test_a.py": source})
+    world.write({"tests/test_a.py": source + "\n\ndef test_b():\n    assert 1 + 1 == 2\n"})
+    world.commit()
+    clean(world)
+
+
+def test_a_weakened_test_with_a_chained_call_is_still_seen(gate, tmp_path):
+    world = World(gate, tmp_path, {"tests/test_a.py": 'def test_a():\n    assert ",".join(["a"]) == "a"\n'})
+    world.write({"tests/test_a.py": 'def test_a():\n    ",".join(["a"])\n'})
+    world.commit()
+    code, guard = world.guard()
+    assert code == 1
+    assert ("TEST_WEAKENED", "tests/test_a.py") in rules_of(guard)
+
+
+def test_the_guard_reads_every_test_file_of_this_repository(gate):
+    """Ordinary code, far more varied than any list above. A crash here once hit 29 of 42 files."""
+    sys.path.insert(0, str(gate.root))
+    try:
+        from gate.guard import collect_functions, rebound_names
+    finally:
+        sys.path.remove(str(gate.root))
+    files = sorted((gate.root / "tests").rglob("*.py"))
+    assert len(files) > 40
+    for path in files:
+        source = path.read_text(encoding="utf-8")
+        collect_functions(source)
+        rebound_names(source)
+
+
+def test_no_module_of_the_gate_defines_a_function_twice(gate):
+    """A second definition silently replaces the first for the whole module, as R6-M1 did."""
+    for path in sorted((gate.root / "gate").glob("*.py")):
+        names = [node.name for node in ast.parse(path.read_text(encoding="utf-8")).body if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef, ast.ClassDef))]
+        assert len(names) == len(set(names)), f"{path.name}: {sorted(name for name in names if names.count(name) > 1)}"
 
 
 # G-4: a byte-order mark.

@@ -47,7 +47,7 @@ What the gate does not do or does not prove, written down rather than dropped. E
 - **L29, code that changes pytest from inside.** A test file or a helper can rebind a test dynamically (`globals()`, `setattr`, `sys.modules`, `exec`, a class decorator, a metaclass, or an attribute set through another name) or monkeypatch pytest when imported, and the application's own modules can do the same when a test imports them. Static reading does not see this; design section 11 does not claim to stop a deliberate adversary. R-11 and A-11 still see a test that goes missing.
 - **L30, plugin declarations left.** `setup.py` with `entry_points` passes, as before. A `[tool.setuptools.dynamic]` change with `project.dynamic` already naming `entry-points` passes, marked in the root. Both matter only where `setup` installs the project; plain metadata files are refused by G-1f.
 - **L31, `post-proposal` at the edges.** It does not `fstat` what it opened, so a process the model left running can swap the file after the check, or hang the step on a pipe until the job's time limit. `O_NOFOLLOW` guards the last part of the path only, and `executor.yml` passes a bare name. Only `GATE_TOKEN` is in that step's environment, so the value test cannot fire for the other four names. A cut after `neutralize` can leave a trailing mention without its closing backtick. An entry naming a private key's header line of a test key is refused, and the proposal is lost.
-- **L32, `gate.reproduce` and URLs.** `ssh.github.com`, `github.com.` and ssh aliases count as other remotes, so the authors' check is skipped with a note. A private repository cannot be rerun with this command, and an ssh agent or a git credential helper reachable from the machine is not looked for.
+- **L32, `gate.reproduce` and URLs.** `make reproduce` echoes its command, `REPO` included, and runs `apt-get` and `pip` before `gate.reproduce` refuses a credential or a secret. `ssh.github.com`, `github.com.` and ssh aliases count as other remotes, so the authors' check is skipped with a note. A private repository cannot be rerun with this command, and an ssh agent or a git credential helper reachable from the machine is not looked for.
 - **L33, the first known-failing list.** A spec PR adding the first list may name an old test, because the rule compares with a list in the base. G-12 stops it when a stored pass exists.
 - **L34, rootdir moved by a plain file.** A subfolder's `pyproject.toml` with only `[project]` moves pytest's rootdir, and the root `conftest.py` is not loaded. R-11 should notice through the IDs; this exact case was not run through `gate/tests`.
 - **L35, a base already broken.** A broken root `pyproject.toml`, or a root `setup.cfg` that cannot be parsed, refuses every change, the repair included. A person's PR can make it.
@@ -60,6 +60,18 @@ What the gate does not do or does not prove, written down rather than dropped. E
 - **L39** Under `acceptance/`, test data named like a control file (`acceptance/data/tox.ini` that mentions pytest, `acceptance/data/proj/conftest.py`) is refused, as G-11b says. Renaming it is the way out.
 - **L40** G-1g and G-1h go by names in the pinned Python's list and in the gate's tools. A tool's dependency not named there, and a module of the application's dependencies, can still be stood in for.
 - **L41** G-1h judges only a new file. A shadow the base already has stays, and a change to it is not refused.
+
+## Carried from review round 6 (the CEO's answer of 2026-11-04)
+
+- **L42** A `.py` file nested too deeply to parse, such as a 1100-term string chain, gives `RecursionError`, a traceback and exit 1. It fails red.
+- **L43** A file named `:(bad)odd` gives exit 2 and no `guard.json`. A plain `:x.py` with `# noqa`, or a plain `:x.yml` with an unpinned action, passes G-5 and G-10, because `added_lines` hands the name to git as a pathspec. pytest does not collect such a name.
+- **L44** For a path name that is not valid UTF-8, `git.show` finds nothing, so G-1e, G-1h and G-1i are skipped for it. G-1d still sees a link or a submodule there. Whether pytest on Linux would collect such a file was not checked.
+- **L45** G-1f also refuses a plain file whose own name ends in `.egg` or `.dist-info`, which the text does not name.
+- **L46** G-4 does not read a function's return annotation, so `def h() -> (test_a := None): pass` passes.
+- **L47** An unparsable `.py` that mentions `pytest_plugins` in a comment is refused, though a mention in a comment is no violation in a file that parses.
+- **L48** G-1i and X-0b go by words. On a direct `gate.reproduce`, `TOKENIZERS_PARALLELISM`, `TIKTOKEN_CACHE_DIR` or `PASSWORD_STORE_DIR` stop the run, and unsetting them clears it. A secret under another name, such as `GH_PAT` or `DATABASE_URL` holding a password, reaches PR code. `make reproduce` forwards none of them. `git+ssh://git@host/x` is refused as holding a credential.
+- **L49** If an application adds `junit` to `gate/acceptance`, a listed failure turns it red. The example does not.
+- **L50** Measured under heavy load on Windows: 5,000 files with 500 changed took 390 s (287 s before these rules), so about 385 changed files would hit `gate/guard`'s `timeout_seconds = 300` on this machine. Ubuntu was not measured.
 
 ## Open until a real run
 
