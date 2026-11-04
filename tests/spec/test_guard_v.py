@@ -7,8 +7,8 @@ from __future__ import annotations
 import pytest
 
 from gatekit import write_text
-from guardkit import (BASE, EXECUTOR, PERSON, PYPROJECT, REVIEWER, SETUP_CFG, TEST_EXTRA, TOX_INI, Case, assert_clean,
-                      assert_fires, commit_app, lines_file, of, rules, run_store, sub)
+from guardkit import (BASE, EXECUTOR, FREE_SETUP_CFG, FREE_TOX_INI, PERSON, PYPROJECT, REVIEWER, SETUP_CFG, TEST_EXTRA,
+                      TOX_INI, Case, assert_clean, assert_fires, commit_app, lines_file, of, rules, run_store, sub)
 
 HARM = {"SPEC.md": "# edited by someone who may not\n", "tests/test_app.py": None}   # G-1 and G-2 in an ai PR
 
@@ -221,8 +221,7 @@ SECTION_EDITS = [
     # (id, file, old text, new text)  -- every one is a changed, added or removed section named in G-1b
     ("pyproject-tool-pytest-changed", "pyproject.toml", 'addopts = "--cov-fail-under=90"', 'addopts = "--cov-fail-under=90 -x"'),
     ("pyproject-tool-coverage-changed", "pyproject.toml", "fail_under = 90", "fail_under = 95"),
-    ("pyproject-tool-section-added", "pyproject.toml", "other_limit = 70\n", "other_limit = 70\n\n[tool.ruff]\nline-length = 100\n"),
-    ("pyproject-tool-section-removed", "pyproject.toml", "\n[tool.example]\nmin_score = 50\nother_limit = 70\n", ""),
+    # [tool.ruff] added or removed is no longer refused: in the root it is marked for the code owner (G-1b-mark, see test_guard_r4.py)
     ("setup-cfg-tool-pytest", "setup.cfg", "addopts = -q", "addopts = -q -x"),
     ("setup-cfg-coverage", "setup.cfg", "branch = True", "branch = False"),
     ("setup-cfg-bandit", "setup.cfg", "skips = B101", "skips = B101,B602"),
@@ -254,53 +253,60 @@ def test_g1b_a_changed_added_or_removed_section_of_a_root_config_file_is_protect
 OTHER_SECTION_EDITS = [
     ("pyproject-project", "pyproject.toml", 'name = "example"', 'name = "example-two"'),
     ("pyproject-build-system-added", "pyproject.toml", "[project]", "[build-system]\nrequires = []\n\n[project]"),
-    ("setup-cfg-metadata", "setup.cfg", "name = example", "name = example-two"),
-    ("setup-cfg-options", "setup.cfg", "packages = find:", "packages = find:\npython_requires = >=3.13"),
-    ("tox-ini-docs", "tox.ini", "note = nothing", "note = something"),
+    ("pyproject-tool-ruff-changed", "pyproject.toml", "line-length = 100", "line-length = 120"),
 ]
+# (the old cases setup-cfg-metadata, setup-cfg-options and tox-ini-docs edited files that mention pytest, which G-1b now
+# refuses whatever the section: they became proofs of the mention rule in test_guard_r4.py)
 
 
-@pytest.mark.req("G-1b")
+@pytest.mark.req("G-1b", "G-1b-mark")
 @pytest.mark.parametrize("name,path,old,new", OTHER_SECTION_EDITS, ids=[e[0] for e in OTHER_SECTION_EDITS])
-def test_g1b_control_a_change_to_any_other_section_is_allowed(tmp_path, baseline, name, path, old, new):
+def test_g1b_control_a_change_to_any_other_section_is_allowed_and_marked_in_the_root(tmp_path, baseline, name, path, old, new):
     case = Case(tmp_path, baseline)
     case.change({path: sub(BASE[path], old, new)})
     res, d = case.run()
     assert_clean(res, d)
+    assert path in d["needs_code_owner"], "in the root an allowed change to these files goes to the code owner (G-1b-mark)"
 
 
 SUBFOLDER_FILES = {"sub/pyproject.toml": PYPROJECT, "sub/setup.cfg": SETUP_CFG, "sub/tox.ini": TOX_INI}
 
 
+SUBFOLDER_PYTEST_EDITS = {
+    "sub/pyproject.toml": ('addopts = "--cov-fail-under=90"', 'addopts = "--cov-fail-under=90 -x"'),   # [tool.pytest.ini_options]
+    "sub/setup.cfg": ("addopts = -q", "addopts = -q -x"),                                          # the file mentions pytest
+    "sub/tox.ini": ("[pytest]\naddopts = -q", "[pytest]\naddopts = -q -x"),                          # the file mentions pytest
+}
+
+
 @pytest.mark.req("G-1b")
 @pytest.mark.parametrize("path", list(SUBFOLDER_FILES))
-def test_g1b_the_three_files_are_watched_by_section_in_any_folder(tmp_path, baseline, path):
-    # pytest reads these three in every folder from a test's path upwards, so a subfolder's file counts like the root's
+def test_g1b_what_pytest_reads_is_refused_in_a_subfolder_too(tmp_path, baseline, path):
+    # pytest reads these three in every folder from a test's path upwards
     original = SUBFOLDER_FILES[path]
-    changed = original.replace("-q", "-x").replace("fail_under = 90", "fail_under = 95").replace("branch = True", "branch = False")
-    assert changed != original
+    old, new = SUBFOLDER_PYTEST_EDITS[path]
     case = Case(tmp_path, baseline, base_edits={path: original})
-    case.change({path: changed})
+    case.change({path: sub(original, old, new)})
     res, d = case.run()
     assert_fires(res, d, "PROTECTED_PATH", path)
 
 
 SUBFOLDER_OTHER_SECTIONS = {
-    "sub/pyproject.toml": ('name = "example"', 'name = "example-two"'),
-    "sub/setup.cfg": ("name = example", "name = example-two"),
-    "sub/tox.ini": ("note = nothing", "note = something"),
+    "sub/pyproject.toml": (PYPROJECT, 'name = "example"', 'name = "example-two"'),
+    "sub/setup.cfg": (FREE_SETUP_CFG, "name = example", "name = example-two"),
+    "sub/tox.ini": (FREE_TOX_INI, "note = nothing", "note = something"),
 }
 
 
-@pytest.mark.req("G-1b")
+@pytest.mark.req("G-1b", "G-1b-mark")
 @pytest.mark.parametrize("path", list(SUBFOLDER_OTHER_SECTIONS))
-def test_g1b_control_another_section_of_the_same_files_in_a_subfolder_stays_allowed(tmp_path, baseline, path):
-    original = SUBFOLDER_FILES[path]
-    old, new = SUBFOLDER_OTHER_SECTIONS[path]
+def test_g1b_control_another_section_of_the_same_files_in_a_subfolder_is_neither_refused_nor_marked(tmp_path, baseline, path):
+    original, old, new = SUBFOLDER_OTHER_SECTIONS[path]
     case = Case(tmp_path, baseline, base_edits={path: original})
     case.change({path: sub(original, old, new)})
     res, d = case.run()
     assert_clean(res, d)
+    assert path not in d["needs_code_owner"], "in a subfolder an ordinary change is not even marked"
 
 
 ENTRY_POINTS = '\n[project.entry-points.pytest11]\nexample = "example.plugin"\n'
@@ -330,6 +336,7 @@ def test_g1b_control_another_entry_points_group_or_scripts_is_allowed(tmp_path, 
     case.change({"pyproject.toml": text})
     res, d = case.run()
     assert_clean(res, d)
+    assert "pyproject.toml" in d["needs_code_owner"], "an allowed root change is marked (G-1b-mark)"
 
 
 UNPARSABLE = [

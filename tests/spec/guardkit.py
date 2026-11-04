@@ -119,6 +119,64 @@ addopts = "--cov-fail-under=90"
 [tool.example]
 min_score = 50
 other_limit = 70
+
+[tool.ruff]
+line-length = 100
+
+[tool.poetry]
+name = "example"
+'''
+
+# The same three kinds of file without the word pytest anywhere (decision X: G-1b looks at that word in setup.cfg and tox.ini)
+FREE_PYPROJECT = '''[project]
+name = "example"
+
+[tool.ruff]
+line-length = 100
+
+[tool.poetry]
+name = "example"
+'''
+
+FREE_SETUP_CFG = '''[metadata]
+name = example
+
+[options]
+packages = find:
+
+[flake8]
+max-line-length = 100
+
+[mypy]
+strict = True
+
+[coverage:run]
+branch = True
+
+[bandit]
+skips = B101
+'''
+
+FREE_TOX_INI = '''[tox]
+envlist = py313
+
+[testenv]
+commands = python -m unittest
+
+[testenv:lint]
+commands = flake8
+
+[coverage:run]
+branch = True
+
+[bandit]
+skips = B101
+
+[flake8]
+max-line-length = 100
+
+[docs]
+note = nothing
 '''
 
 SETUP_CFG = '''[metadata]

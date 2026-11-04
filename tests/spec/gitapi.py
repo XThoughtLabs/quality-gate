@@ -26,8 +26,9 @@ def blob_sha(data: bytes) -> str:
 
 
 class FakeGitApi:
-    def __init__(self, stub, repo: str = DEFAULT_REPO, token: str = DEFAULT_TOKEN):
+    def __init__(self, stub, repo: str = DEFAULT_REPO, token: str = DEFAULT_TOKEN, *, ignore_case: bool = False):
         self.stub, self.repo, self.token = stub, repo, token
+        self.ignore_case = ignore_case   # GitHub treats OWNER/NAME without regard to letter case
         self.blobs: dict[str, bytes] = {}
         self.trees: dict[str, dict[str, tuple[str, str, str]]] = {}   # tree id -> {path: (mode, type, blob sha)}
         self.commits: dict[str, dict] = {}                              # commit sha -> {tree, parents, author, verified, n}
@@ -91,6 +92,17 @@ class FakeGitApi:
         self.branches[branch] = sha
         return sha
 
+    def mirror(self, commits, *, branch: str = "reports", foreign=None) -> None:
+        """Show the API a branch that real git holds. `commits` is [(sha, [parent shas])], oldest first; `foreign` maps a
+        sha to (author login, verified) for the commits that were not made by the bot."""
+        empty = self._put_tree({})
+        for sha, parents in commits:
+            author, verified = (foreign or {}).get(sha, (BOT, True))
+            self._n += 1
+            self.commits[sha] = {"tree": empty, "parents": list(parents), "message": "mirrored", "author": author,
+                                 "verified": verified, "n": self._n}
+        self.branches[branch] = commits[-1][0]
+
     def reachable(self, branch: str = "reports") -> list[str]:
         head, seen, stack = self.branches.get(branch), set(), []
         if head:
@@ -124,6 +136,8 @@ class FakeGitApi:
 
     def _register(self):
         s, base = self.stub, "/repos/" + re.escape(self.repo)
+        if self.ignore_case:
+            base = f"(?i:{base})"
 
         def guarded(fn):
             def handler(req):

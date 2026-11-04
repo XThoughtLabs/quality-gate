@@ -780,14 +780,16 @@ def test_g11_spec_pr_touching_outside_acceptance_fires_only_g11(tmp_path, baseli
     case.change({path: "changed\n"})
     res, d = case.run()
     assert_fires(res, d, "SPEC_OUTSIDE_ACCEPTANCE", path)
-    assert set(rules(d)) == {"SPEC_OUTSIDE_ACCEPTANCE"}, "G-1 to G-10 do not apply to spec PRs"
+    assert set(rules(d)) == {"SPEC_OUTSIDE_ACCEPTANCE"}, "G-1 and G-5 to G-9 do not apply to spec PRs, and G-2 to G-4a reach only acceptance/ (G-11a)"
 
 
-@pytest.mark.req("G-11")
-def test_g11_control_acceptance_only_is_clean_even_with_things_g2_g5_would_flag(tmp_path, baseline):
+@pytest.mark.req("G-11", "G-11a")
+def test_g11_control_acceptance_only_is_clean_even_with_things_g5_to_g9_would_flag(tmp_path, baseline):
+    # G-11a brings G-2, G-3, G-4 and G-4a to a spec PR; G-5 to G-9 still do not apply to it
     case = Case(tmp_path, baseline, branch="spec/tests-1")
-    weakened = "import os  # noqa\n\n\ndef test_permissions():\n    assert True\n"
-    case.change({"acceptance/test_status.py": weakened, "acceptance/test_search.py": "def test_find():\n    assert 1 == 1\n"})
+    case.change({"acceptance/test_status.py": "import os  # noqa\n" + ACC_STATUS,        # G-5 would flag the noqa
+                 "acceptance/test_search.py": "def test_find():\n    assert 1 == 1\n",    # a new test is always fine
+                 "acceptance/helper.py": "x: int = 'a'  # type: ignore\n"})
     res, d = case.run()
     assert_clean(res, d)
 
