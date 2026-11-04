@@ -173,13 +173,15 @@ class GitRemote:
 class ApiRemote:
     """The branch on GitHub, written through the API so that GitHub signs each commit."""
 
-    def __init__(self, repository: str, branch: str, base: str | None = None, token: str | None = None) -> None:
+    def __init__(self, repository: str, branch: str, base: str | None = None, token: str | None = None, must_exist: bool = False) -> None:
         self.repository = repository
         self.branch = branch
+        self.must_exist = must_exist
         self.base = (base or os.environ.get("GITHUB_API_URL", "https://api.github.com")).rstrip("/")
         self.token = os.environ.get("GATE_TOKEN", "") if token is None else token
         self.head: str | None = None
         self.head_tree: str | None = None
+        self.listed: set[str] = set()
 
     def _call(self, method: str, route: str, body: Any = None) -> Any:
         data = json.dumps(body).encode() if body is not None else None
@@ -276,17 +278,20 @@ class ApiRemote:
     def foreign_commits(self, accepted: dict[str, dict]) -> tuple[list[str], list[str]]:
         """Each commit not written and signed for github-actions[bot], and those accepted of them."""
         if self._read_head() is None:
+            if self.must_exist:
+                raise RemoteError("the branch exists, and the API does not show it")
             return [], []
         foreign: list[str] = []
         found: list[str] = []
         for page in range(1, COMMIT_PAGES + 1):
             commits = self._safe("GET", f"/commits?sha={self.branch}&per_page=100&page={page}")
             for item in commits:
+                sha = str(item.get("sha"))
+                self.listed.add(sha)
                 author = (item.get("author") or {}).get("login")
                 verified = ((item.get("commit") or {}).get("verification") or {}).get("verified")
                 if author == EXPECTED_AUTHOR and verified is True:
                     continue
-                sha = str(item.get("sha"))
                 if sha in accepted and self._only_adds_records(sha):
                     found.append(sha)
                 else:

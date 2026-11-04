@@ -158,8 +158,12 @@ Exit 1 when `violations` is non-empty, otherwise 0.
 **Rules for `ai` PRs:**
 
 - **G-1 `PROTECTED_PATH`.** Touching any of these, added, changed or deleted, in any letter case: `.github/`, `acceptance/`, `quality.toml`, `CODEOWNERS`, `SPEC.md`, `TASK.md`, `BASELINE.md`, `OPEN-ISSUES.md`, `SOURCE-MANIFEST.json`, `evidence/`, `security-review.md`, and everything in `guard.extra_protected`. A renamed file is checked under both names.
-- **G-1a What controls the tests and the security tools (decisions W and X), also `PROTECTED_PATH`.** In any folder: `pytest.toml`, `.pytest.toml`, `pytest.ini`, `.pytest.ini`, `.bandit`, `bandit.yaml`, `bandit.yml`, `.gitleaks.toml`, `.gitleaksignore`. In the root only: `conftest.py`, `pytest.py`, `pytest/`, `_pytest/`. The pytest names come from `CONFIG_LOADERS_BY_NAME` in `_pytest/config/findpaths.py` of pytest 9.2.0, the pinned version, which reads them in every folder from a test's path upwards. A change of the pinned version means checking this list again.
-- **G-1b Sections, also `PROTECTED_PATH`.** A changed section, added, changed or removed, in a `pyproject.toml` (`[tool.*]`, `[project.entry-points.pytest11]`), `setup.cfg` (`[tool:*]`, `[coverage:*]`, `[bandit]`, `[flake8]`, `[mypy*]`) or `tox.ini` (`[pytest]`, `[tox*]`, `[testenv*]`, `[coverage:*]`, `[bandit]`, `[flake8]`, `[mypy*]`), in any folder, because pytest reads those three in every folder too. A change to any other section of those files is allowed. A file that cannot be parsed counts as changed.
+- **G-1a What controls the tests and the security tools (decisions W and X), also `PROTECTED_PATH`.** In any folder: `pytest.toml`, `.pytest.toml`, `pytest.ini`, `.pytest.ini`, `.bandit`, `bandit.yaml`, `bandit.yml`, `.gitleaks.toml`, `.gitleaksignore`. In the root only: `conftest.py`, `pytest.py`, `pytest/`, `_pytest/`. The pytest names come from `CONFIG_LOADERS_BY_NAME` in `_pytest/config/findpaths.py` of pytest 9.2.0, the pinned version, which looks for them upwards from the common ancestor of its arguments and from each argument, so any folder a command names can hold one. A change of the pinned version means checking this list again.
+- **G-1b Sections, also `PROTECTED_PATH`.** What pytest reads is refused, and what it does not read stays an ordinary change.
+  - In any folder: a `tox.ini` or a `setup.cfg` that changed and mentions `pytest`, in any letter case, before or after the change. Their sections are not parsed for this, because pytest reads these files with its own parser, which cuts lines and section names differently.
+  - In any folder: a changed `[tool.pytest]`, or any table under it such as `[tool.pytest.ini_options]`, or a changed `[project.entry-points.pytest11]`, in a `pyproject.toml`; or a `pyproject.toml` that cannot be parsed and mentions `pytest`.
+  - In the root only: a changed `[tool.coverage]`, `[tool.bandit]`, `[tool.tox]`, `[tool.semgrep]`, `[tool.gitleaks]`, `[tool.pip-audit]` or `[tool.pip_audit]`, or any table under them, in `pyproject.toml`; `[coverage:*]` or `[bandit]` in `setup.cfg`; `[tox*]`, `[testenv*]`, `[coverage:*]` or `[bandit]` in `tox.ini`; a root file of these three that cannot be parsed.
+- **G-1b-mark** In the root, any other change to those three files, such as `[tool.ruff]`, `[tool.poetry]`, `[project]` or `[flake8]`, is no violation. Its path goes into `needs_code_owner`. In a subfolder, a change that the rules above do not name is ordinary, and is neither refused nor marked.
 - **G-1c** A change to any other `conftest.py` is no violation. Its path goes into `needs_code_owner`.
 - **G-2 `TEST_DELETED`.** A test file (`test_*.py`, `*_test.py`, or any `.py` under a `tests/` folder) deleted, or a test present in the base and absent in the head. A test is a function whose name starts with `test_`, or a method whose name starts with `test`.
 - **G-3 `TEST_SKIPPED`.** A `test_*` function present in the base that gains `pytest.mark.skip`, `pytest.mark.skipif`, `pytest.mark.xfail`, `unittest.skip`, a `pytest.skip(` call or a `pytest.xfail(` call. A reason line does not excuse this.
@@ -184,6 +188,7 @@ Exit 1 when `violations` is non-empty, otherwise 0.
 **Rules for `spec` PRs:**
 
 - **G-11 `SPEC_OUTSIDE_ACCEPTANCE`.** Touching anything outside `acceptance/`.
+- **G-11a** G-2, G-3, G-4 and G-4a also apply to the test files under `acceptance/`: a spec PR adds tests, and it cannot take one away or weaken one unseen.
 
 **Rules for `other` PRs:** only G-12 to G-14 apply.
 
@@ -195,7 +200,7 @@ Exit 1 when `violations` is non-empty, otherwise 0.
 - **G-13 `KNOWN_FAILING_ADD_NOT_ALLOWED`.** An entry added on a PR that is not `spec`. When the base already has a list, also: an added entry whose map ID is not `DEF-*`, or whose test function already exists in the base. A `spec` PR that introduces the first list may map entries to any valid ID.
 - **G-14 `KNOWN_FAILING_REMOVED_NOT_PASSED`.** An entry removed without a stored pass.
 
-G-1 to G-9 do not apply to `spec` PRs; G-10 does.
+G-1 and G-5 to G-9 do not apply to `spec` PRs; G-10 does.
 
 ## 6. `gate.security_check`
 
@@ -327,13 +332,15 @@ The GitHub side of the judge: `context`, `jobs`, `extras`, `post-checks`, `post-
 - **P-4 (F9)** `create-pull-request --branch NAME --prefix TEXT --base BRANCH` opens a PR for the branch the model ended on, the one in the working tree. A name without the prefix, or a branch not on the remote, exits 1.
 - **P-5 (F10)** A refused read of a commit's statuses gives `independent_review` `"unknown"` in `extras`, and an empty list in `review-statuses`. It blocks nothing by itself.
 - **P-6 (W.2)** `post-proposal --file FILE --branch NAME` posts the model's proposed security entry, neutralized, on its open PR. A missing or empty file does nothing.
+- **P-6a** The model chooses what is at that path and the step holds a token. So a symbolic link, a file with a second name or anything but a plain file exits 2 and posts nothing, and it is never followed. A text holding the value of `GATE_TOKEN`, `GH_TOKEN`, `GITHUB_TOKEN`, `CLAUDE_CODE_OAUTH_TOKEN` or `EXECUTOR_APP_PRIVATE_KEY`, or anything shaped like a GitHub token, an Anthropic key or a private key, exits 1 and posts nothing.
 - **P-2** `hide-paths` takes `spec_tests.deny_read` out of the working folder with a sparse checkout, so that they do not show as deleted. An empty list exits 2.
 
 ## 8b. `gate.reproduce`
 
 `python -P -m gate.reproduce --repo URL --sha SHA --out DIR`
 
-- **X-0 (decision X)** On a GitHub remote, or with `--api-repo`, it makes the check of W-12 and W-14 before it reads the stored evidence. Any foreign commit, or a failed read, exits 1 with `REPORTS_UNTRUSTED`. On another remote the authors cannot be checked, and it says so.
+- **X-0 (decision X)** On a GitHub remote, in any URL form (`https`, `ssh`, `git@`, with credentials, in any letter case), or with `--api-repo`, it makes the check of W-12 and W-14 before it reads the stored evidence. Any foreign commit, a failed read, or an API that does not show the branch git has read exits 1 with `REPORTS_UNTRUSTED`. "Does not show" means the API has no such branch, or the commit git read is not among the commits the API lists. A newer commit on the API's side is no failure, because a report may be stored meanwhile and its authors are checked too. On another remote the authors cannot be checked, and it says so.
+- **X-0a (C-3)** A credential in `--repo` goes to git on its command line and stays in no file under `--out`, and it is in no message.
 - **X-1** It takes the stored context and extras of the newest attempt for the SHA, the configuration and acceptance tests at that run's `trusted_sha`, and only the runs stored before that attempt.
 - **X-2** It reruns the mandatory checks of the `run` job, seals, regenerates the report and compares it with the stored one by K-1. Exit 0 when equal, 1 when not, 2 when no evidence is stored for the SHA.
 

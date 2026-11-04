@@ -37,7 +37,8 @@ FIXED_PROTECTED = (
 )
 # What controls which tests are collected or how the security tools run (decisions W, X).
 # The pytest names are those of CONFIG_LOADERS_BY_NAME in pytest 9.2.0, the pinned version,
-# which looks for them in every folder from a test's path upwards.
+# which looks for them upwards from the common ancestor of its arguments and from each
+# argument, so any folder a command names can hold one.
 PROTECTED_NAMES_ANY_FOLDER = {
     "pytest.toml",
     ".pytest.toml",
@@ -52,9 +53,11 @@ PROTECTED_NAMES_ANY_FOLDER = {
 PROTECTED_ROOT_CONFTEST = "conftest.py"
 # `python -m pytest` runs from the working folder, so these would stand in for pytest itself.
 PROTECTED_ROOT_SHADOWS = ("pytest.py", "pytest/", "_pytest/")
-PROTECTED_INI_SECTIONS = {
-    "setup.cfg": ("tool:*", "coverage:*", "bandit", "flake8", "mypy*"),
-    "tox.ini": ("pytest", "tox*", "testenv*", "coverage:*", "bandit", "flake8", "mypy*"),
+# In the root only: the tools that decide what is tested and how the security checks run.
+PROTECTED_TOOLS_IN_ROOT = ("pytest", "coverage", "bandit", "tox", "semgrep", "gitleaks", "pip-audit", "pip_audit")
+PROTECTED_INI_SECTIONS_IN_ROOT = {
+    "setup.cfg": ("coverage:*", "bandit"),
+    "tox.ini": ("tox*", "testenv*", "coverage:*", "bandit"),
 }
 FIXED_THRESHOLD_KEYS = ("fail_under", "fail-under", "cov-fail-under")
 KNOWN_FAILING_PATH = "acceptance/known-failing.txt"
@@ -250,31 +253,61 @@ def _ini_sections(text: str, patterns: tuple[str, ...]) -> dict[str, dict[str, s
     }
 
 
-def protected_section_changed(path: str, base_text: str | None, head_text: str | None) -> str | None:
-    """Say which protected section of a root configuration file changed, or None."""
-    lowered = PurePosixPath(path.lower()).name
-    if lowered == "pyproject.toml":
-        try:
-            before_doc = tomllib.loads(base_text or "")
-            after_doc = tomllib.loads(head_text or "")
-        except tomllib.TOMLDecodeError:
-            return "the file cannot be parsed"
-        before = before_doc.get("tool", {})
-        after = after_doc.get("tool", {})
-        changed = sorted(key for key in set(before) | set(after) if before.get(key) != after.get(key))
-        if changed:
-            return f"[tool.{changed[0]}] changed"
-        plugins = [doc.get("project", {}).get("entry-points", {}).get("pytest11") for doc in (before_doc, after_doc)]
-        return "[project.entry-points.pytest11] changed" if plugins[0] != plugins[1] else None
-    patterns = PROTECTED_INI_SECTIONS.get(lowered)
-    if patterns is None:
-        return None
-    before_ini = _ini_sections(base_text or "", patterns)
-    after_ini = _ini_sections(head_text or "", patterns)
-    if before_ini is None or after_ini is None:
-        return "the file cannot be parsed"
-    changed = sorted(key for key in set(before_ini) | set(after_ini) if before_ini.get(key) != after_ini.get(key))
-    return f"[{changed[0]}] changed" if changed else None
+def _as_table(value: object) -> dict:
+    return value if isinstance(value, dict) else {}
+
+
+def _toml_change(is_root: bool, base_text: str | None, head_text: str | None) -> tuple[str | None, bool]:
+    try:
+        before_doc = tomllib.loads(base_text or "")
+        after_doc = tomllib.loads(head_text or "")
+    except tomllib.TOMLDecodeError:
+        mentions_pytest = "pytest" in f"{base_text}{head_text}".lower()
+        return ("the file cannot be parsed", False) if is_root or mentions_pytest else (None, False)
+    before = _as_table(before_doc.get("tool"))
+    after = _as_table(after_doc.get("tool"))
+    changed = sorted(key for key in set(before) | set(after) if before.get(key) != after.get(key))
+    watched = PROTECTED_TOOLS_IN_ROOT if is_root else ("pytest",)
+    hit = [key for key in changed if key.lower() in watched]
+    if hit:
+        return f"[tool.{hit[0]}] changed", False
+    plugins = [
+        _as_table(_as_table(doc.get("project")).get("entry-points")).get("pytest11") for doc in (before_doc, after_doc)
+    ]
+    if plugins[0] != plugins[1]:
+        return "[project.entry-points.pytest11] changed", False
+    return None, is_root and base_text != head_text
+
+
+def _ini_change(name: str, is_root: bool, base_text: str | None, head_text: str | None) -> tuple[str | None, bool]:
+    if base_text == head_text:
+        return None, False
+    # pytest reads these files with its own parser, which cuts lines and section names
+    # differently from configparser. So no reading of them is trusted: any change to a file
+    # that mentions pytest is refused, whatever the sections seem to be.
+    if "pytest" in (base_text or "").lower() or "pytest" in (head_text or "").lower():
+        return "a change to a file that mentions pytest", False
+    if not is_root:
+        return None, False
+    patterns = PROTECTED_INI_SECTIONS_IN_ROOT[name]
+    before = _ini_sections(base_text or "", patterns)
+    after = _ini_sections(head_text or "", patterns)
+    if before is None or after is None:
+        return "the file cannot be parsed", False
+    changed = sorted(key for key in set(before) | set(after) if before.get(key) != after.get(key))
+    return (f"[{changed[0]}] changed", False) if changed else (None, True)
+
+
+def section_change(path: str, base_text: str | None, head_text: str | None) -> tuple[str | None, bool]:
+    """Whether a change to a configuration file is refused, with why, or marked for a person."""
+    lowered = path.lower()
+    name = PurePosixPath(lowered).name
+    is_root = lowered == name
+    if name == "pyproject.toml":
+        return _toml_change(is_root, base_text, head_text)
+    if name in PROTECTED_INI_SECTIONS_IN_ROOT:
+        return _ini_change(name, is_root, base_text, head_text)
+    return None, False
 
 
 def is_test_file(path: str) -> bool:
@@ -721,9 +754,11 @@ def check_ai_rules(git: Git, base: str, head: str, changes: list[tuple[str, str]
         if is_protected(path, protected) or is_protected_control_file(path):
             result.add("PROTECTED_PATH", path, f"status {status}")
         else:
-            section = protected_section_changed(path, git.show(base, path), git.show(head, path))
-            if section:
-                result.add("PROTECTED_PATH", path, section)
+            refusal, mark = section_change(path, git.show(base, path), git.show(head, path))
+            if refusal:
+                result.add("PROTECTED_PATH", path, refusal)
+            elif mark:
+                result.needs_code_owner.append(path)
         if PurePosixPath(path).name.lower() == PROTECTED_ROOT_CONFTEST and path.lower() != PROTECTED_ROOT_CONFTEST:
             result.needs_code_owner.append(path)
         flagged: list[tuple[int, int]] = []
@@ -747,9 +782,11 @@ def judge(args: argparse.Namespace, config: dict) -> Result:
         check_ai_rules(git, base, head, changes, config.get("guard", {}), result)
 
     if kind == "spec":
-        for _, path in changes:
+        for status, path in changes:
             if not is_protected(path, ["acceptance/"]):
                 result.add("SPEC_OUTSIDE_ACCEPTANCE", path, "a spec PR may touch only acceptance/")
+            elif is_test_file(path):
+                check_tests(git, base, head, status, path, result)
 
     if kind in ("ai", "spec"):
         for status, path in changes:

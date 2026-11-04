@@ -14,6 +14,7 @@ import re
 import shutil
 import subprocess
 import sys
+import urllib.parse
 from pathlib import Path
 
 from gate import report as report_module
@@ -30,24 +31,50 @@ class Untrusted(Exception):
 def git(*args: str, cwd: Path | None = None) -> str:
     process = subprocess.run(["git", *args], cwd=cwd, capture_output=True, check=False)
     if process.returncode != 0:
-        raise UsageError(f"git {args[0]} failed: {process.stderr.decode('utf-8', 'replace').strip()[:300]}")
+        said = re.sub(r"://[^/@\s]+@", "://", process.stderr.decode("utf-8", "replace"))
+        raise UsageError(f"git {args[0]} failed: {said.strip()[:300]}")
     return process.stdout.decode("utf-8", "replace").strip()
 
 
 def github_repository(repo: str) -> str | None:
-    """OWNER/NAME of a GitHub URL, or None for any other remote."""
-    match = re.fullmatch(r"(?:https://github\.com/|git@github\.com:)([^/]+/[^/]+?)(?:\.git)?/?", repo)
-    return match.group(1) if match else None
+    """OWNER/NAME of a remote on GitHub, in any URL form, or None for any other remote."""
+    text = repo.strip()
+    scp_form = re.fullmatch(r"(?:[^@/\s]+@)?(?:www\.)?github\.com:(.+)", text, re.IGNORECASE)
+    if scp_form:
+        path = scp_form.group(1)
+    else:
+        parts = urllib.parse.urlsplit(text)
+        if (parts.hostname or "").lower() not in ("github.com", "www.github.com"):
+            return None
+        path = parts.path
+    name = path.strip("/").removesuffix(".git").rstrip("/")
+    if not re.fullmatch(r"[^/\s]+/[^/\s]+", name):
+        raise UsageError("this GitHub URL names no repository")
+    return name
 
 
-def check_stored_evidence(repository: str | None, config: Path) -> None:
+def without_credentials(url: str) -> str:
+    """A URL to keep in a file: a credential in it would be written under --out."""
+    parts = urllib.parse.urlsplit(url)
+    if "@" not in parts.netloc or parts.scheme.lower() not in ("http", "https"):
+        return url
+    return urllib.parse.urlunsplit(parts._replace(netloc=parts.netloc.rsplit("@", 1)[1]))
+
+
+def check_stored_evidence(repository: str | None, config: Path, tip: str) -> None:
     """Stored evidence on GitHub is read only after the check every other read makes."""
     if repository is None:
         print("note: this remote is not on GitHub, so the authors of its reports branch cannot be checked")
         return
-    status = actors_status(ApiRemote(repository, "reports"), load_accepted(str(config)))
+    # git has already read this branch, so an API that cannot see it is no all-clear.
+    remote = ApiRemote(repository, "reports", must_exist=True)
+    status = actors_status(remote, load_accepted(str(config)))
     if not status["actors_ok"]:
         raise Untrusted(str(status["reason"]))
+    # The commits checked must include the one git read. A later commit on the API's side is
+    # only a report stored meanwhile, and its authors were checked too.
+    if tip not in remote.listed:
+        raise Untrusted("the API does not show the commit git has read from this branch")
 
 
 def find_stored(reports: Path, sha: str) -> Path:
@@ -106,10 +133,15 @@ def reproduce(args: argparse.Namespace) -> int:
 
     pr_dir = work / "pr"
     git("clone", "--quiet", args.repo, str(pr_dir))
-    git("fetch", "--quiet", "--no-tags", "origin", "+refs/heads/reports:refs/remotes/origin/reports", cwd=pr_dir)
+    # This folder sits under --out, so a credential in the URL stays out of its files, and git
+    # is given the URL each time. Asked of git because a relative path means something else here.
+    source = git("remote", "get-url", "origin", cwd=pr_dir)
+    git("remote", "set-url", "origin", without_credentials(source), cwd=pr_dir)
+    git("fetch", "--quiet", "--no-tags", source, "+refs/heads/reports:refs/remotes/origin/reports", cwd=pr_dir)
     default_tree = work / "default"
     git("worktree", "add", "--quiet", "--detach", str(default_tree), git("symbolic-ref", "--short", "refs/remotes/origin/HEAD", cwd=pr_dir), cwd=pr_dir)
-    check_stored_evidence(args.api_repo or github_repository(args.repo), default_tree / "quality.toml")
+    tip = git("rev-parse", "refs/remotes/origin/reports", cwd=pr_dir)
+    check_stored_evidence(args.api_repo or github_repository(args.repo), default_tree / "quality.toml", tip)
     stored_tree = work / "stored"
     git("worktree", "add", "--quiet", "--detach", str(stored_tree), "origin/reports", cwd=pr_dir)
     stored = find_stored(stored_tree / "reports", args.sha)
@@ -117,7 +149,7 @@ def reproduce(args: argparse.Namespace) -> int:
     context = read_json(stored / "context.json")
     # A closed PR's branch may be gone; GitHub keeps its head under refs/pull.
     subprocess.run(
-        ["git", "fetch", "--quiet", "--no-tags", "origin", f"refs/pull/{context['pr']}/head"],
+        ["git", "fetch", "--quiet", "--no-tags", source, f"refs/pull/{context['pr']}/head"],
         cwd=pr_dir,
         capture_output=True,
         check=False,

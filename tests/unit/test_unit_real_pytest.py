@@ -201,6 +201,8 @@ CHEAT = (
         ("tox.ini", "[pytest]\naddopts = -p cheat\npythonpath = .\n"),
         ("setup.cfg", "[tool:pytest]\naddopts = -p cheat\npythonpath = .\n"),
         ("tests/setup.cfg", "[tool:pytest]\naddopts = -p cheat\npythonpath = ..\n"),
+        # pytest's parser cuts this section line differently from configparser (review round 3).
+        ("tox.ini", "[pytest] # ]\naddopts = -p cheat\npythonpath = .\n"),
     ],
 )
 def test_each_file_pytest_reads_as_configuration_is_refused(gate, tmp_path, name, text):
@@ -233,6 +235,35 @@ def test_the_list_of_names_is_the_pinned_pytests_own():
     source = (root / "gate" / "guard.py").read_text(encoding="utf-8")
     for name in CONFIG_LOADERS_BY_NAME:
         assert f'"{name}"' in source, f"pytest reads {name}, and the guard does not name it"
+
+
+APP = "def add(a, b):\n    return a + b\n"
+
+
+@pytest.mark.parametrize(
+    ("name", "text"),
+    [
+        ("tox.ini", "[pytest] # ]\npythonpath = shim\n"),
+        ("tox.ini", "[pytest]; a comment\npythonpath = shim\n"),
+        ("setup.cfg", "[tool:pytest] # ]\npythonpath = shim\n"),
+    ],
+)
+def test_a_broken_module_cannot_be_replaced_through_a_file_the_guard_reads_differently(gate, tmp_path, name, text):
+    """Real pytest reads the file, and a broken module is swapped for a good one in a shim."""
+    repo, base = make_repo(tmp_path, {"app.py": APP, "tests/test_add.py": "from app import add\n\n\ndef test_add():\n    assert add(1, 2) == 3\n"})
+    git(repo, "checkout", "-q", "-b", "ai/1-x")
+    write_files(repo, {"app.py": "def add(a, b):\n    return a - b\n", "shim/app.py": APP, name: text})
+    git(repo, "add", "-A")
+    git(repo, "commit", "-qm", "the change")
+    env = {key: value for key, value in os.environ.items() if key != "PYTHONPATH"}
+    run = subprocess.run([sys.executable, "-m", "pytest", "-q", "-p", "no:cacheprovider"], cwd=repo, capture_output=True, text=True, env=env, check=False)
+    assert run.returncode == 0, f"this file did not change pytest: {run.stdout}"
+    config = tmp_path / "quality.toml"
+    config.write_text('[feedback]\nexecutor_app = "example-executor"\n', encoding="utf-8")
+    out = tmp_path / "guard.json"
+    process = gate.run("guard", "--repo", repo, "--base", base, "--head", "HEAD", "--branch", "ai/1-x", "--author", "example-executor[bot]", "--config", config, "--out", out)
+    assert process.returncode == 1
+    assert ("PROTECTED_PATH", name) in {(item["rule"], item["path"]) for item in json.loads(out.read_text(encoding="utf-8"))["violations"]}
 
 
 @pytest.mark.parametrize("name", ["pytest.py", "pytest/__init__.py", "_pytest/__init__.py"])

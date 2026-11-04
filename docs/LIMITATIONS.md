@@ -30,6 +30,16 @@ What the gate does not do or does not prove, written down rather than dropped. E
 - **L18** A whole-workflow `concurrency` on the thin `feedback` workflow lets a later comment cancel a queued reviewer's event, by GitHub's rule for pending runs.
 - **L19** The issue's text sits in the main prompt with no closing marker, read when the job runs, so its author can change it after labeling. It opens no new shell or output path.
 
+## Carried from review round 3
+
+- **L20** R-11 and A-11 still fail falsely on what pytest passes over for reasons parsing does not see: default `norecursedirs` (`.*`, `build`, `dist`, `venv`, `node_modules`, `*.egg`), `__new__`, an inherited `__init__`, `@dataclass`, an inherited or annotated `__test__`, a `fixture as fx` alias, `collect_ignore`. It fails closed, and `expected_tests_ignore` is the way out.
+- **L21** A prose-only change to `security-review.md` lists nothing, and removing the text above a dormant table row can turn on an exception without a listed row. A rename away is not seen by the merge flag.
+- **L22** A path with a newline puts its second line at the start of a line in `decide`'s log, where the runner might read a `::` command.
+- **L23** A fix round's note says only `gate/tests failed`, and the JUnit file's names are not carried. The model can run the tests itself.
+- **L24** On an API failure, the reason `REPORTS_UNTRUSTED` says the branch holds a commit the gate did not write, when the truth is that it could not be read.
+- **L25** A model that pushes and then checks out another branch ends with no PR, and exit 1. The prompt does not tell it to stay.
+- **L26** The steps after the model hold the app's token and run the gate from `$RUNNER_TEMP/gate`, which the model's `Bash(python:*)` could change. L14's reach to the token applies there too. `actions/upload-artifact` also follows links in the run job's output folder. The text check of P-6a reads the text as it stands, so an encoded secret passes it.
+
 ## Open until a real run
 
 These can only be seen on GitHub, in Part 3:

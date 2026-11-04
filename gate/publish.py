@@ -12,6 +12,7 @@ import json
 import os
 import re
 import secrets
+import stat
 import subprocess
 import sys
 import urllib.error
@@ -37,6 +38,8 @@ from gate.common import (
 MAX_COMMENT = 60_000
 MAX_PROPOSAL = 10_000
 PROPOSAL_FILE = ".gate-security-proposal.md"
+SECRET_VARIABLES = ("GATE_TOKEN", "GH_TOKEN", "GITHUB_TOKEN", "CLAUDE_CODE_OAUTH_TOKEN", "EXECUTOR_APP_PRIVATE_KEY")
+SECRET_PATTERN = re.compile(r"gh[pousr]_[A-Za-z0-9]{20,}|github_pat_[A-Za-z0-9_]{20,}|sk-ant-[A-Za-z0-9_-]{10,}|-----BEGIN [A-Z ]*PRIVATE KEY-----")
 DEFAULT_SEMI_AUTOMATIC = [
     "The independent review is started by hand on the laptop.",
     "A person approves and merges each PR.",
@@ -441,11 +444,36 @@ def cmd_open_pr(args: argparse.Namespace) -> int:
     return EXIT_OK
 
 
+def read_proposal(path: str) -> str | None:
+    """Read the model's file. None when absent. Anything but a plain file of its own is refused.
+
+    The model chooses what is at this path, and this step holds a token: a link could point
+    at the job's secrets, and a second name for a file could be the git config that holds one.
+    """
+    try:
+        info = os.lstat(path)
+    except FileNotFoundError:
+        return None
+    if not stat.S_ISREG(info.st_mode) or info.st_nlink != 1:
+        raise UsageError("the proposal is not a plain file")
+    descriptor = os.open(path, os.O_RDONLY | getattr(os, "O_NOFOLLOW", 0))
+    with os.fdopen(descriptor, "rb") as handle:
+        return handle.read(MAX_PROPOSAL + 1).decode("utf-8", "replace")
+
+
+def holds_a_secret(text: str) -> bool:
+    values = [os.environ.get(name, "") for name in SECRET_VARIABLES]
+    return any(value and value in text for value in values) or SECRET_PATTERN.search(text) is not None
+
+
 def cmd_post_proposal(args: argparse.Namespace) -> int:
     """Post the model's proposed security entry as text on its PR. Only the CEO can add one."""
-    proposal = Path(args.file)
-    if not proposal.is_file() or not proposal.read_text(encoding="utf-8", errors="replace").strip():
+    raw = read_proposal(args.file)
+    if raw is None or not raw.strip():
         return EXIT_OK
+    if holds_a_secret(raw):
+        print("the proposal holds what looks like a secret, so it is not posted", file=sys.stderr)
+        return EXIT_RULE_FAILED
     repository = os.environ["GITHUB_REPOSITORY"]
     owner = repository.split("/", 1)[0]
     head = urllib.parse.quote(f"{owner}:{args.branch}", safe="")
@@ -453,7 +481,7 @@ def cmd_post_proposal(args: argparse.Namespace) -> int:
     if not pulls:
         print("no open PR to post the proposal on", file=sys.stderr)
         return EXIT_RULE_FAILED
-    text = neutralize(proposal.read_text(encoding="utf-8", errors="replace"))[:MAX_PROPOSAL]
+    text = neutralize(raw)[:MAX_PROPOSAL]
     body = f"The executor proposes this entry for `security-review.md`. Only the CEO can add it.\n\n{text}"
     call("POST", f"/repos/{repository}/issues/{pulls[0]['number']}/comments", {"body": body})
     return EXIT_OK
@@ -621,7 +649,8 @@ def main(argv: list[str] | None = None) -> int:
     except UsageError as error:
         return fail_usage(str(error))
     except (urllib.error.URLError, OSError, ValueError, KeyError) as error:
-        # The message names the kind of failure only: a token never enters it.
+        # The message names the kind of failure only: a token never enters it, and a file's
+        # name or content never does either.
         print(f"publish: {type(error).__name__} in {args.command}", file=sys.stderr)
         return EXIT_RULE_FAILED
 
