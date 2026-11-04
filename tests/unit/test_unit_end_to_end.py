@@ -323,13 +323,17 @@ def test_reproduce_refuses_a_reports_branch_written_by_another_actor(world, shor
 
 
 @pytest.mark.req("X-0b")
-def test_reproduce_keeps_secrets_from_the_checks_it_reruns(world, short_tmp):
-    """With a token in the rerun's environment, gate/env would fail and the reports would differ."""
+def test_reproduce_refuses_to_start_with_a_secret_in_its_environment(world, short_tmp):
+    """PR code would run under this user, and could read this process's environment."""
     head = world.change()
     assert world.judge(world.run_job())["verdict"] == "ready-for-human"
     env = {**reproduce_env(world), "GATE_TOKEN": "FAKE-VALUE-NOT-A-TOKEN", "SOME_API_KEY": "FAKE-VALUE-TWO"}
-    process = world.gate.run("reproduce", "--repo", world.remote, "--sha", head, "--out", short_tmp / "rerun", env=env)
-    assert process.returncode == 0, process.stdout + process.stderr
+    out = short_tmp / "rerun"
+    process = world.gate.run("reproduce", "--repo", world.remote, "--sha", head, "--out", out, env=env)
+    assert process.returncode == 2
+    assert "GATE_TOKEN" in process.stderr and "SOME_API_KEY" in process.stderr
+    assert "FAKE-VALUE" not in process.stdout + process.stderr
+    assert not out.exists(), "nothing ran"
 
 
 @pytest.mark.req("X-1")

@@ -8,14 +8,17 @@ from __future__ import annotations
 
 import argparse
 import ast
+import codecs
 import collections
 import configparser
 import fnmatch
 import hashlib
+import io
 import json
 import re
 import subprocess
 import sys
+import tokenize
 import tomllib
 from dataclasses import dataclass, field
 from pathlib import Path, PurePosixPath
@@ -55,6 +58,11 @@ PROTECTED_NAMES_ANY_FOLDER = {
 }
 # In what git stores, a link is only the name of its target, and a submodule only a commit's name.
 NOT_PLAIN_MODES = ("120000", "160000")
+# Code with no source to read, and what makes Python load code as an installed package.
+NOT_SOURCE_SUFFIXES = (".pyc", ".pyo", ".so", ".pyd")
+NOT_SOURCE_FOLDER_SUFFIXES = (".dist-info", ".egg-info", ".egg")
+# What `python -m pytest` imports: the working folder comes first on the path.
+TOOL_MODULES = ("pytest", "_pytest", "pluggy", "iniconfig", "packaging", "pygments", "colorama", "tomli", "exceptiongroup")
 PROTECTED_ROOT_CONFTEST = "conftest.py"
 # `python -m pytest` runs from the working folder, so these would stand in for pytest itself.
 PROTECTED_ROOT_SHADOWS = ("pytest.py", "pytest/", "_pytest/")
@@ -72,7 +80,9 @@ ACTION_DEFAULT_BOT = "claude[bot]"
 
 # A repository's own settings must never start a command from here. --text keeps a
 # .gitattributes in the repository from hiding a change.
-_SAFE_DIFF = ("--no-renames", "--no-color", "--no-ext-diff", "--no-textconv", "--text")
+# A .gitmodules in the PR can otherwise tell git to leave a submodule out of the diff.
+_SAFE_DIFF = ("--no-renames", "--no-color", "--no-ext-diff", "--no-textconv", "--text", "--ignore-submodules=none")
+_COMPREHENSIONS = (ast.ListComp, ast.SetComp, ast.DictComp, ast.GeneratorExp)
 _SKIP_DECORATORS = (
     "pytest.mark.skip",
     "pytest.mark.skipif",
@@ -149,10 +159,18 @@ class Git:
             return None
         return process.stdout.decode("utf-8", "replace")
 
-    def mode(self, rev: str, path: str) -> str | None:
-        """A path's mode in a commit: 120000 is a link and 160000 a submodule. None when absent."""
-        raw = self.run("ls-tree", "-z", "--full-tree", rev, "--", path)
-        return raw.split(b" ", 1)[0].decode("ascii", "replace") if raw else None
+    def not_plain_files(self, start: str, end: str) -> list[str]:
+        """Changed paths that are a link or a submodule at the end. The diff gives each mode, so
+        no path name has to go back to git, where it could read as a pathspec or decode badly."""
+        fields = self.run("diff", *_SAFE_DIFF, "--raw", "-z", start, end).decode("utf-8", "replace").split("\0")
+        found = []
+        for index in range(0, len(fields) - 1, 2):
+            if fields[index].split(" ")[1] in NOT_PLAIN_MODES:
+                found.append(fields[index + 1])
+        return found
+
+    def files(self, rev: str) -> list[str]:
+        return self.run("ls-tree", "-r", "--name-only", "-z", rev).decode("utf-8", "replace").split("\0")[:-1]
 
     def exists(self, rev: str) -> bool:
         process = subprocess.run(
@@ -440,9 +458,14 @@ def _facts_of(function: ast.AST, inherited_skips: int) -> TestFacts:
     )
 
 
+def _parsed(source: str) -> ast.Module:
+    """Python skips a byte-order mark. ast.parse of a string does not, so the guard does it here."""
+    return ast.parse(source.removeprefix("\ufeff"))
+
+
 def collect_functions(source: str) -> tuple[dict[str, TestFacts], dict[str, str]]:
     """Map each test to what it checks, and each other function to its code. Raises SyntaxError."""
-    tree = ast.parse(source)
+    tree = _parsed(source)
     module_skips = 0
     for node in tree.body:
         if isinstance(node, ast.Assign) and any(
@@ -471,34 +494,75 @@ def collect_functions(source: str) -> tuple[dict[str, TestFacts], dict[str, str]
     return tests, others
 
 
-def rebound_names(source: str) -> collections.Counter[str]:
-    """How often each name is bound at module or class level, a test's own `def` included once."""
-    bound: collections.Counter[str] = collections.Counter()
-    own_scopes = (ast.Lambda, ast.ListComp, ast.SetComp, ast.DictComp, ast.GeneratorExp)
+def _dotted(node: ast.AST) -> str | None:
+    if isinstance(node, ast.Name):
+        return node.id
+    if isinstance(node, ast.Attribute):
+        base = _dotted(node.value)
+        return f"{base}.{node.attr}" if base else None
+    return None
 
-    def scan(node: ast.AST, prefix: str) -> None:
-        for child in ast.iter_child_nodes(node):
-            if isinstance(child, (ast.FunctionDef, ast.AsyncFunctionDef, ast.ClassDef)):
-                # Another def replaces the one before it, and can replace a class of that name.
-                bound[prefix + child.name] += 1
-                if isinstance(child, ast.ClassDef):
-                    scan(child, f"{prefix}{child.name}.")
-            elif not isinstance(child, own_scopes):
-                if isinstance(child, ast.Name) and isinstance(child.ctx, (ast.Store, ast.Del)):
-                    bound[prefix + child.id] += 1
-                elif (
-                    isinstance(child, ast.Attribute)
-                    and isinstance(child.ctx, (ast.Store, ast.Del))
-                    and isinstance(child.value, ast.Name)
-                ):
-                    bound[f"{prefix}{child.value.id}.{child.attr}"] += 1
-                elif isinstance(child, ast.alias):
-                    bound[prefix + (child.asname or child.name.split(".", 1)[0])] += 1
-                elif isinstance(child, ast.ExceptHandler) and child.name:
-                    bound[prefix + child.name] += 1
-                scan(child, prefix)
 
-    scan(ast.parse(source), "")
+def _names_bound_by(node: ast.AST) -> list[str]:
+    """The names this one node binds in the scope it stands in. A star import gives "*"."""
+    if isinstance(node, ast.Name) and isinstance(node.ctx, (ast.Store, ast.Del)):
+        return [node.id]
+    if isinstance(node, ast.alias):
+        return [node.asname or node.name.split(".", 1)[0]]
+    if isinstance(node, (ast.ExceptHandler, ast.MatchAs, ast.MatchStar)):
+        return [node.name] if node.name else []
+    if isinstance(node, ast.MatchMapping):
+        return [node.rest] if node.rest else []
+    return []
+
+
+def rebound_names(source: str) -> collections.Counter[tuple[str, str]]:
+    """Each binding at module or class level, with what binds it, so a swap counts as a change."""
+    bound: collections.Counter[tuple[str, str]] = collections.Counter()
+    tree = _parsed(source)
+
+    def visit(node: ast.AST, prefix: str, statement: ast.AST) -> None:
+        if isinstance(node, ast.stmt):
+            statement = node
+        if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef, ast.ClassDef)):
+            # Another def or class replaces the one before it. What runs outside its body counts.
+            bound[(prefix + node.name, "def or class")] += 1
+            outside: list[ast.AST] = list(node.decorator_list)
+            inside: list[ast.stmt] = []
+            if isinstance(node, ast.ClassDef):
+                outside += [*node.bases, *node.keywords]
+                inside = node.body
+            else:
+                outside.append(node.args)
+            for part in outside:
+                visit(part, prefix, statement)
+            for part in inside:
+                visit(part, f"{prefix}{node.name}.", part)
+        elif isinstance(node, ast.Lambda):
+            visit(node.args, prefix, statement)
+        elif isinstance(node, _COMPREHENSIONS):
+            # Its own variables stay inside it, and a := binds outside it.
+            for inner in ast.walk(node):
+                if isinstance(inner, ast.NamedExpr):
+                    bound[(prefix + inner.target.id, ast.dump(statement))] += 1
+        else:
+            if isinstance(node, ast.Attribute) and isinstance(node.ctx, (ast.Store, ast.Del)):
+                dotted = _dotted(node)
+                if dotted:
+                    # In a class body a bare name can mean that class's own attribute.
+                    bound[(dotted, f"attribute: {ast.dump(statement)}")] += 1
+                    bound[(prefix + dotted, f"attribute: {ast.dump(statement)}")] += 1
+            for name in _names_bound_by(node):
+                bound[(prefix + name, ast.dump(statement))] += 1
+            for child in ast.iter_child_nodes(node):
+                visit(child, prefix, statement)
+
+    visit(tree, "", tree)
+    # A `global` reaches the module from any function or class, and no function body is entered.
+    for inner in ast.walk(tree):
+        if isinstance(inner, ast.Global):
+            for name in inner.names:
+                bound[(name, ast.dump(inner))] += 1
     return bound
 
 
@@ -506,6 +570,16 @@ def _scopes(name: str) -> list[str]:
     """A test and the classes it stands in: rebinding any of them takes the test away."""
     parts = name.split(".")
     return [".".join(parts[: index + 1]) for index in range(len(parts))]
+
+
+def bound_again(name: str, added: collections.Counter[tuple[str, str]]) -> bool:
+    scopes = _scopes(name)
+    for bound_name, how in added:
+        if bound_name == "*" or bound_name in scopes:
+            return True
+        if how.startswith("attribute:") and bound_name.startswith(f"{name}."):
+            return True
+    return False
 
 
 def check_tests(git: Git, base: str, head: str, status: str, path: str, result: Result) -> list[tuple[int, int]]:
@@ -527,8 +601,7 @@ def check_tests(git: Git, base: str, head: str, status: str, path: str, result: 
         result.add("TEST_WEAKENED", path, "the changed test file cannot be parsed")
         return []
 
-    base_bound = rebound_names(base_source)
-    head_bound = rebound_names(head_source)
+    added_bindings = rebound_names(head_source) - rebound_names(base_source)
     flagged: list[tuple[int, int]] = []
     for name, before in sorted(base_tests.items()):
         after = head_tests.get(name)
@@ -536,7 +609,7 @@ def check_tests(git: Git, base: str, head: str, status: str, path: str, result: 
             result.add("TEST_DELETED", path, f"{name} was removed")
             continue
         weakened = False
-        if any(head_bound[scope] > base_bound[scope] for scope in _scopes(name)):
+        if bound_again(name, added_bindings):
             result.add("TEST_WEAKENED", path, f"{name} is bound again at module or class level")
             weakened = True
         if after.skips > before.skips:
@@ -817,6 +890,100 @@ def security_review_changes(git: Git, base: str, head: str) -> list[dict]:
     return changes
 
 
+def is_not_source(path: str) -> bool:
+    parts = PurePosixPath(path.lower()).parts
+    if parts[-1].endswith(NOT_SOURCE_SUFFIXES):
+        return True
+    return any(part == "__pycache__" or part.endswith(NOT_SOURCE_FOLDER_SUFFIXES) for part in parts)
+
+
+def declares_other_encoding(text: str) -> bool:
+    """Python would read other code from these bytes than the guard read as UTF-8."""
+    lines = _with_newlines_as_pytest_reads_them(text).encode("utf-8", "replace")
+    try:
+        encoding, _ = tokenize.detect_encoding(io.BytesIO(lines).readline)
+    except (SyntaxError, LookupError):
+        return True
+    return codecs.lookup(encoding).name not in ("utf-8", "utf-8-sig")
+
+
+def plugin_line_added(path: str, base_text: str | None, head_text: str) -> bool:
+    """pytest loads what a module's `pytest_plugins` names, as it would from a conftest.py."""
+    watched = ["pytest_plugins"]
+    if is_test_file(path) or is_protected(path, ["acceptance/"]):
+        watched.append("*")
+    try:
+        added = rebound_names(head_text) - rebound_names(base_text or "")
+    except SyntaxError:
+        return "pytest_plugins" in head_text
+    return any(name in watched for name, _ in added)
+
+
+def importable_names(files: list[str]) -> set[str]:
+    """The application's top-level modules, the standard library's, and the tools the gate runs."""
+    names = {*sys.stdlib_module_names, *TOOL_MODULES}
+    for path in files:
+        parts = PurePosixPath(path).parts
+        parts = parts[1:] if parts[0] == "src" else parts
+        if len(parts) == 1 and parts[0].endswith(".py"):
+            names.add(parts[0].removesuffix(".py"))
+        elif len(parts) == 2 and parts[1] == "__init__.py":
+            names.add(parts[0])
+    return names - {"conftest", "__init__"}
+
+
+def stands_in_for_a_module(path: str, test_folders: set[str], names: set[str]) -> bool:
+    """pytest puts a test's folder first on the path, so a module there replaces the real one."""
+    pure = PurePosixPath(path)
+    module, folder = (pure.parent.name, pure.parent.parent) if pure.name == "__init__.py" else (pure.stem, pure.parent)
+    return str(folder) in test_folders and module in names
+
+
+def new_root_shadows(git: Git, base: str, head: str, head_files: list[str]) -> list[str]:
+    """New top-level names that `python -m pytest` would find before the real module."""
+    known = {PurePosixPath(path).parts[0] for path in git.files(base)}
+    tools = {*sys.stdlib_module_names, *TOOL_MODULES}
+    found = set()
+    for path in head_files:
+        parts = PurePosixPath(path).parts
+        if parts[0] in known:
+            continue
+        if len(parts) == 1 and parts[0].endswith(".py") and parts[0].removesuffix(".py") in tools:
+            found.add(path)
+        elif len(parts) == 2 and parts[1] == "__init__.py" and parts[0] in tools:
+            found.add(path)
+    return sorted(found)
+
+
+def check_what_runs(git: Git, base: str, head: str, changes: list[tuple[str, str]], result: Result) -> None:
+    """Rules for `ai` and `spec` PRs: what Python runs must be what this guard read."""
+    for path in git.not_plain_files(base, head):
+        result.add("PROTECTED_PATH", path, "a symbolic link or a submodule: tools follow what the guard cannot read")
+    head_files = git.files(head)
+    for path in new_root_shadows(git, base, head, head_files):
+        result.add("PROTECTED_PATH", path, "a new top-level name that stands in for a module pytest or Python uses")
+    names = importable_names(head_files)
+    test_folders = {str(PurePosixPath(path).parent) for path in head_files if is_test_file(path) or is_protected(path, ["acceptance/"])}
+    test_folders -= {".", "src"}
+    for status, path in changes:
+        if status == "D":
+            continue
+        check_pins(git, base, head, path, result)
+        if is_not_source(path):
+            result.add("PROTECTED_PATH", path, "bytecode or an installed package's files: no source to read")
+        if not path.lower().endswith(".py"):
+            continue
+        head_text = git.show(head, path)
+        if head_text is None:
+            continue
+        if declares_other_encoding(head_text):
+            result.add("PROTECTED_PATH", path, "declares an encoding other than UTF-8")
+        if plugin_line_added(path, git.show(base, path), head_text):
+            result.add("PROTECTED_PATH", path, "adds or changes pytest_plugins, or a star import in a test file")
+        if status == "A" and stands_in_for_a_module(path, test_folders, names):
+            result.add("PROTECTED_PATH", path, "stands in for a module of that name, in a folder holding tests")
+
+
 def spec_control_refusal(git: Git, base: str, head: str, path: str) -> str | None:
     """A spec PR adds tests. What controls how every test runs stays with people."""
     if PurePosixPath(path.lower()).name == PROTECTED_ROOT_CONFTEST:
@@ -873,11 +1040,7 @@ def judge(args: argparse.Namespace, config: dict) -> Result:
                 check_tests(git, base, head, status, path, result)
 
     if kind in ("ai", "spec"):
-        for status, path in changes:
-            if status != "D":
-                check_pins(git, base, head, path, result)
-                if git.mode(head, path) in NOT_PLAIN_MODES:
-                    result.add("PROTECTED_PATH", path, "a symbolic link or a submodule: tools follow what the guard cannot read")
+        check_what_runs(git, base, head, changes, result)
 
     check_repeated(git, base, head, head, args, result)
     if kind != "ai":

@@ -17,7 +17,6 @@ reproduce:
 	  -v "$(CURDIR):/gate:ro" \
 	  -v "$(abspath $(OUT)):/out" \
 	  -e PYTHONPATH=/gate \
-	  -e GATE_TOKEN \
 	  -e GATE_TOOLS=/tools/bin \
 	  -e GATE_TOOLS_BIN=/tools-bin \
 	  -e GATE_SEMGREP=/semgrep/bin \

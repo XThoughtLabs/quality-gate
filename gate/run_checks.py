@@ -126,6 +126,8 @@ def post_checks(check: dict, raw_dir: Path, expected: set[str] | None) -> list[s
             failures.append(f"JUnit file {junit} is missing or unreadable")
         else:
             write_json(raw_dir / "counts.json", counts)
+            if counts["failures"] + counts["errors"] > 0:
+                failures.append(f"the JUnit file records {counts['failures'] + counts['errors']} failed tests")
             if check.get("forbid_skips") and counts["skipped"] > 0:
                 failures.append(f"{counts['skipped']} tests were skipped")
     for output in check.get("required_outputs", []):

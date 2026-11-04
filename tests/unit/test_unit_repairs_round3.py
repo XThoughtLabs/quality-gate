@@ -2,11 +2,9 @@
 
 from __future__ import annotations
 
-import argparse
 import json
 import os
 import stat
-import subprocess
 import sys
 from pathlib import Path
 
@@ -272,7 +270,7 @@ def test_each_form_of_a_github_url_is_known(gate, url):
 
 @pytest.mark.parametrize(
     "url",
-    ["https://example.com/github.com/o/n", "https://github.com.example.com/o/n", "git@example.com:o/n.git", "/srv/git/o/n.git", "file:///srv/github.com/o/n", r"C:\repos\github.com\o\n"],
+    ["evil.example:x@github.com:o/n", "https://example.com/github.com/o/n", "https://github.com.example.com/o/n", "git@example.com:o/n.git", "/srv/git/o/n.git", "file:///srv/github.com/o/n", r"C:\repos\github.com\o\n"],
 )
 def test_another_remote_is_not_taken_for_github(gate, url):
     assert load_reproduce(gate).github_repository(url) is None
@@ -307,57 +305,6 @@ def test_a_404_for_a_branch_git_has_read_is_no_all_clear(gate, stub):
         finally:
             os.environ.clear()
             os.environ.update(env)
-
-
-# X-0a: a credential in the URL goes to git and stays in no file or message.
-
-
-@pytest.mark.parametrize(
-    ("url", "kept"),
-    [
-        ("https://x-access-token:SECRET@github.com/o/n.git", "https://github.com/o/n.git"),
-        ("https://a:b@c@github.com/o/n", "https://github.com/o/n"),
-        ("HTTP://token@example.com/o/n", "http://example.com/o/n"),
-        ("https://github.com/o/n.git", "https://github.com/o/n.git"),
-        ("ssh://git@github.com/o/n.git", "ssh://git@github.com/o/n.git"),
-        ("git@github.com:o/n.git", "git@github.com:o/n.git"),
-        ("/srv/git/n.git", "/srv/git/n.git"),
-    ],
-)
-def test_the_url_kept_in_a_file_has_no_credential(gate, url, kept):
-    assert load_reproduce(gate).without_credentials(url) == kept
-
-
-def test_the_fetch_keeps_its_credential_while_the_stored_url_has_none(gate, tmp_path, monkeypatch):
-    """A private remote still needs it on each fetch. No local remote can show this."""
-    module = load_reproduce(gate)
-    url = "https://x-access-token:SECRET@github.com/o/n.git"
-    calls: list[tuple[str, ...]] = []
-
-    def fake_git(*args: str, cwd: Path | None = None) -> str:
-        calls.append(args)
-        if args[:2] == ("remote", "get-url"):
-            return url
-        if args[0] == "fetch":
-            raise module.UsageError("stop here")
-        return ""
-
-    monkeypatch.setattr(module, "git", fake_git)
-    arguments = argparse.Namespace(repo=url, sha="1" * 40, out=str(tmp_path / "out"), api_repo=None)
-    with pytest.raises(module.UsageError):
-        module.reproduce(arguments)
-    assert ("remote", "set-url", "origin", "https://github.com/o/n.git") in calls
-    assert url in next(call for call in calls if call[0] == "fetch")
-
-
-def test_a_message_from_git_loses_the_credential(gate, monkeypatch):
-    module = load_reproduce(gate)
-    said = b"fatal: unable to access 'https://x-access-token:SECRET@github.com/o/n.git/': error"
-    monkeypatch.setattr(module.subprocess, "run", lambda *_a, **_k: subprocess.CompletedProcess([], 128, b"", said))
-    with pytest.raises(module.UsageError) as caught:
-        module.git("fetch", "origin")
-    assert "SECRET" not in str(caught.value)
-    assert "github.com/o/n.git" in str(caught.value)
 
 
 def test_a_relative_path_to_the_remote_still_works(gate, tmp_path):

@@ -34,7 +34,7 @@ Add to the application's repository, on its default branch:
 | `make check` | runs this repository's own tests |
 | `make reproduce REPO=<url> SHA=<sha>` | reruns every deterministic check in the pinned container, regenerates the report, and compares it with the stored one |
 
-`make reproduce` needs `make` and Docker, and on a GitHub remote it first reads the `reports` branch's commits through GitHub's API, with no token. A private repository needs `GATE_TOKEN` set in your environment, or the rerun stops with `REPORTS_UNTRUSTED`. `make reproduce` hands it to the container by name, and `gate.reproduce` removes it before any rerun check starts. The comparison ignores the times: `generated_at`, `duration_seconds`, the hashes of raw logs (the tools print their own times into them), and the run's ID and attempt. It also ignores `environment` and `verification.execution_environment`, because a rerun runs in another environment by design.
+`make reproduce` needs `make` and Docker, and on a GitHub remote it first reads the `reports` branch's commits through GitHub's API, with no token. It takes no secrets: a rerun runs PR code, which could read them, so a secret-named variable in its environment or a credential in `REPO` exits 2 before anything runs. So a private repository cannot be rerun with this command. The comparison ignores the times: `generated_at`, `duration_seconds`, the hashes of raw logs (the tools print their own times into them), and the run's ID and attempt. It also ignores `environment` and `verification.execution_environment`, because a rerun runs in another environment by design.
 
 AI steps are reproducible as a procedure (prompts, versions, limits), not as identical output.
 

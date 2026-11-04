@@ -81,7 +81,7 @@ def ids_in_source(source: str, path: str) -> set[str]:
     """The IDs of the tests in one file, as a JUnit file names them. Raises SyntaxError."""
     module = PurePosixPath(path).with_suffix("").as_posix().replace("/", ".")
     found: set[str] = set()
-    tree = ast.parse(source)
+    tree = ast.parse(source.removeprefix("\ufeff"))
     if _sets_test_false(tree.body):
         return found
 

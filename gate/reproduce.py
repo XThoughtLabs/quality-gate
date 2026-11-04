@@ -15,7 +15,6 @@ import shutil
 import subprocess
 import sys
 import urllib.parse
-from collections.abc import Mapping
 from pathlib import Path
 
 from gate import report as report_module
@@ -33,15 +32,14 @@ class Untrusted(Exception):
 def git(*args: str, cwd: Path | None = None) -> str:
     process = subprocess.run(["git", *args], cwd=cwd, capture_output=True, check=False)
     if process.returncode != 0:
-        said = re.sub(r"://[^/@\s]+@", "://", process.stderr.decode("utf-8", "replace"))
-        raise UsageError(f"git {args[0]} failed: {said.strip()[:300]}")
+        raise UsageError(f"git {args[0]} failed: {process.stderr.decode('utf-8', 'replace').strip()[:300]}")
     return process.stdout.decode("utf-8", "replace").strip()
 
 
 def github_repository(repo: str) -> str | None:
     """OWNER/NAME of a remote on GitHub, in any URL form, or None for any other remote."""
     text = repo.strip()
-    scp_form = re.fullmatch(r"(?:[^@/\s]+@)?(?:www\.)?github\.com:(.+)", text, re.IGNORECASE)
+    scp_form = re.fullmatch(r"(?:[^@/:\s]+@)?(?:www\.)?github\.com:(.+)", text, re.IGNORECASE)
     if scp_form:
         path = scp_form.group(1)
     else:
@@ -55,17 +53,23 @@ def github_repository(repo: str) -> str | None:
     return name
 
 
-def without_credentials(url: str) -> str:
-    """A URL to keep in a file: a credential in it would be written under --out."""
-    parts = urllib.parse.urlsplit(url)
-    if "@" not in parts.netloc or parts.scheme.lower() not in ("http", "https"):
-        return url
-    return urllib.parse.urlunsplit(parts._replace(netloc=parts.netloc.rsplit("@", 1)[1]))
+def holds_a_credential(url: str) -> bool:
+    try:
+        parts = urllib.parse.urlsplit(url)
+        if "://" not in url:
+            return False
+        return bool(parts.password or parts.query) or (parts.username is not None and parts.scheme.lower() != "ssh")
+    except ValueError:
+        return True
 
 
-def without_secrets(variables: Mapping[str, str]) -> dict[str, str]:
-    """The environment of the checks a rerun starts: PR code runs there, as in the run job."""
-    return {name: value for name, value in variables.items() if not any(part in name.upper() for part in SECRET_NAME_PARTS)}
+def refuse_secrets(repo: str) -> None:
+    """PR code runs under this user and can read this process, so a secret here is a secret given."""
+    names = [name for name, value in os.environ.items() if value and any(part in name.upper() for part in SECRET_NAME_PARTS)]
+    if names:
+        raise UsageError(f"a rerun runs PR code, which could read these, so unset them: {', '.join(sorted(names))}")
+    if holds_a_credential(repo):
+        raise UsageError("--repo holds a credential, which PR code could read, so take it out")
 
 
 def check_stored_evidence(repository: str | None, config: Path, tip: str) -> None:
@@ -130,6 +134,7 @@ def run_step(check: str, config: Path, out: Path, workdir: Path, environment: di
 
 
 def reproduce(args: argparse.Namespace) -> int:
+    refuse_secrets(args.repo)
     out = Path(args.out).resolve()
     work = out / "work"
     for folder in (work, out / "artifact", out / "regenerated"):
@@ -139,11 +144,7 @@ def reproduce(args: argparse.Namespace) -> int:
 
     pr_dir = work / "pr"
     git("clone", "--quiet", args.repo, str(pr_dir))
-    # This folder sits under --out, so a credential in the URL stays out of its files, and git
-    # is given the URL each time. Asked of git because a relative path means something else here.
-    source = git("remote", "get-url", "origin", cwd=pr_dir)
-    git("remote", "set-url", "origin", without_credentials(source), cwd=pr_dir)
-    git("fetch", "--quiet", "--no-tags", source, "+refs/heads/reports:refs/remotes/origin/reports", cwd=pr_dir)
+    git("fetch", "--quiet", "--no-tags", "origin", "+refs/heads/reports:refs/remotes/origin/reports", cwd=pr_dir)
     default_tree = work / "default"
     git("worktree", "add", "--quiet", "--detach", str(default_tree), git("symbolic-ref", "--short", "refs/remotes/origin/HEAD", cwd=pr_dir), cwd=pr_dir)
     tip = git("rev-parse", "refs/remotes/origin/reports", cwd=pr_dir)
@@ -155,7 +156,7 @@ def reproduce(args: argparse.Namespace) -> int:
     context = read_json(stored / "context.json")
     # A closed PR's branch may be gone; GitHub keeps its head under refs/pull.
     subprocess.run(
-        ["git", "fetch", "--quiet", "--no-tags", source, f"refs/pull/{context['pr']}/head"],
+        ["git", "fetch", "--quiet", "--no-tags", "origin", f"refs/pull/{context['pr']}/head"],
         cwd=pr_dir,
         capture_output=True,
         check=False,
@@ -170,7 +171,7 @@ def reproduce(args: argparse.Namespace) -> int:
 
     artifact = out / "artifact"
     environment = {
-        **without_secrets(os.environ),
+        **os.environ,
         "GATE_ENV_ROLE": "reproduce",
         "PYTHONPATH": str(GATE_ROOT),
         "GATE_HOME": str(GATE_ROOT),

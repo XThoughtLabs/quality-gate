@@ -158,7 +158,7 @@ def test_a_link_the_base_already_had_and_a_deleted_link_are_no_violation(gate, t
     world.gate.git(world.repo, "branch", "--force", world.branch, "HEAD")
     world.gate.git(world.repo, "symbolic-ref", "HEAD", f"refs/heads/{world.branch}")
     world.gate.git(world.repo, "rm", "--quiet", "--cached", "gone-link")
-    world.gate.git(world.repo, "update-index", "--add", "--cacheinfo", f"100644,{world.gate.git(world.repo, 'rev-parse', 'HEAD:app.py')},copy.py")
+    world.gate.git(world.repo, "update-index", "--add", "--cacheinfo", f"100644,{world.gate.git(world.repo, 'rev-parse', 'HEAD:app.py')},copied.py")
     world.commit(stage_all=False)
     code, guard = world.guard()
     assert code == 0, guard["violations"]
@@ -420,9 +420,3 @@ def test_other_entry_points_and_dynamic_fields_are_not_refused(world, text):
     assert code == 0, guard["violations"]
 
 
-# X-0b: `make reproduce` hands the token over by name.
-
-
-def test_make_reproduce_hands_the_token_to_the_container_by_name(gate):
-    makefile = (gate.root / "Makefile").read_text(encoding="utf-8")
-    assert "\t  -e GATE_TOKEN \\\n" in makefile, "by name only, so the value is not on the command line"
