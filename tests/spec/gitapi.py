@@ -26,9 +26,11 @@ def blob_sha(data: bytes) -> str:
 
 
 class FakeGitApi:
-    def __init__(self, stub, repo: str = DEFAULT_REPO, token: str = DEFAULT_TOKEN, *, ignore_case: bool = False):
+    def __init__(self, stub, repo: str = DEFAULT_REPO, token: str = DEFAULT_TOKEN, *, ignore_case: bool = False,
+                 require_auth: bool = True):
         self.stub, self.repo, self.token = stub, repo, token
         self.ignore_case = ignore_case   # GitHub treats OWNER/NAME without regard to letter case
+        self.require_auth = require_auth # False: a public repository, read without any credential (gate.reproduce takes none)
         self.blobs: dict[str, bytes] = {}
         self.trees: dict[str, dict[str, tuple[str, str, str]]] = {}   # tree id -> {path: (mode, type, blob sha)}
         self.commits: dict[str, dict] = {}                              # commit sha -> {tree, parents, author, verified, n}
@@ -129,6 +131,8 @@ class FakeGitApi:
 
     # ------------------------------------------------------------------ the routes
     def _auth(self, req) -> bool:
+        if not self.require_auth:
+            return True
         ok = self.token in req.header("authorization")
         if not ok:
             self.bad_auth.append(f"{req.method} {req.path}")

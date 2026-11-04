@@ -1,13 +1,17 @@
-"""gate.reproduce, X-0 (decision X, amended by HQ-ANSWERS-04): who wrote the `reports` branch.
+"""gate.reproduce, X-0 (decision X, amended by HQ-ANSWERS-04 and HQ-ANSWERS-07): who wrote the `reports` branch.
 
 gate.reproduce reads the stored evidence with git. On a GitHub remote, in any URL form, or with --api-repo, it first asks the
 API who wrote the branch (W-12, W-14) and compares what the API shows with what git has read. A foreign commit, a failed read
 or an API that does not show the branch git has read exits 1 with REPORTS_UNTRUSTED. On another remote it says that the
 authors cannot be checked.
 
+Since HQ-ANSWERS-07 gate.reproduce takes no secrets (X-0b, X-0a): nothing here gives it a token, a secret-named variable or a
+credential in a URL, and the API is read without any credential. The forms that carry a credential, and the variables, are
+tested in test_reproduce_x0b.py.
+
 Nothing here touches the network: git rewrites each URL form below to a local bare repository (`url.<base>.insteadOf`, with
 only the file protocol allowed), and the API is the in-memory stand-in on 127.0.0.1. CONTRACTS.md names no variable for the
-API's address and token in section 8b, so those of section 9 are used (GITHUB_API_URL, GATE_TOKEN).
+API's address in section 8b, so the one of section 9 is used (GITHUB_API_URL).
 """
 from __future__ import annotations
 
@@ -18,7 +22,6 @@ import pytest
 from gatekit import Repo, assert_no_traceback, assert_rc, base_env, git, make_bare, push_to, run_gate, write_json
 from gitapi import FakeGitApi
 
-CREDENTIAL = "SENTINEL-VALUE-1234"
 SLUG = "example-org/example-app"
 GITHUB_FORMS = {
     "https": "https://github.com/example-org/example-app",
@@ -26,8 +29,6 @@ GITHUB_FORMS = {
     "ssh-url": "ssh://git@github.com/example-org/example-app.git",
     "scp-like": "git@github.com:example-org/example-app.git",
     "scp-like-without-dot-git": "git@github.com:example-org/example-app",
-    "https-user-and-password": f"https://x-access-token:{CREDENTIAL}@github.com/example-org/example-app.git",
-    "https-token-as-user": f"https://{CREDENTIAL}@github.com/example-org/example-app",
     "https-capitals": "HTTPS://GITHUB.COM/example-org/example-app.git",
     "https-mixed-case-host": "https://GitHub.com/example-org/example-app",
     "ssh-url-capitals": "SSH://GIT@GITHUB.COM/example-org/example-app.git",
@@ -65,7 +66,8 @@ class Remote:
         self.commits = [(line.split()[0], line.split()[1:])
                         for line in git(self.bare, "rev-list", "--reverse", "--parents", "reports").splitlines()]
         assert len(self.commits) == 2
-        self.api = FakeGitApi(stub, ignore_case=True)
+        # a public repository: the API answers without any credential, because gate.reproduce holds none
+        self.api = FakeGitApi(stub, ignore_case=True, require_auth=False)
         self.show()
 
     def show(self, *, foreign=None):
@@ -85,7 +87,7 @@ class Remote:
         cfg = home / ".gitconfig"
         cfg.write_text(text, encoding="utf-8")
         return base_env({"HOME": home, "USERPROFILE": home, "GIT_CONFIG_GLOBAL": cfg, "GIT_ALLOW_PROTOCOL": "file",
-                         "GITHUB_API_URL": self.stub.url, "GATE_TOKEN": self.api.token, **(extra or {})})
+                         "GITHUB_API_URL": self.stub.url, **(extra or {})})
 
     def run(self, url=None, *, api_repo=None, extra_env=None):
         args = ["--repo", url or str(self.bare), "--sha", self.sha, "--out", self.out]
@@ -108,28 +110,20 @@ class Remote:
         return bool(self.stub.reqs("GET", r"/repos/(?i:example-org/example-app)/commits"))
 
 
-def assert_untrusted(remote, res, *, unseen=()):
+def assert_untrusted(remote, res):
     assert_rc(res, 1)
     assert_no_traceback(res)
     said = remote.text(res)
     assert "REPORTS_UNTRUSTED" in said, f"exit 1 without the code REPORTS_UNTRUSTED\n{res.describe()}"
-    for value in unseen:
-        assert value not in said, "a credential of the URL was printed or written (C-3)"
 
 
-def assert_not_untrusted(remote, res, *, unseen=()):
+def assert_not_untrusted(remote, res):
     """The check was made and found nothing: the run goes on to X-2, which finds no evidence for this SHA (exit 2)."""
     assert_rc(res, 2)
     assert_no_traceback(res)
     said = remote.text(res)
     assert "REPORTS_UNTRUSTED" not in said
     assert remote.asked_who_wrote_it(), "the API was never asked who wrote the branch, so the check was not made"
-    for value in unseen:
-        assert value not in said, "a credential of the URL was printed or written (C-3)"
-
-
-def credentials_of(form: str):
-    return [CREDENTIAL] if CREDENTIAL in GITHUB_FORMS[form] else []
 
 
 # ----------------------------------------------------------------------------- every URL form of a GitHub remote
@@ -141,7 +135,7 @@ def test_x0_a_foreign_commit_exits_1_with_reports_untrusted_in_every_github_url_
     remote = Remote(tmp_path, stub, evidence_for_sha=True)   # the evidence for the very SHA is there, and must not be read
     remote.show(foreign={remote.commits[0][0]: ("some-person", True)})
     res = remote.run(GITHUB_FORMS[form])
-    assert_untrusted(remote, res, unseen=credentials_of(form))
+    assert_untrusted(remote, res)
 
 
 @pytest.mark.req("X-0")
@@ -149,7 +143,17 @@ def test_x0_a_foreign_commit_exits_1_with_reports_untrusted_in_every_github_url_
 def test_x0_control_only_the_bots_commits_pass_the_check_in_every_github_url_form(tmp_path, stub, form):
     remote = Remote(tmp_path, stub, evidence_for_sha=False)
     res = remote.run(GITHUB_FORMS[form])
-    assert_not_untrusted(remote, res, unseen=credentials_of(form))
+    assert_not_untrusted(remote, res)
+
+
+@pytest.mark.req("X-0", "X-0b")
+def test_x0_the_api_is_asked_without_any_credential(tmp_path, stub):
+    # gate.reproduce takes no secrets, so it has none to send: the check of W-12 is an anonymous read
+    remote = Remote(tmp_path, stub, evidence_for_sha=False)
+    res = remote.run(GITHUB_FORMS["https"])
+    assert_not_untrusted(remote, res)
+    sent = [r for r in stub.requests if r.header("authorization")]
+    assert not sent, f"requests that carried an Authorization header: {sent}"
 
 
 # ----------------------------------------------------------------------------- the three kinds of failure, by every way in
@@ -179,8 +183,9 @@ def scenario_read_fails_404(r):
     r.api.commits_status = 404
 
 
-def scenario_token_refused(r):
-    return {"GATE_TOKEN": "SENTINEL-VALUE-1234-WRONG"}
+def scenario_read_refused_403(r):
+    # what an anonymous read gets when GitHub refuses it (a rate limit, for one): a failed read, not an all-clear
+    r.api.commits_status = 403
 
 
 def scenario_api_has_no_such_branch(r):
@@ -205,7 +210,7 @@ FAILURES = {
     "another-app-is-a-foreign-author": scenario_another_app,
     "the-read-of-the-commits-fails-500": scenario_read_fails_500,
     "the-read-of-the-commits-fails-404": scenario_read_fails_404,
-    "the-token-is-refused": scenario_token_refused,
+    "the-read-is-refused-403": scenario_read_refused_403,
     "the-api-shows-no-such-branch": scenario_api_has_no_such_branch,
     "the-api-shows-another-history": scenario_api_shows_another_history,
     "the-api-is-behind-the-branch-git-has-read": scenario_api_is_behind_git,
