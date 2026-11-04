@@ -322,6 +322,16 @@ def test_reproduce_refuses_a_reports_branch_written_by_another_actor(world, shor
     assert "REPORTS_UNTRUSTED" in process.stderr
 
 
+@pytest.mark.req("X-0b")
+def test_reproduce_keeps_secrets_from_the_checks_it_reruns(world, short_tmp):
+    """With a token in the rerun's environment, gate/env would fail and the reports would differ."""
+    head = world.change()
+    assert world.judge(world.run_job())["verdict"] == "ready-for-human"
+    env = {**reproduce_env(world), "GATE_TOKEN": "FAKE-VALUE-NOT-A-TOKEN", "SOME_API_KEY": "FAKE-VALUE-TWO"}
+    process = world.gate.run("reproduce", "--repo", world.remote, "--sha", head, "--out", short_tmp / "rerun", env=env)
+    assert process.returncode == 0, process.stdout + process.stderr
+
+
 @pytest.mark.req("X-1")
 def test_reproduce_finds_a_closed_prs_head_after_its_branch_is_gone(world, short_tmp):
     head = world.change()

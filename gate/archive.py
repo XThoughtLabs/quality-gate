@@ -173,10 +173,9 @@ class GitRemote:
 class ApiRemote:
     """The branch on GitHub, written through the API so that GitHub signs each commit."""
 
-    def __init__(self, repository: str, branch: str, base: str | None = None, token: str | None = None, must_exist: bool = False) -> None:
+    def __init__(self, repository: str, branch: str, base: str | None = None, token: str | None = None) -> None:
         self.repository = repository
         self.branch = branch
-        self.must_exist = must_exist
         self.base = (base or os.environ.get("GITHUB_API_URL", "https://api.github.com")).rstrip("/")
         self.token = os.environ.get("GATE_TOKEN", "") if token is None else token
         self.head: str | None = None
@@ -278,8 +277,6 @@ class ApiRemote:
     def foreign_commits(self, accepted: dict[str, dict]) -> tuple[list[str], list[str]]:
         """Each commit not written and signed for github-actions[bot], and those accepted of them."""
         if self._read_head() is None:
-            if self.must_exist:
-                raise RemoteError("the branch exists, and the API does not show it")
             return [], []
         foreign: list[str] = []
         found: list[str] = []

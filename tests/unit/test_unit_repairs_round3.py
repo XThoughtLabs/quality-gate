@@ -298,8 +298,15 @@ def test_a_404_for_a_branch_git_has_read_is_no_all_clear(gate, stub):
         sys.path.remove(str(gate.root))
     stub.routes[("GET", "/repos/example/app/git/ref/heads/reports")] = (404, {})
     assert actors_status(ApiRemote("example/app", "reports", base=stub.url, token=""), {})["actors_ok"] is True, "a first run has no branch yet"
-    status = actors_status(ApiRemote("example/app", "reports", base=stub.url, token="", must_exist=True), {})
-    assert status["actors_ok"] is False
+    module = load_reproduce(gate)
+    with pytest.raises(module.Untrusted):
+        env = os.environ.copy()
+        os.environ["GITHUB_API_URL"] = stub.url
+        try:
+            module.check_stored_evidence("example/app", gate.root / "docs" / "quality.example.toml", "a" * 40)
+        finally:
+            os.environ.clear()
+            os.environ.update(env)
 
 
 # X-0a: a credential in the URL goes to git and stays in no file or message.

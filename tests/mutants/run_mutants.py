@@ -28,8 +28,9 @@ UNIT = "tests/unit/test_unit_scripts.py"
 E2E = "tests/unit/test_unit_end_to_end.py"
 REAL = "tests/unit/test_unit_real_pytest.py"
 ROUND3 = "tests/unit/test_unit_repairs_round3.py"
+ROUND4 = "tests/unit/test_unit_repairs_round4.py"
 TESTS_FOR = {
-    "GUARD": ["tests/spec/test_guard.py", "tests/spec/test_guard_v.py", "tests/spec/test_guard_r4.py", ROUND3, REAL, UNIT, E2E],
+    "GUARD": ["tests/spec/test_guard.py", "tests/spec/test_guard_v.py", "tests/spec/test_guard_r4.py", ROUND4, ROUND3, REAL, UNIT, E2E],
     "COL": [REAL, "tests/spec/test_run_checks_base.py", "tests/spec/test_acceptance.py"],
     "PUB": [UNIT, ROUND3, "tests/spec/test_publish_r4.py", "tests/spec/test_reproduce.py"],
     "WF": ["tests/unit/test_unit_workflows.py", "tests/spec/test_workflows.py"],
@@ -165,14 +166,30 @@ MUTANTS: list[tuple[str, str, str, str, str]] = [
     ("PUB-R3-pattern", "gate/publish.py", "return any(value and value in text for value in values) or SECRET_PATTERN.search(text) is not None", "return any(value and value in text for value in values)", "H2 a token's shape is posted"),
     ("REPRO-R3-host", "gate/reproduce.py", 'if (parts.hostname or "").lower() not in ("github.com", "www.github.com"):', 'if parts.scheme != "https" or parts.hostname != "github.com":', "M2 a GitHub URL taken for another remote"),
     ("REPRO-R3-scp", "gate/reproduce.py", "    if scp_form:\n        path = scp_form.group(1)\n    else:\n", "    if True:\n", "M2 the git@ form"),
-    ("REPRO-R3-exists", "gate/reproduce.py", 'ApiRemote(repository, "reports", must_exist=True)', 'ApiRemote(repository, "reports")', "M2 a 404 read as all clear"),
+    ("REPRO-R4-env", "gate/reproduce.py", "**without_secrets(os.environ),", "**os.environ,", "R4-M2 a rerun's check sees a token"),
     ("REPRO-R3-tip", "gate/reproduce.py", "if tip not in remote.listed:", "if False:", "X-0 another history than git read"),
     ("REPRO-R3-credential", "gate/reproduce.py", 'git("remote", "set-url", "origin", without_credentials(source), cwd=pr_dir)\n', "pass\n", "X-0a a credential in a file under --out"),
     ("REPRO-R3-strip", "gate/reproduce.py", 'return urllib.parse.urlunsplit(parts._replace(netloc=parts.netloc.rsplit("@", 1)[1]))', "return url", "X-0a a credential in a file under --out"),
     ("REPRO-R3-direct-fetch", "gate/reproduce.py", 'git("fetch", "--quiet", "--no-tags", source, "+refs/heads/reports', 'git("fetch", "--quiet", "--no-tags", "origin", "+refs/heads/reports', "X-0a a private remote's fetch still has its credential"),
     ("REPRO-R3-relative", "gate/reproduce.py", 'source = git("remote", "get-url", "origin", cwd=pr_dir)', "source = args.repo", "X-0a a relative path resolved from the wrong folder"),
     ("REPRO-R3-scrub", "gate/reproduce.py", 'said = re.sub(r"://[^/@\\s]+@", "://", process.stderr.decode("utf-8", "replace"))', 'said = process.stderr.decode("utf-8", "replace")', "X-0a a credential in a message"),
-    ("ARC-R3-exists", "gate/archive.py", "            if self.must_exist:\n                raise RemoteError(\"the branch exists, and the API does not show it\")\n", "", "M2 a 404 read as all clear"),
+    # Review round 4.
+    ("GUARD-R4-link", "gate/guard.py", "if git.mode(head, path) in NOT_PLAIN_MODES:", "if False:", "R4-H1 a link is read by its target's name"),
+    ("GUARD-R4-submodule", "gate/guard.py", 'NOT_PLAIN_MODES = ("120000", "160000")', 'NOT_PLAIN_MODES = ("120000",)', "R4-H1 a submodule passes"),
+    ("GUARD-R4-attributes", "gate/guard.py", '    ".gitattributes",\n', "", "R4-H2 the checkout differs from the blob"),
+    ("GUARD-R4-newlines", "gate/guard.py", 'return (text or "").replace("\\r\\n", "\\n").replace("\\r", "\\n")', 'return text or ""', "R4-H5 a lone CR splits the guard from pytest"),
+    ("GUARD-R4-plugin-any", "gate/guard.py", 'plugins = [_values_named(doc, "pytest11") for doc in (before_doc, after_doc)]', 'plugins = [_as_table(_as_table(doc.get("project")).get("entry-points")).get("pytest11") for doc in (before_doc, after_doc)]', "R4-M3 another tool's plugin table"),
+    ("GUARD-R4-dynamic", "gate/guard.py", 'if dynamic[0] != dynamic[1] and "entry-points" in f"{dynamic[0]}{dynamic[1]}":', "if False:", "R4-M3 entry points declared dynamic"),
+    ("GUARD-R4-rebind", "gate/guard.py", "if any(head_bound[scope] > base_bound[scope] for scope in _scopes(name)):", "if False:", "R4-H4 a test's name bound again"),
+    ("GUARD-R4-rebind-class", "gate/guard.py", "for scope in _scopes(name)):", "for scope in [name]):", "R4-H4 the class a test stands in bound again"),
+    ("GUARD-R4-rebind-def", "gate/guard.py", "if isinstance(child, (ast.FunctionDef, ast.AsyncFunctionDef, ast.ClassDef)):\n                # Another def replaces the one before it, and can replace a class of that name.\n                bound[prefix + child.name] += 1\n", "if isinstance(child, (ast.FunctionDef, ast.AsyncFunctionDef, ast.ClassDef)):\n", "R4-H4 another def or class under a test's name"),
+    ("GUARD-R4-rebind-attribute", "gate/guard.py", 'bound[f"{prefix}{child.value.id}.{child.attr}"] += 1', "pass", "R4-H4 an attribute set from outside the class"),
+    ("GUARD-R4-rebind-import", "gate/guard.py", 'bound[prefix + (child.asname or child.name.split(".", 1)[0])] += 1', "pass", "R4-H4 an import under a test's name"),
+    ("GUARD-R4-rebind-except", "gate/guard.py", "elif isinstance(child, ast.ExceptHandler) and child.name:\n                    bound[prefix + child.name] += 1\n", "elif False:\n                    pass\n", "R4-H4 except as a test's name"),
+    ("GUARD-R4-rebind-scope", "gate/guard.py", "own_scopes = (ast.Lambda, ast.ListComp, ast.SetComp, ast.DictComp, ast.GeneratorExp)", "own_scopes = ()", "R4-H4 a comprehension's own variable refused"),
+    ("GUARD-R4-spec-conftest", "gate/guard.py", "if PurePosixPath(path.lower()).name == PROTECTED_ROOT_CONFTEST:\n        return \"a spec PR", "if False:\n        return \"a spec PR", "R4-H3 a conftest.py in a spec PR"),
+    ("GUARD-R4-spec-names", "gate/guard.py", 'if is_protected_control_file(path):\n        return "a spec PR may not', 'if False:\n        return "a spec PR may not', "R4-H3 pytest.ini under acceptance/ in a spec PR"),
+    ("GUARD-R4-spec-sections", "gate/guard.py", "return section_change(path, git.show(base, path), git.show(head, path))[0]", "return None", "R4-H3 a section under acceptance/ in a spec PR"),
     ("GUARD-X-review", "gate/guard.py", "result.security_review_changes = security_review_changes(git, base, head)", "pass", "F8 a change to the security review"),
     ("GUARD-X-parse", "gate/guard.py", 'result.add("TEST_WEAKENED", path, "the changed test file cannot be parsed")', "pass", "an unparsable test file"),
     ("RUN-X-acceptance", "gate/run_checks.py", 'ignore = ["acceptance/", *check.get("expected_tests_ignore", [])]', 'ignore = [*check.get("expected_tests_ignore", [])]', "F1 acceptance tests expected of gate/tests"),

@@ -8,6 +8,7 @@ from __future__ import annotations
 
 import argparse
 import ast
+import collections
 import configparser
 import fnmatch
 import hashlib
@@ -49,7 +50,11 @@ PROTECTED_NAMES_ANY_FOLDER = {
     "bandit.yml",
     ".gitleaks.toml",
     ".gitleaksignore",
+    # It can make what is checked out differ from what git stores, which is what the guard reads.
+    ".gitattributes",
 }
+# In what git stores, a link is only the name of its target, and a submodule only a commit's name.
+NOT_PLAIN_MODES = ("120000", "160000")
 PROTECTED_ROOT_CONFTEST = "conftest.py"
 # `python -m pytest` runs from the working folder, so these would stand in for pytest itself.
 PROTECTED_ROOT_SHADOWS = ("pytest.py", "pytest/", "_pytest/")
@@ -143,6 +148,11 @@ class Git:
         if process.returncode != 0:
             return None
         return process.stdout.decode("utf-8", "replace")
+
+    def mode(self, rev: str, path: str) -> str | None:
+        """A path's mode in a commit: 120000 is a link and 160000 a submodule. None when absent."""
+        raw = self.run("ls-tree", "-z", "--full-tree", rev, "--", path)
+        return raw.split(b" ", 1)[0].decode("ascii", "replace") if raw else None
 
     def exists(self, rev: str) -> bool:
         process = subprocess.run(
@@ -257,10 +267,28 @@ def _as_table(value: object) -> dict:
     return value if isinstance(value, dict) else {}
 
 
+def _with_newlines_as_pytest_reads_them(text: str | None) -> str:
+    return (text or "").replace("\r\n", "\n").replace("\r", "\n")
+
+
+def _values_named(value: object, name: str) -> list[object]:
+    """Every value under a key of this name, anywhere in a parsed file."""
+    found: list[object] = []
+    if isinstance(value, dict):
+        for key, item in value.items():
+            if str(key).lower() == name:
+                found.append(item)
+            found += _values_named(item, name)
+    elif isinstance(value, list):
+        for item in value:
+            found += _values_named(item, name)
+    return found
+
+
 def _toml_change(is_root: bool, base_text: str | None, head_text: str | None) -> tuple[str | None, bool]:
     try:
-        before_doc = tomllib.loads(base_text or "")
-        after_doc = tomllib.loads(head_text or "")
+        before_doc = tomllib.loads(_with_newlines_as_pytest_reads_them(base_text))
+        after_doc = tomllib.loads(_with_newlines_as_pytest_reads_them(head_text))
     except tomllib.TOMLDecodeError:
         mentions_pytest = "pytest" in f"{base_text}{head_text}".lower()
         return ("the file cannot be parsed", False) if is_root or mentions_pytest else (None, False)
@@ -271,11 +299,12 @@ def _toml_change(is_root: bool, base_text: str | None, head_text: str | None) ->
     hit = [key for key in changed if key.lower() in watched]
     if hit:
         return f"[tool.{hit[0]}] changed", False
-    plugins = [
-        _as_table(_as_table(doc.get("project")).get("entry-points")).get("pytest11") for doc in (before_doc, after_doc)
-    ]
+    plugins = [_values_named(doc, "pytest11") for doc in (before_doc, after_doc)]
     if plugins[0] != plugins[1]:
-        return "[project.entry-points.pytest11] changed", False
+        return "a table named pytest11 changed", False
+    dynamic = [_as_table(doc.get("project")).get("dynamic") for doc in (before_doc, after_doc)]
+    if dynamic[0] != dynamic[1] and "entry-points" in f"{dynamic[0]}{dynamic[1]}":
+        return "project.dynamic names entry-points", False
     return None, is_root and base_text != head_text
 
 
@@ -442,6 +471,43 @@ def collect_functions(source: str) -> tuple[dict[str, TestFacts], dict[str, str]
     return tests, others
 
 
+def rebound_names(source: str) -> collections.Counter[str]:
+    """How often each name is bound at module or class level, a test's own `def` included once."""
+    bound: collections.Counter[str] = collections.Counter()
+    own_scopes = (ast.Lambda, ast.ListComp, ast.SetComp, ast.DictComp, ast.GeneratorExp)
+
+    def scan(node: ast.AST, prefix: str) -> None:
+        for child in ast.iter_child_nodes(node):
+            if isinstance(child, (ast.FunctionDef, ast.AsyncFunctionDef, ast.ClassDef)):
+                # Another def replaces the one before it, and can replace a class of that name.
+                bound[prefix + child.name] += 1
+                if isinstance(child, ast.ClassDef):
+                    scan(child, f"{prefix}{child.name}.")
+            elif not isinstance(child, own_scopes):
+                if isinstance(child, ast.Name) and isinstance(child.ctx, (ast.Store, ast.Del)):
+                    bound[prefix + child.id] += 1
+                elif (
+                    isinstance(child, ast.Attribute)
+                    and isinstance(child.ctx, (ast.Store, ast.Del))
+                    and isinstance(child.value, ast.Name)
+                ):
+                    bound[f"{prefix}{child.value.id}.{child.attr}"] += 1
+                elif isinstance(child, ast.alias):
+                    bound[prefix + (child.asname or child.name.split(".", 1)[0])] += 1
+                elif isinstance(child, ast.ExceptHandler) and child.name:
+                    bound[prefix + child.name] += 1
+                scan(child, prefix)
+
+    scan(ast.parse(source), "")
+    return bound
+
+
+def _scopes(name: str) -> list[str]:
+    """A test and the classes it stands in: rebinding any of them takes the test away."""
+    parts = name.split(".")
+    return [".".join(parts[: index + 1]) for index in range(len(parts))]
+
+
 def check_tests(git: Git, base: str, head: str, status: str, path: str, result: Result) -> list[tuple[int, int]]:
     """Apply the test rules. Return the head's line ranges already flagged as skipped."""
     if status == "D":
@@ -461,6 +527,8 @@ def check_tests(git: Git, base: str, head: str, status: str, path: str, result: 
         result.add("TEST_WEAKENED", path, "the changed test file cannot be parsed")
         return []
 
+    base_bound = rebound_names(base_source)
+    head_bound = rebound_names(head_source)
     flagged: list[tuple[int, int]] = []
     for name, before in sorted(base_tests.items()):
         after = head_tests.get(name)
@@ -468,6 +536,9 @@ def check_tests(git: Git, base: str, head: str, status: str, path: str, result: 
             result.add("TEST_DELETED", path, f"{name} was removed")
             continue
         weakened = False
+        if any(head_bound[scope] > base_bound[scope] for scope in _scopes(name)):
+            result.add("TEST_WEAKENED", path, f"{name} is bound again at module or class level")
+            weakened = True
         if after.skips > before.skips:
             result.add("TEST_SKIPPED", path, f"{name} gained a skip or an expected failure")
             flagged.append((after.first_line, after.last_line))
@@ -746,6 +817,15 @@ def security_review_changes(git: Git, base: str, head: str) -> list[dict]:
     return changes
 
 
+def spec_control_refusal(git: Git, base: str, head: str, path: str) -> str | None:
+    """A spec PR adds tests. What controls how every test runs stays with people."""
+    if PurePosixPath(path.lower()).name == PROTECTED_ROOT_CONFTEST:
+        return "a spec PR may not change a conftest.py: fixtures go in the test file, or in a person's PR"
+    if is_protected_control_file(path):
+        return "a spec PR may not change what controls the tests"
+    return section_change(path, git.show(base, path), git.show(head, path))[0]
+
+
 def check_ai_rules(git: Git, base: str, head: str, changes: list[tuple[str, str]], guard: dict, result: Result) -> None:
     protected = [*FIXED_PROTECTED, *guard.get("extra_protected", [])]
     keys = [*FIXED_THRESHOLD_KEYS, *guard.get("threshold_keys", [])]
@@ -785,6 +865,10 @@ def judge(args: argparse.Namespace, config: dict) -> Result:
         for status, path in changes:
             if not is_protected(path, ["acceptance/"]):
                 result.add("SPEC_OUTSIDE_ACCEPTANCE", path, "a spec PR may touch only acceptance/")
+                continue
+            refusal = spec_control_refusal(git, base, head, path)
+            if refusal:
+                result.add("PROTECTED_PATH", path, refusal)
             elif is_test_file(path):
                 check_tests(git, base, head, status, path, result)
 
@@ -792,6 +876,8 @@ def judge(args: argparse.Namespace, config: dict) -> Result:
         for status, path in changes:
             if status != "D":
                 check_pins(git, base, head, path, result)
+                if git.mode(head, path) in NOT_PLAIN_MODES:
+                    result.add("PROTECTED_PATH", path, "a symbolic link or a submodule: tools follow what the guard cannot read")
 
     check_repeated(git, base, head, head, args, result)
     if kind != "ai":

@@ -15,10 +15,12 @@ import shutil
 import subprocess
 import sys
 import urllib.parse
+from collections.abc import Mapping
 from pathlib import Path
 
 from gate import report as report_module
 from gate.archive import ApiRemote, actors_status, load_accepted
+from gate.env_check import SECRET_NAME_PARTS
 from gate.common import DIAGNOSTIC_CHECKS, EXIT_OK, EXIT_RULE_FAILED, UsageError, fail_usage, read_json, read_json_or_none, write_json
 
 GATE_ROOT = Path(__file__).resolve().parent.parent
@@ -61,18 +63,22 @@ def without_credentials(url: str) -> str:
     return urllib.parse.urlunsplit(parts._replace(netloc=parts.netloc.rsplit("@", 1)[1]))
 
 
+def without_secrets(variables: Mapping[str, str]) -> dict[str, str]:
+    """The environment of the checks a rerun starts: PR code runs there, as in the run job."""
+    return {name: value for name, value in variables.items() if not any(part in name.upper() for part in SECRET_NAME_PARTS)}
+
+
 def check_stored_evidence(repository: str | None, config: Path, tip: str) -> None:
     """Stored evidence on GitHub is read only after the check every other read makes."""
     if repository is None:
         print("note: this remote is not on GitHub, so the authors of its reports branch cannot be checked")
         return
-    # git has already read this branch, so an API that cannot see it is no all-clear.
-    remote = ApiRemote(repository, "reports", must_exist=True)
+    remote = ApiRemote(repository, "reports")
     status = actors_status(remote, load_accepted(str(config)))
     if not status["actors_ok"]:
         raise Untrusted(str(status["reason"]))
-    # The commits checked must include the one git read. A later commit on the API's side is
-    # only a report stored meanwhile, and its authors were checked too.
+    # The commits checked must include the one git read, so an API that shows no such branch is
+    # no all-clear. A later commit on its side is a report stored meanwhile, and was checked too.
     if tip not in remote.listed:
         raise Untrusted("the API does not show the commit git has read from this branch")
 
@@ -164,7 +170,7 @@ def reproduce(args: argparse.Namespace) -> int:
 
     artifact = out / "artifact"
     environment = {
-        **os.environ,
+        **without_secrets(os.environ),
         "GATE_ENV_ROLE": "reproduce",
         "PYTHONPATH": str(GATE_ROOT),
         "GATE_HOME": str(GATE_ROOT),
