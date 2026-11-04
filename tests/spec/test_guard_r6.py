@@ -465,6 +465,37 @@ def test_g1g_control_a_module_that_is_not_top_level_is_no_violation(tmp_path, ba
     assert_clean(res, d)
 
 
+@pytest.mark.req("G-1g")
+@pytest.mark.parametrize("direction", ["a-file-turned-into-a-package", "a-package-turned-into-a-file"])
+def test_g1g_control_a_module_the_base_has_in_the_other_shape_is_no_violation(tmp_path, baseline, direction):
+    # "a module's name the base already has at the top level, as a file or as a package": the name is what counts
+    if direction == "a-file-turned-into-a-package":
+        case = start(tmp_path, baseline, AI, files={"json.py": VALUE_PY})
+        change(case, files={"json/__init__.py": ""}, deletes=["json.py"])
+    else:
+        case = start(tmp_path, baseline, AI, files={"logging/__init__.py": ""})
+        change(case, files={"logging.py": VALUE_PY}, deletes=["logging/__init__.py"])
+    res, d = case.run()
+    assert_clean(res, d)
+
+
+@pytest.mark.req("G-1g")
+def test_g1g_control_a_package_added_beside_a_file_of_the_same_name_the_base_has_is_no_violation(tmp_path, baseline):
+    case = start(tmp_path, baseline, AI, files={"json.py": VALUE_PY})
+    change(case, files={"json/__init__.py": ""})
+    res, d = case.run()
+    assert_clean(res, d)
+
+
+@pytest.mark.req("G-1g")
+def test_g1g_the_name_the_base_has_excuses_only_that_name(tmp_path, baseline):
+    case = start(tmp_path, baseline, AI, files={"json.py": VALUE_PY})
+    change(case, files={"json/__init__.py": "", "logging/__init__.py": ""})
+    res, d = case.run()
+    assert_fires(res, d, "PROTECTED_PATH", "logging/__init__.py")
+    assert "json/__init__.py" not in paths_of(d)
+
+
 # ----------------------------------------------------------------------------- G-1h: standing in for the application
 
 H_FIRE = {   # base files, head files, the path that must be reported
@@ -512,7 +543,8 @@ def test_g1h_a_module_under_acceptance_that_stands_in_for_another_is_refused_in_
 @pytest.mark.req("G-1h")
 def test_g1h_control_other_names_in_a_test_folder_are_no_violation(tmp_path, baseline):
     case = start(tmp_path, baseline, AI)
-    change(case, files={"tests/helpers_extra.py": VALUE_PY, "tests/mytools/__init__.py": "", "tests/__init__.py": ""})
+    # (no tests/__init__.py here: a package is never stood in for, so it would make this control pass whatever the names)
+    change(case, files={"tests/helpers_extra.py": VALUE_PY, "tests/mytools/__init__.py": ""})
     res, d = case.run()
     assert_clean(res, d)
 
@@ -555,6 +587,48 @@ def test_g1h_control_a_module_of_the_application_that_is_not_top_level_cannot_be
     change(case, files={"tests/inner.py": VALUE_PY})
     res, d = case.run()
     assert_clean(res, d)
+
+
+PACKAGE_MODULES = {"the application": "app", "the standard library": "os", "a tool": "pluggy"}
+
+
+@pytest.mark.req("G-1h")
+@pytest.mark.parametrize("shape", ["module", "package"])
+def test_g1h_control_a_test_folder_that_is_a_package_cannot_be_stood_in_for_by_a_new_module_or_package(tmp_path, baseline, shape):
+    # pytest puts a test's folder first on the path unless the folder is a package
+    case = start(tmp_path, baseline, AI, files={"pack/__init__.py": "", "pack/test_pack.py": TESTFILE})
+    change(case, files={f"pack/{name}.py" if shape == "module" else f"pack/{name}/__init__.py": VALUE_PY
+                        for name in PACKAGE_MODULES.values()})
+    res, d = case.run()
+    assert_clean(res, d)
+
+
+@pytest.mark.req("G-1h")
+def test_g1h_control_an_init_py_that_the_same_pr_adds_makes_the_folder_a_package_in_the_head(tmp_path, baseline):
+    # a reading: "has no __init__.py" is judged on the head, like the application's modules
+    case = start(tmp_path, baseline, AI, files={"pack/test_pack.py": TESTFILE})
+    change(case, files={"pack/__init__.py": "", "pack/app.py": VALUE_PY})
+    res, d = case.run()
+    assert_clean(res, d)
+
+
+@pytest.mark.req("G-1h")
+def test_g1h_the_same_new_module_is_refused_in_a_folder_with_no_init_py_and_not_in_one_with_it(tmp_path, baseline):
+    case = start(tmp_path, baseline, AI, files={"pack/__init__.py": "", "pack/test_pack.py": TESTFILE, "plain/test_plain.py": TESTFILE})
+    change(case, files={"pack/app.py": VALUE_PY, "plain/app.py": VALUE_PY})
+    res, d = case.run()
+    assert_fires(res, d, "PROTECTED_PATH", "plain/app.py")
+    assert "pack/app.py" not in paths_of(d)
+
+
+@pytest.mark.req("G-1h", "G-11a")
+def test_g1h_acceptance_is_a_package_in_the_base_so_only_the_folder_without_init_py_below_it_is_refused(tmp_path, baseline):
+    case = start(tmp_path, baseline, SPEC, files={"acceptance/__init__.py": ""})
+    change(case, files={"acceptance/app.py": VALUE_PY, "acceptance/sub/os.py": VALUE_PY})
+    res, d = case.run()
+    assert d["kind"] == "spec"
+    assert_fires(res, d, "PROTECTED_PATH", "acceptance/sub/os.py")
+    assert "acceptance/app.py" not in paths_of(d)
 
 
 # ----------------------------------------------------------------------------- G-1i: plugins by name
@@ -814,3 +888,72 @@ def test_g4_a_spec_pr_cannot_bind_a_test_name_in_a_newly_listed_way_either(tmp_p
     res, d = spec_bound_case(tmp_path, baseline, at_the_end("match 1:\n    case test_alpha:\n        pass"))
     assert d["kind"] == "spec"
     assert_fires(res, d, "TEST_WEAKENED", "acceptance/test_bind.py")
+
+
+# ----------------------------------------------------------------------------- C-2: a call in any ordinary form is no crash
+#
+# An expected failure prints a short message and no traceback. The guard reads the code of a test that a PR changes, and a call
+# in it can have any ordinary shape: a method of a literal, of a call's result, of a subscript, a call of a call's result, a
+# chain that starts at a name, a chain that starts at `self`.
+
+FORMS = "tests/test_forms.py"
+CALL_FORMS = {
+    "a-method-of-a-literal": '",".join(x)',
+    "a-method-of-a-call-result": "make().value()",
+    "a-method-of-a-subscript": "items[0].run()",
+    "a-call-of-a-call-result": "make()()",
+    "a-chain-that-starts-at-a-name": 'Path("x").read_text()',
+    "a-chain-that-starts-at-self": 'self.client.get("/").json()',
+}
+FORMS_TEMPLATE = '''from pathlib import Path
+
+
+class TestForms:
+    def test_form(self):
+        x = ["a", "b"]
+        items = [object()]
+        make = lambda: x
+        {call}
+        value = {call}
+        assert value == {expected}
+        assert {call} is not None
+'''
+
+
+def forms(call, expected=1):
+    return FORMS_TEMPLATE.format(call=call, expected=expected)
+
+
+@pytest.mark.req("C-2", "G-4a")
+@pytest.mark.parametrize("form", list(CALL_FORMS))
+def test_c2_changing_a_test_that_holds_a_call_in_any_ordinary_form_gets_a_normal_answer(tmp_path, baseline, form):
+    call = CALL_FORMS[form]
+    case = Case(tmp_path, baseline, base_edits={FORMS: forms(call, 1)})
+    case.change({FORMS: forms(call, 2)})
+    res, d = case.run()
+    assert d["kind"] == "ai"
+    assert_clean(res, d)    # exit 0, the --out file written, no traceback
+    assert any(m["path"] == FORMS and m["name"].endswith("test_form") for m in d["marked_tests"]), d["marked_tests"]
+
+
+@pytest.mark.req("C-2", "G-11a")
+def test_c2_the_same_in_a_spec_pr_under_acceptance_gets_a_normal_answer(tmp_path, baseline):
+    path = "acceptance/test_forms.py"
+    call = CALL_FORMS["a-chain-that-starts-at-self"]
+    case = Case(tmp_path, baseline, branch=SPEC, base_edits={path: forms(call, 1)})
+    case.change({path: forms(call, 2)})
+    res, d = case.run()
+    assert d["kind"] == "spec"
+    assert_clean(res, d)
+    assert any(m["path"] == path for m in d["marked_tests"]), d["marked_tests"]
+
+
+@pytest.mark.req("C-2", "G-4")
+def test_c2_a_weakened_test_that_holds_such_a_call_still_gets_test_weakened_and_no_traceback(tmp_path, baseline):
+    call = CALL_FORMS["a-chain-that-starts-at-self"]
+    weakened = forms(call, 1).replace("assert value == 1", "assert True")
+    assert weakened != forms(call, 1)
+    case = Case(tmp_path, baseline, base_edits={FORMS: forms(call, 1)})
+    case.change({FORMS: weakened})
+    res, d = case.run()
+    assert_fires(res, d, "TEST_WEAKENED", FORMS)
