@@ -835,9 +835,9 @@
   {
     "id": "GUARD-R5-encoding-newline",
     "rule": "R5-H2 a cookie after a lone CR",
-    "outcome": "survived",
-    "killed_by": "",
-    "run_at": "abc47da"
+    "outcome": "killed",
+    "killed_by": "FAILED tests/unit/test_unit_repairs_round5.py::test_another_encoding_is_refused[a-test-blank-line-ended-by-a-lone-cr]",
+    "run_at": "2026-11-06, d81a2d8 with the test case added in this commit"
   },
   {
     "id": "GUARD-R5-not-source",

@@ -84,8 +84,8 @@ def test_gitmodules_cannot_hide_a_submodule(world):
 
 @pytest.mark.parametrize(
     "first",
-    ["# coding: utf-7\n", "# -*- coding: latin-1 -*-\n", "# vim: set fileencoding=cp1252 :\n", "#!/bin/python\n# coding: utf-7\n", "#!/bin/python\r# coding: utf-7\r", "# coding: nothing-of-this-name\n", "\ufeff# coding: latin-1\n"],
-    ids=["utf-7", "latin-1", "vim", "second-line", "after-a-lone-cr", "unknown", "bom-and-another"],
+    ["# coding: utf-7\n", "# -*- coding: latin-1 -*-\n", "# vim: set fileencoding=cp1252 :\n", "#!/bin/python\n# coding: utf-7\n", "#!/bin/python\r# coding: utf-7\r", "\r# coding: utf-7\r", "# coding: nothing-of-this-name\n", "\ufeff# coding: latin-1\n"],
+    ids=["utf-7", "latin-1", "vim", "second-line", "after-a-lone-cr", "blank-line-ended-by-a-lone-cr", "unknown", "bom-and-another"],
 )
 @pytest.mark.parametrize("path", ["tests/test_a.py", "app.py", "new/module.py"], ids=["a-test", "the-application", "a-new-file"])
 def test_another_encoding_is_refused(world, first, path):
