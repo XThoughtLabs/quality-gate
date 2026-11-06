@@ -22,3 +22,9 @@ The pipeline names no application, so it can be pointed at another one.
 The application's other repository calls these workflows at a full commit SHA only.
 
 Known limits: PR code runs inside the `run` job, so the gate does not prove resistance to a deliberately adversarial executor. It proves only what its checks see.
+
+## License
+
+Apache License 2.0: see `LICENSE` and `NOTICE`.
+
+This product was written with AI assistance (Claude Code, by Anthropic) under the direction and review of XThoughtLabs.
