@@ -74,13 +74,17 @@ Prints one line per item: `OK <item>` or `BROKEN <item>: <reason>`. `--out` writ
 
 - **E-1 executor and spec-tests.** Items `secret:CLAUDE_CODE_OAUTH_TOKEN`, `secret:EXECUTOR_APP_PRIVATE_KEY`, `variable:EXECUTOR_APP_ID`. Missing or empty is broken. A private key without a PEM header line is broken. An app ID that is not a positive integer is broken.
 - **E-2 run.** Every environment variable with a non-empty value whose name contains `TOKEN`, `SECRET`, `PASSWORD`, `PRIVATE_KEY`, `CREDENTIAL` or `API_KEY` (case-insensitive) gives a broken item `secret-present:<NAME>`, except `GATE_PROBE_TOKEN`.
-- **E-3 Permissions.** For `run`, `publish`, `archive` and `feedback`, permissions are probed against the API at `GITHUB_API_URL`, for `GITHUB_REPOSITORY`, with the token in `GATE_PROBE_TOKEN`. A write probe sends a request that changes nothing: status 422 means the write is allowed, 403 means it is denied. The `contents` write probe (`POST /git/refs`) sends a **well-formed but doomed** body — a fresh unused branch at an all-zero, non-existent object (`{"ref": "refs/heads/gate-probe-<random>", "sha": "<40 zeros>"}`) — so a denied token answers 403 and an allowed token answers 422; a bare `{}` body makes `/git/refs` answer 422 before the permission is checked, which a read-only token would read as "allowed" (the false positive found on run 42361091565, 2026-11-07). The other write probes (`checks`, `pull-requests`) send `{}`. A read probe expects 200.
+- **E-3 Permissions.** For `run`, `publish`, `archive` and `feedback`, permissions are probed against the API at `GITHUB_API_URL`, for `GITHUB_REPOSITORY`, with the token in `GATE_PROBE_TOKEN`. A write probe sends a request that changes nothing: status 422 means the write is allowed, 403 means it is denied. Two probes send a **well-formed but doomed** body, because a bare `{}` body is validated before the permission is checked and a read-only token would read as "allowed":
+  - `contents` (`POST /git/refs`): a fresh unused branch at an all-zero, non-existent object (`{"ref": "refs/heads/gate-probe-<random>", "sha": "<40 zeros>"}`). The empty-body `{}` false positive was found on run 42361091565 (2026-11-07).
+  - `pull-requests` (`PATCH /pulls/{pr}`): the open PR's base moved to a non-existent branch (`{"base": "gate-probe-<random>"}`). The PR number comes from the workflow event (`GITHUB_EVENT_PATH`: `pull_request.number`, `issue.number`, or `workflow_run.pull_requests[0].number`); with no PR number the item is broken, never a pass. This replaces `POST /pulls`, which the repository's "Allow GitHub Actions to create and approve pull requests" setting blocks (off by default) so that it returned 403 even for an allowed token (run 42368667062, publish job, 2026-11-07). The gate never needs `POST /pulls`: the launcher opens PRs with the app token, and `publish` only posts PR comments.
+
+  The `checks` write probe keeps the empty `{}` body. A read probe expects 200.
 
   | Permission | Probe |
   |---|---|
-  | `checks` write | `POST /repos/{repo}/check-runs` |
-  | `contents` write | `POST /repos/{repo}/git/refs` |
-  | `pull-requests` write | `POST /repos/{repo}/pulls` |
+  | `checks` write | `POST /repos/{repo}/check-runs` (body `{}`) |
+  | `contents` write | `POST /repos/{repo}/git/refs` (well-formed, doomed) |
+  | `pull-requests` write | `PATCH /repos/{repo}/pulls/{pr}` (well-formed, doomed; `{pr}` from the event) |
   | `actions` read | `GET /repos/{repo}/actions/runs?per_page=1` |
   | `contents` read | `GET /repos/{repo}` |
 

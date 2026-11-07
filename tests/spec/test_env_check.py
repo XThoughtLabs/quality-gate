@@ -1,6 +1,7 @@
 """gate.env_check: rules E-1 to E-5 (and the parts of C-2, C-3, Q-2 that show here)."""
 from __future__ import annotations
 
+import json
 import re
 import sys
 
@@ -10,6 +11,7 @@ from gatekit import (SENTINEL_PREFIX, assert_no_traceback, assert_rc, assert_ref
                      load_out, make_config, run_gate)
 
 REPO = "example-org/example-app"
+PR = 77  # the open PR the pull-requests write probe PATCHes; given to env_check through the event
 TOKEN_V = "SENTINEL-VALUE-1111"
 KEY_V = "SENTINEL-VALUE-2222"
 APP_ID_V = "7391824"
@@ -27,6 +29,13 @@ def executor_env(**override):
 
 
 def run_env(tmp_path, role, env_extra=None, *, config=None, with_out=True, cwd=None):
+    env_extra = dict(env_extra or {})
+    # env_check reads the PR number (for the pull-requests write probe) from the event.
+    # Supply a default pull_request event unless the caller set GITHUB_EVENT_PATH itself.
+    if "GITHUB_EVENT_PATH" not in env_extra:
+        event = tmp_path / "gh-event.json"
+        event.write_text(json.dumps({"pull_request": {"number": PR}}), encoding="utf-8")
+        env_extra["GITHUB_EVENT_PATH"] = str(event)
     out = tmp_path / "env-out.json"
     args = ["--role", role]
     if config:
@@ -66,7 +75,7 @@ def assert_item(res, data, item, ok):
 ROUTES = {
     ("checks", "write"): ("POST", "/repos/{repo}/check-runs"),
     ("contents", "write"): ("POST", "/repos/{repo}/git/refs"),
-    ("pull-requests", "write"): ("POST", "/repos/{repo}/pulls"),
+    ("pull-requests", "write"): ("PATCH", "/repos/{repo}/pulls/{pr}"),
     ("actions", "read"): ("GET", "/repos/{repo}/actions/runs"),
     ("contents", "read"): ("GET", "/repos/{repo}"),
 }
@@ -94,7 +103,7 @@ def configure_stub(stub, role, overrides=None):
     for perm in every:
         method, template = ROUTES[perm]
         status = overrides.get(perm, correct_status(perm, role))
-        stub.route(method, re.escape(template.format(repo=REPO)), (status, {"message": "probe"}))
+        stub.route(method, re.escape(template.format(repo=REPO, pr=PR)), (status, {"message": "probe"}))
 
 
 def api_env(stub_url, role, **extra):
@@ -249,19 +258,22 @@ def test_e3_correct_permissions_are_ok_and_probes_are_the_documented_ones(tmp_pa
     seen = {(r.method, r.path) for r in stub.requests}
     for perm in perms:
         method, template = ROUTES[perm]
-        assert (method, template.format(repo=REPO)) in seen, f"probe {method} {template} was not sent"
+        assert (method, template.format(repo=REPO, pr=PR)) in seen, f"probe {method} {template} was not sent"
     for r in stub.requests:
-        assert (r.method, r.path) in {(m, t.format(repo=REPO)) for m, t in ROUTES.values()}, \
+        assert (r.method, r.path) in {(m, t.format(repo=REPO, pr=PR)) for m, t in ROUTES.values()}, \
             f"unexpected call {r.method} {r.path}: a probe must change nothing"
         assert PROBE_V in r.header("authorization"), "the probe must carry GATE_PROBE_TOKEN"
-        if r.method == "POST":
-            if r.path.endswith("/git/refs"):
-                body = r.json()
-                assert set(body) == {"ref", "sha"} and body["ref"].startswith("refs/heads/gate-probe-") \
-                    and body["sha"] == "0" * 40, \
-                    "the contents write probe sends a well-formed request that can never succeed"
-            else:
-                assert r.json() == {}, "the other write probes send the invalid body {}"
+        if r.method == "POST" and r.path.endswith("/git/refs"):
+            body = r.json()
+            assert set(body) == {"ref", "sha"} and body["ref"].startswith("refs/heads/gate-probe-") \
+                and body["sha"] == "0" * 40, \
+                "the contents write probe sends a well-formed request that can never succeed"
+        elif r.method == "PATCH" and "/pulls/" in r.path:
+            body = r.json()
+            assert set(body) == {"base"} and body["base"].startswith("gate-probe-"), \
+                "the pull-requests write probe moves the PR base to a non-existent branch"
+        elif r.method == "POST":
+            assert r.json() == {}, "the checks write probe sends the invalid body {}"
         if r.path.endswith("/actions/runs"):
             assert r.q("per_page") == "1"
 
@@ -283,6 +295,36 @@ def test_e3_contents_write_probe_is_well_formed_and_doomed_not_empty(tmp_path, s
     assert set(body) == {"ref", "sha"}
     assert body["ref"].startswith("refs/heads/gate-probe-") and len(body["ref"]) > len("refs/heads/gate-probe-")
     assert body["sha"] == "0" * 40
+
+
+@pytest.mark.req("E-3")
+def test_e3_pull_requests_probe_is_a_patch_of_the_pr_base_not_post_pulls(tmp_path, stub):
+    """The pull-requests write probe must PATCH the open PR's base to a non-existent branch, not
+    POST /pulls. POST /pulls is blocked by the repository's 'create and approve pull requests'
+    setting and returned 403 even for an allowed token (run 42368667062, publish job). Fails on
+    the old POST-/pulls probe."""
+    configure_stub(stub, "publish")  # publish: pull-requests write allowed; the stub answers 422
+    res, data, _ = run_env(tmp_path, "publish", api_env(stub.url, "publish"))
+    assert_rc(res, 0)
+    assert perm_item(data, "publish", ("pull-requests", "write"))["ok"] is True  # 422 read as allowed
+    patches = [r for r in stub.requests if r.method == "PATCH" and "/pulls/" in r.path]
+    assert len(patches) == 1, "exactly one pull-requests write probe, a PATCH of the PR"
+    assert not [r for r in stub.requests if r.method == "POST" and r.path.endswith("/pulls")], \
+        "the probe must not POST /pulls"
+    assert patches[0].path.endswith(f"/pulls/{PR}"), "it PATCHes the PR from the event"
+    body = patches[0].json()
+    assert set(body) == {"base"} and body["base"].startswith("gate-probe-"), "a non-existent base, changing nothing"
+
+
+@pytest.mark.req("E-3")
+def test_e3_pull_requests_probe_without_a_pr_number_is_broken_never_a_pass(tmp_path, stub):
+    """With no PR number in the event, the pull-requests write probe fails closed."""
+    configure_stub(stub, "publish")
+    res, data, _ = run_env(tmp_path, "publish", api_env(stub.url, "publish", GITHUB_EVENT_PATH=None))
+    assert_rc(res, 1)
+    item = perm_item(data, "publish", ("pull-requests", "write"))
+    assert item["ok"] is False and "PR number" in item["reason"]
+    assert not [r for r in stub.requests if "/pulls" in r.path], "no probe is sent without a PR number"
 
 
 def _flip(role, perm):
@@ -543,7 +585,7 @@ def test_e5_api_roles_never_print_the_probe_token_or_other_values(tmp_path, stub
         url = stub.url
     elif state == "denied-everywhere":
         for method, template in ROUTES.values():
-            stub.route(method, re.escape(template.format(repo=REPO)), (401, {"message": "Bad credentials"}))
+            stub.route(method, re.escape(template.format(repo=REPO, pr=PR)), (401, {"message": "Bad credentials"}))
         url = stub.url
     else:
         url = closed_port_url()

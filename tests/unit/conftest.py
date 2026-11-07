@@ -86,6 +86,7 @@ class Stub:
 
             do_GET = _serve
             do_POST = _serve
+            do_PATCH = _serve
 
             def log_message(self, *_args: object) -> None:
                 return

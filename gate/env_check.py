@@ -18,28 +18,66 @@ SECRET_NAME_PARTS = ("TOKEN", "SECRET", "PASSWORD", "PRIVATE_KEY", "CREDENTIAL",
 PROBE_TOKEN = "GATE_PROBE_TOKEN"
 
 WRITE_PROBES = {
-    "checks": "/repos/{repo}/check-runs",
-    "contents": "/repos/{repo}/git/refs",
-    "pull-requests": "/repos/{repo}/pulls",
+    "checks": ("POST", "/repos/{repo}/check-runs"),
+    "contents": ("POST", "/repos/{repo}/git/refs"),
+    "pull-requests": ("PATCH", "/repos/{repo}/pulls/{pr}"),
 }
 READ_PROBES = {
     "actions": "/repos/{repo}/actions/runs?per_page=1",
     "contents": "/repos/{repo}",
 }
-# The contents write probe sends a well-formed request that can never succeed: a fresh,
-# unused branch pointed at an all-zero (non-existent) object. A denied token answers 403; an
-# allowed token answers 422 (the object does not exist) and nothing is created. An empty {}
-# body would make /repos/{repo}/git/refs answer 422 before the permission is checked, which a
-# read-only token would then read as "allowed" (the false positive found on run 42361091565).
+# A write probe changes nothing: a denied token answers 403, an allowed token 422 (the request
+# is well-formed but cannot succeed). Two probes need a well-formed body, because an empty {}
+# body is validated before the permission is checked and a read-only token would read as
+# "allowed":
+#   - contents: POST /git/refs a fresh unused branch at an all-zero (non-existent) object
+#     (the false positive found on run 42361091565);
+#   - pull-requests: PATCH /pulls/{pr}, moving the open PR's base to a non-existent branch. This
+#     is a write the gate's actors legitimately hold (pull-requests: write). It is not the same
+#     as POST /pulls, which the repository's "Allow GitHub Actions to create and approve pull
+#     requests" setting blocks (off by default) and which the gate never needs: the launcher
+#     opens PRs with the app token, and publish only posts PR comments. The empty-body POST
+#     /pulls probe returned 403 even for an allowed token (run 42368667062, publish job).
+# The checks write probe keeps the empty {} body (POST /check-runs answers 422 when allowed).
 CONTENTS_PROBE_REF_PREFIX = "refs/heads/gate-probe-"
 ZERO_SHA = "0" * 40
+PR_PROBE_BASE_PREFIX = "gate-probe-"
 
 
 def write_probe_body(name: str) -> dict:
-    """The JSON body of a write probe. Well-formed and doomed for contents; {} for the rest."""
+    """The JSON body of a write probe: well-formed and doomed for contents and pull-requests, {} for checks."""
     if name == "contents":
         return {"ref": f"{CONTENTS_PROBE_REF_PREFIX}{secrets.token_hex(6)}", "sha": ZERO_SHA}
+    if name == "pull-requests":
+        return {"base": f"{PR_PROBE_BASE_PREFIX}{secrets.token_hex(6)}"}
     return {}
+
+
+def event_pr_number() -> int | None:
+    """The PR number from the workflow event (GITHUB_EVENT_PATH), or None.
+
+    pull_request_target carries pull_request.number; issue_comment carries issue.number;
+    workflow_run (same-repo) carries workflow_run.pull_requests[0].number. The pull-requests
+    write probe needs an open PR to PATCH.
+    """
+    path = os.environ.get("GITHUB_EVENT_PATH", "")
+    if not path:
+        return None
+    try:
+        with open(path, encoding="utf-8") as handle:
+            event = json.load(handle)
+    except (OSError, ValueError):
+        return None
+    if not isinstance(event, dict):
+        return None
+    candidates = [event.get("pull_request"), event.get("issue")]
+    runs = event.get("workflow_run")
+    if isinstance(runs, dict) and isinstance(runs.get("pull_requests"), list) and runs["pull_requests"]:
+        candidates.append(runs["pull_requests"][0])
+    for obj in candidates:
+        if isinstance(obj, dict) and isinstance(obj.get("number"), int):
+            return obj["number"]
+    return None
 
 # Each job's permissions, as amended by AA-01.
 ROLE_PERMISSIONS = {
@@ -100,11 +138,11 @@ def check_no_secrets() -> list[Item]:
 def probe(method: str, url: str, token: str, payload: dict | None = None) -> int | None:
     """Return the HTTP status of one harmless request, or None on a network error.
 
-    A POST carries ``payload`` as JSON (``{}`` when none is given). The body never changes
-    anything: a write probe either lacks the permission (403) or sends a request that cannot
-    succeed (422). See ``write_probe_body``.
+    A write (POST or PATCH) carries ``payload`` as JSON; a read (GET) carries no body. The body
+    never changes anything: a write probe either lacks the permission (403) or sends a request
+    that cannot succeed (422). See ``write_probe_body``.
     """
-    body = json.dumps(payload if payload is not None else {}).encode() if method == "POST" else None
+    body = json.dumps(payload).encode() if payload is not None else None
     request = urllib.request.Request(url, data=body, method=method)
     request.add_header("Authorization", f"Bearer {token}")
     request.add_header("Accept", "application/vnd.github+json")
@@ -129,6 +167,7 @@ def check_permissions(role: str) -> list[Item]:
     token = os.environ.get(PROBE_TOKEN, "")
     api = os.environ.get("GITHUB_API_URL", "").rstrip("/")
     repo = os.environ.get("GITHUB_REPOSITORY", "")
+    pr = event_pr_number()
     items = []
     for name, kind, want in expected:
         label = f"permission:{name}-{kind}:{want}"
@@ -138,11 +177,15 @@ def check_permissions(role: str) -> list[Item]:
         if not api or not repo:
             items.append(Item(label, False, "GITHUB_API_URL or GITHUB_REPOSITORY is not set"))
             continue
-        route = (WRITE_PROBES if kind == "write" else READ_PROBES)[name].format(repo=repo)
-        if kind == "write":
-            status = probe("POST", api + route, token, write_probe_body(name))
+        if kind == "read":
+            status = probe("GET", api + READ_PROBES[name].format(repo=repo), token)
         else:
-            status = probe("GET", api + route, token)
+            method, route_template = WRITE_PROBES[name]
+            if name == "pull-requests" and pr is None:
+                items.append(Item(label, False, "no PR number in the event to probe pull-requests write"))
+                continue
+            route = route_template.format(repo=repo, pr=pr)
+            status = probe(method, api + route, token, write_probe_body(name))
         if status is None:
             items.append(Item(label, False, "network error"))
         elif kind == "read":

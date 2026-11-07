@@ -89,6 +89,10 @@ class World:
         self.publish = tmp / "publish"
         self.config = tmp / "repo" / "quality.toml"
         (tmp / "no-reports").mkdir()
+        # env_check reads the PR number for the pull-requests write probe from the event, as the
+        # judge's run job does (GITHUB_EVENT_PATH). GATE_PR is "7", so the event names PR 7.
+        self.event = tmp / "event.json"
+        self.event.write_text(json.dumps({"pull_request": {"number": 7}}), encoding="utf-8")
 
         self.remote.mkdir()
         gate.git(self.remote, "init", "--quiet", "--bare", "--initial-branch=candidate/a")
@@ -135,6 +139,7 @@ class World:
             GATE_PROBE_TOKEN="SENTINEL-VALUE-PROBE",
             GITHUB_API_URL=self.stub.url,
             GITHUB_REPOSITORY="example/app",
+            GITHUB_EVENT_PATH=str(self.event),
         )
 
     def run_job(self, stop_after: str | None = None) -> dict:
