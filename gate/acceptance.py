@@ -23,7 +23,10 @@ def parse_list(text: str) -> dict[str, str]:
         stripped = line.strip()
         if not stripped or stripped.startswith("#"):
             continue
-        parts = stripped.split()
+        # The map ID is the last whitespace-separated field; the test ID is everything
+        # before it, its own spaces kept (a parametrized ID may hold a space, e.g.
+        # "...[GET /tasks/{id}/history-invalid]").
+        parts = stripped.rsplit(None, 1)
         if len(parts) != 2 or not MAP_ID.match(parts[1]):
             raise UsageError(f"known-failing list line {number} has no valid map ID")
         if parts[0] in entries:

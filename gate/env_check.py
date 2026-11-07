@@ -6,6 +6,7 @@ import argparse
 import json
 import os
 import platform
+import secrets
 import sys
 import urllib.error
 import urllib.request
@@ -25,6 +26,20 @@ READ_PROBES = {
     "actions": "/repos/{repo}/actions/runs?per_page=1",
     "contents": "/repos/{repo}",
 }
+# The contents write probe sends a well-formed request that can never succeed: a fresh,
+# unused branch pointed at an all-zero (non-existent) object. A denied token answers 403; an
+# allowed token answers 422 (the object does not exist) and nothing is created. An empty {}
+# body would make /repos/{repo}/git/refs answer 422 before the permission is checked, which a
+# read-only token would then read as "allowed" (the false positive found on run 42361091565).
+CONTENTS_PROBE_REF_PREFIX = "refs/heads/gate-probe-"
+ZERO_SHA = "0" * 40
+
+
+def write_probe_body(name: str) -> dict:
+    """The JSON body of a write probe. Well-formed and doomed for contents; {} for the rest."""
+    if name == "contents":
+        return {"ref": f"{CONTENTS_PROBE_REF_PREFIX}{secrets.token_hex(6)}", "sha": ZERO_SHA}
+    return {}
 
 # Each job's permissions, as amended by AA-01.
 ROLE_PERMISSIONS = {
@@ -82,9 +97,14 @@ def check_no_secrets() -> list[Item]:
     return items
 
 
-def probe(method: str, url: str, token: str) -> int | None:
-    """Return the HTTP status of one harmless request, or None on a network error."""
-    body = b"{}" if method == "POST" else None
+def probe(method: str, url: str, token: str, payload: dict | None = None) -> int | None:
+    """Return the HTTP status of one harmless request, or None on a network error.
+
+    A POST carries ``payload`` as JSON (``{}`` when none is given). The body never changes
+    anything: a write probe either lacks the permission (403) or sends a request that cannot
+    succeed (422). See ``write_probe_body``.
+    """
+    body = json.dumps(payload if payload is not None else {}).encode() if method == "POST" else None
     request = urllib.request.Request(url, data=body, method=method)
     request.add_header("Authorization", f"Bearer {token}")
     request.add_header("Accept", "application/vnd.github+json")
@@ -119,7 +139,10 @@ def check_permissions(role: str) -> list[Item]:
             items.append(Item(label, False, "GITHUB_API_URL or GITHUB_REPOSITORY is not set"))
             continue
         route = (WRITE_PROBES if kind == "write" else READ_PROBES)[name].format(repo=repo)
-        status = probe("POST" if kind == "write" else "GET", api + route, token)
+        if kind == "write":
+            status = probe("POST", api + route, token, write_probe_body(name))
+        else:
+            status = probe("GET", api + route, token)
         if status is None:
             items.append(Item(label, False, "network error"))
         elif kind == "read":

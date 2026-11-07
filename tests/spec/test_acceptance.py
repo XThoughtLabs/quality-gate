@@ -243,6 +243,32 @@ def test_usage_error_without_arguments_exits_2(tmp_path):
     assert_refused(run_gate("acceptance", cwd=tmp_path), 2)
 
 
+# A parametrized acceptance test ID can hold a space (run 42361091565, PR #1). The map ID is
+# the last whitespace field; the test ID is everything before it, its space kept (supersedes L17).
+TSPACE1 = ("acceptance.test_spec_1_identity_and_visibility::"
+           "test_spec_1_business_endpoints_require_a_valid_token[GET /tasks/{task_id}/history-invalid]")
+TSPACE2 = ("acceptance.test_spec_1_identity_and_visibility::"
+           "test_spec_1_business_endpoints_require_a_valid_token[GET /tasks/{task_id}/history-missing]")
+
+
+@pytest.mark.req("A-7")
+def test_a_test_id_with_a_space_is_listed_by_its_last_field_as_the_map_id(tmp_path):
+    """The two real space-holding IDs of run 42361091565. Fails on the old split() parser,
+    which made gate.acceptance exit 2 (a usage error) on such a line."""
+    res, d, _ = acc(tmp_path, [(TSPACE1, "fail"), (TSPACE2, "fail")],
+                    [f"{TSPACE1} DEF-SPEC-1", f"{TSPACE2} DEF-SPEC-1"])
+    assert_rc(res, 0)
+    assert d["listed_failing"] == sorted([TSPACE1, TSPACE2])
+    assert d["failing_not_listed"] == []
+
+
+@pytest.mark.req("A-7")
+def test_a_space_test_id_still_needs_a_valid_map_id(tmp_path):
+    """Control: the refusals hold even when the test ID holds a space. Passes both ways."""
+    res, _, out = acc(tmp_path, [(TSPACE1, "fail")], [TSPACE1])  # no map ID at the end
+    assert_refused(res, 2, out)
+
+
 # ----------------------------------------------------------------------------- A-8 and the list file
 
 

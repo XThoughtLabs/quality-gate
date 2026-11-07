@@ -82,6 +82,7 @@ MUTANTS: list[tuple[str, str, str, str, str]] = [
     ("ENV-E3-allowed", "gate/env_check.py", 'ok = want == "allowed"', "ok = True", "E-3 write allowed when it must be denied"),
     ("ENV-E3-denied", "gate/env_check.py", 'ok = want == "denied"', "ok = True", "E-3 write denied when it must be allowed"),
     ("ENV-E3-other", "gate/env_check.py", 'items.append(Item(label, False, f"write probe returned {status}"))', "items.append(Item(label, True))", "E-3 another status passes"),
+    ("ENV-E3-empty-body", "gate/env_check.py", 'return {"ref": f"{CONTENTS_PROBE_REF_PREFIX}{secrets.token_hex(6)}", "sha": ZERO_SHA}', "return {}", "E-3 contents probe sends the empty body {}"),
     ("ENV-E5-pem", "gate/env_check.py", '"has no PEM header line"', "key", "E-5 prints a malformed key"),
     ("ENV-E5-id", "gate/env_check.py", '"is not a positive integer"', "app_id", "E-5 prints a malformed value"),
     ("ENV-E5-name", "gate/env_check.py", 'items.append(Item(f"secret-present:{name}", False, "a secret is present in this job"))', 'items.append(Item(f"secret-present:{name}", False, os.environ[name]))', "E-5 prints a present secret"),
@@ -97,6 +98,7 @@ MUTANTS: list[tuple[str, str, str, str, str]] = [
     ("ACC-A5", "gate/acceptance.py", 'if mode == "exact" and failing != listed:', "if False:", "A-5 list not exact"),
     ("ACC-A6", "gate/acceptance.py", "if require_empty and listed:", "if False:", "A-6 list not empty"),
     ("ACC-A7", "gate/acceptance.py", "if len(parts) != 2 or not MAP_ID.match(parts[1]):", "if False:", "A-7 no map ID"),
+    ("ACC-list-space", "gate/acceptance.py", "parts = stripped.rsplit(None, 1)", "parts = stripped.split()", "A-7 a test ID with a space (splits on all whitespace)"),
     # report: missing output, unfinished stage, disagreement, claims
     ("REP-V1-sha", "gate/report.py", "elif str(meta[key]) != str(context.get(field)):", "elif False:", "V-1 another SHA"),
     ("REP-V1-exit", "gate/report.py", 'if step.get("conclusion") == "success" and any_failed:', "if False:", "V-1 success with a failed exit code"),

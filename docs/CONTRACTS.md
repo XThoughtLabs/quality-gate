@@ -74,7 +74,7 @@ Prints one line per item: `OK <item>` or `BROKEN <item>: <reason>`. `--out` writ
 
 - **E-1 executor and spec-tests.** Items `secret:CLAUDE_CODE_OAUTH_TOKEN`, `secret:EXECUTOR_APP_PRIVATE_KEY`, `variable:EXECUTOR_APP_ID`. Missing or empty is broken. A private key without a PEM header line is broken. An app ID that is not a positive integer is broken.
 - **E-2 run.** Every environment variable with a non-empty value whose name contains `TOKEN`, `SECRET`, `PASSWORD`, `PRIVATE_KEY`, `CREDENTIAL` or `API_KEY` (case-insensitive) gives a broken item `secret-present:<NAME>`, except `GATE_PROBE_TOKEN`.
-- **E-3 Permissions.** For `run`, `publish`, `archive` and `feedback`, permissions are probed against the API at `GITHUB_API_URL`, for `GITHUB_REPOSITORY`, with the token in `GATE_PROBE_TOKEN`. A write probe sends the body `{}`, which is invalid on purpose and so changes nothing: status 422 means the write is allowed, 403 means it is denied. A read probe expects 200.
+- **E-3 Permissions.** For `run`, `publish`, `archive` and `feedback`, permissions are probed against the API at `GITHUB_API_URL`, for `GITHUB_REPOSITORY`, with the token in `GATE_PROBE_TOKEN`. A write probe sends a request that changes nothing: status 422 means the write is allowed, 403 means it is denied. The `contents` write probe (`POST /git/refs`) sends a **well-formed but doomed** body — a fresh unused branch at an all-zero, non-existent object (`{"ref": "refs/heads/gate-probe-<random>", "sha": "<40 zeros>"}`) — so a denied token answers 403 and an allowed token answers 422; a bare `{}` body makes `/git/refs` answer 422 before the permission is checked, which a read-only token would read as "allowed" (the false positive found on run 42361091565, 2026-11-07). The other write probes (`checks`, `pull-requests`) send `{}`. A read probe expects 200.
 
   | Permission | Probe |
   |---|---|
@@ -124,7 +124,7 @@ Runs every command of one check, in order, in the working directory.
 
 `python -P -m gate.acceptance --junit FILE --known-failing FILE [--mode subset|exact] [--require-empty] [--config FILE] [--tests-dir DIR] --out FILE`
 
-The test ID is `<classname>::<name>` from the JUnit file. The list holds one entry per line: `<test id> <map id>`. Blank lines and lines starting with `#` are ignored. A map ID is `PUB-<2 digits>`, `SPEC-6.1`, `SPEC-6.2` or `DEF-<letters, digits, dashes>`. A missing list file is an empty list.
+The test ID is `<classname>::<name>` from the JUnit file. The list holds one entry per line: `<test id> <map id>`. The **map ID is the last whitespace-separated field, and the test ID is everything before it**, its own spaces kept — so a parametrized ID that holds a space (for example `...[GET /tasks/{task_id}/history-invalid]`) can be listed (this supersedes L17). Blank lines and lines starting with `#` are ignored. A map ID is `PUB-<2 digits>`, `SPEC-6.1`, `SPEC-6.2` or `DEF-<letters, digits, dashes>`. A line with no map ID, an invalid map ID, or a repeated test ID is refused (exit 2). A missing list file is an empty list.
 
 `--out` writes `{"ok", "mode", "list_size", "failing_not_listed", "listed_failing", "remove_from_list", "missing_listed", "missing_tests", "passed", "reason_codes"}`, with sorted lists.
 

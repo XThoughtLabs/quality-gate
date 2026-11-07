@@ -255,9 +255,34 @@ def test_e3_correct_permissions_are_ok_and_probes_are_the_documented_ones(tmp_pa
             f"unexpected call {r.method} {r.path}: a probe must change nothing"
         assert PROBE_V in r.header("authorization"), "the probe must carry GATE_PROBE_TOKEN"
         if r.method == "POST":
-            assert r.json() == {}, "a write probe sends the invalid body {}"
+            if r.path.endswith("/git/refs"):
+                body = r.json()
+                assert set(body) == {"ref", "sha"} and body["ref"].startswith("refs/heads/gate-probe-") \
+                    and body["sha"] == "0" * 40, \
+                    "the contents write probe sends a well-formed request that can never succeed"
+            else:
+                assert r.json() == {}, "the other write probes send the invalid body {}"
         if r.path.endswith("/actions/runs"):
             assert r.q("per_page") == "1"
+
+
+@pytest.mark.req("E-3")
+def test_e3_contents_write_probe_is_well_formed_and_doomed_not_empty(tmp_path, stub):
+    """The contents write probe must not send the empty body {}: a real API answers 422 to an
+    empty POST /git/refs before checking the permission, so a read-only token would read as
+    'allowed' (the false positive of run 42361091565). It sends an unused branch at an all-zero,
+    non-existent object instead, so a denied token answers 403. Fails on the old probe."""
+    configure_stub(stub, "run")  # for role run, contents write is denied; the stub answers 403
+    res, data, _ = run_env(tmp_path, "run", api_env(stub.url, "run"))
+    assert_rc(res, 0)
+    assert perm_item(data, "run", ("contents", "write"))["ok"] is True  # 403 read as denied
+    posts = [r for r in stub.requests if r.method == "POST" and r.path.endswith("/git/refs")]
+    assert len(posts) == 1, "exactly one contents write probe is sent"
+    body = posts[0].json()
+    assert body != {}, "the contents write probe must not send the empty body {}"
+    assert set(body) == {"ref", "sha"}
+    assert body["ref"].startswith("refs/heads/gate-probe-") and len(body["ref"]) > len("refs/heads/gate-probe-")
+    assert body["sha"] == "0" * 40
 
 
 def _flip(role, perm):
