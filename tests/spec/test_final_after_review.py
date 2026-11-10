@@ -445,6 +445,7 @@ def test_final_facts_an_account_that_is_not_the_reviewers_bot_is_null(tmp_path, 
 def test_final_facts_a_head_that_is_not_40_lowercase_hex_exits_2(tmp_path, hub, sha):
     out = tmp_path / "facts.json"
     res = run_gate("publish", "final-facts", "--head-sha", sha, "--config", config(tmp_path), "--out", out, env=hub.env())
+    assert "invalid choice" not in res.err, f"precondition: gate.publish has final-facts, so exit 2 is its own refusal\n{res.describe()}"
     assert res.rc == 2, res.describe()
     assert_no_traceback(res)
     assert not hub.stub.requests, "nothing is read for a malformed SHA"
