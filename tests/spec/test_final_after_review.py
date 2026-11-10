@@ -14,7 +14,7 @@ import re
 
 import pytest
 
-from gatekit import assert_no_traceback, base_env, load_out, make_config, run_gate, write_json
+from gatekit import RawResponse, assert_no_traceback, base_env, load_out, make_config, run_gate, write_json
 from reportkit import World
 
 REPO = "example-org/example-app"
@@ -76,7 +76,9 @@ class Hub:
         # The seams of FN-9's interleaving tests: a test changes the stand-in's state at a named moment, never by time.
         self.reads = 0                     # statuses reads answered so far
         self.after_read = None             # called with the read's number once its answer is fixed, before it is sent
-        self.on_post = None                # called with a check-run post's body as it arrives, before it is answered
+        self.on_post = None                # called with a check-run post's body as it arrives; may return a refusal
+        self.garbled = None                # bytes every statuses read answers with, as sent (FN-9: a failure is never silence)
+        self.refused: list = []            # posts answered with a refusal: never counted as posted
         repo = re.escape(REPO)
         stub.route("GET", r"/users/(.+)", self._user)
         stub.route("GET", rf"/repos/{repo}/commits/([^/]+)/statuses", self._statuses)
@@ -93,6 +95,8 @@ class Hub:
     def _statuses(self, req):
         if "statuses" in self.broken:
             return 500, {"message": "boom"}
+        if self.garbled is not None:
+            return RawResponse(self.garbled)
         sha = req.path.split("/commits/", 1)[1].split("/", 1)[0]
         answer = list(self.statuses.get(sha, [])) if (req.q("page") or "1") == "1" else []
         self.reads += 1
@@ -101,8 +105,10 @@ class Hub:
         return 200, answer
 
     def _post(self, req):
-        if self.on_post is not None:
-            self.on_post(req.json())
+        refusal = self.on_post(req.json()) if self.on_post is not None else None
+        if refusal is not None:
+            self.refused.append(req)
+            return refusal
         return 201, {"id": 1}
 
     def _runs(self, req):
@@ -121,7 +127,8 @@ class Hub:
         return [r for r in self.stub.requests if r.method not in ("GET", "HEAD")]
 
     def posted(self, name="gate/final"):
-        return [r.json() for r in self.writes() if r.path.endswith("/check-runs") and r.json().get("name") == name]
+        return [r.json() for r in self.writes()
+                if r.path.endswith("/check-runs") and r.json().get("name") == name and not any(r is x for x in self.refused)]
 
     def env(self):
         return base_env({"GATE_TOKEN": TOKEN, "GITHUB_API_URL": self.stub.url, "GITHUB_REPOSITORY": REPO})
@@ -597,6 +604,8 @@ def test_fn4_a_newer_review_by_another_creator_keeps_gate_final_in_progress(tmp_
     posted = hub.posted()
     assert len(posted) == 1 and posted[0]["status"] == "in_progress" and posted[0].get("conclusion") is None, posted
     assert "ready-for-human" not in text_of(posted[0])
+    # FN-9 (L63): the decision itself is for the newest review, not only the post that FN-9's re-read corrects.
+    assert out["decision"]["verdict"] == "awaiting-review" and "REVIEW_NOT_BY_REVIEWER" in codes(out["decision"]), out
 
 
 @pytest.mark.req("FN-9", "FN-5", "FN-3")
@@ -779,14 +788,24 @@ def test_fn4_a_successful_review_with_one_mandatory_check_missing_is_incomplete(
     assert "MISSING_CHECK" in body["output"]["summary"]
 
 
-@pytest.mark.req("FN-4")
-@pytest.mark.parametrize("broken", ["users", "statuses", "pulls"])
-def test_fn4_a_read_needed_before_deciding_that_fails_posts_nothing_and_exits_1(tmp_path, hub, broken):
+@pytest.mark.req("FN-9", "FN-4")
+@pytest.mark.parametrize("broken", ["users", "statuses", "pulls", "users-not-a-bot"])
+def test_fn9_a_read_needed_before_deciding_that_fails_posts_gate_final_in_progress_and_exits_1(tmp_path, hub, broken):
+    # Changed by FN-9's "a failure is never silence" (L65, the CEO's decision of 2026-11-11): such a run posted nothing,
+    # so an earlier success stayed newest over the review it could not read. Was
+    # test_fn4_a_read_needed_before_deciding_that_fails_posts_nothing_and_exits_1 (asserted no write at all); the case
+    # "users-not-a-bot" (a 200 answer that is not the reviewer's bot, L58) is new.
     st = reviewed(hub)
-    hub.broken.add(broken)
+    if broken == "users-not-a-bot":
+        hub.users[CREATORS["reviewer"]["login"]] = dict(CREATORS["reviewer"], type="User")
+    else:
+        hub.broken.add(broken)
     res, out = finalize(tmp_path, hub, status_event(st))
     assert res.rc == 1, res.describe()
-    assert hub.writes() == []
+    assert out["code"] == "READ_FAILED", out
+    posted = hub.posted()
+    assert len(posted) == 1 and posted[0]["status"] == "in_progress" and posted[0].get("conclusion") is None, posted
+    assert "REVIEW_UNREADABLE" in posted[0]["output"]["summary"] and "ready-for-human" not in text_of(posted[0])
 
 
 @pytest.mark.req("FN-4")
@@ -960,6 +979,8 @@ def test_fn9_b_a_review_that_changes_between_the_archive_jobs_read_and_its_post_
     newer = world.add(state, who)
     ran(world.finalize(newer, "B"))
     ran(world.archive_post(out))
+    # FN-9 (L63): before the post, never success - not even for a moment that the after-read would correct.
+    assert all(b.get("conclusion") != "success" for b in hub.posted()), hub.posted()
     expect, code = EXPECT[(state, who)]
     assert_newest_final(hub, expect, code, f"a {who} {state} status between the archive job's read and its post")
 
@@ -987,6 +1008,8 @@ def test_fn9_a_a_success_posted_after_a_newer_reviews_run_read_and_posted_is_not
     assert "error" not in second, second.get("error")
     ran(second["res"])
     ran(first)
+    # FN-9 (L63): before the post, never success - not even for a moment that the after-read would correct.
+    assert all(b.get("conclusion") != "success" for b in hub.posted()), hub.posted()
     expect, code = EXPECT[(state, who)]
     assert_newest_final(hub, expect, code, f"run A posted after run B read a {who} {state} status")
 
@@ -1076,3 +1099,100 @@ def test_fn9_a_re_read_that_fails_is_never_success(tmp_path, hub, path, when):
     else:
         assert any(b.get("conclusion") == "success" for b in posted), "precondition: the re-read before the post confirmed it"
     assert_newest_final(hub, "waiting", "REVIEW_UNREADABLE", f"the re-read {when} the post failed ({path})")
+
+
+@pytest.mark.req("FN-9", "FN-4")
+def test_fn9_finalize_decides_on_the_newest_review_not_on_the_older_status_that_started_it(tmp_path, hub):
+    """L63 (M1 b): a late run for an older failed review. The newest review is the reviewer's success, so the decision is
+    success, made on the API's list, not on the status that started the run."""
+    world = Ready(tmp_path, hub)
+    older = world.add("failure")
+    world.add("success")
+    ran(world.finalize(older, "late"))
+    posted = hub.posted()
+    assert [(b["status"], b.get("conclusion")) for b in posted] == [("completed", "success")], posted
+    assert posted[0]["output"]["summary"].startswith("Final verdict: ready-for-human"), posted[0]["output"]
+
+
+# ----------------------------------------------------------------------------- FN-9: a failure is never silence (L65)
+
+
+GARBLED = {   # answers that http.client cannot parse: they raise IncompleteRead and BadStatusLine, not OSError
+    "incomplete-read": b"HTTP/1.0 200 OK\r\nContent-Type: application/json\r\nContent-Length: 100\r\n\r\n[",
+    "bad-status-line": b"NOT-AN-HTTP-ANSWER\r\n\r\n",
+}
+
+
+@pytest.mark.req("FN-9")
+@pytest.mark.parametrize("path", ["archive", "finalize"])
+@pytest.mark.parametrize("when", ["before", "after"])
+@pytest.mark.parametrize("kind", sorted(GARBLED))
+def test_fn9_a_re_read_that_the_http_client_cannot_parse_is_never_success_and_never_a_crash(tmp_path, hub, path, when, kind):
+    world = Ready(tmp_path, hub)
+    if when == "before":
+        hub.after_read = lambda number: setattr(hub, "garbled", GARBLED[kind])
+    else:
+        hub.on_post = lambda body: (setattr(hub, "garbled", GARBLED[kind])
+                                    if body.get("name") == "gate/final" and body.get("conclusion") == "success" else None)
+    if path == "archive":
+        res = world.archive_post(world.archive_read())
+    else:
+        res = world.finalize(world.first, "A")
+    hub.after_read = hub.on_post = None
+    ran(res)
+    posted = hub.posted()
+    if when == "before":
+        assert all(b.get("conclusion") != "success" for b in posted), f"no success without a re-read that confirms it: {posted}"
+    else:
+        assert any(b.get("conclusion") == "success" for b in posted), "precondition: the re-read before the post confirmed it"
+    assert_newest_final(hub, "waiting", "REVIEW_UNREADABLE", f"the {kind} re-read {when} the post ({path})")
+
+
+def lose_corrections(world, hub, refusal, lost):
+    """After the first success post, the reviewer's failure comes (its own run replaced, L18) and the next `lost` posts
+    of gate/final are refused."""
+    seen = []
+
+    def as_posted(body):
+        if body.get("name") != "gate/final":
+            return None
+        seen.append(body)
+        if len(seen) == 1 and body.get("conclusion") == "success":
+            world.add("failure")
+            return None
+        if 2 <= len(seen) <= 1 + lost:
+            return (500, {"message": "boom"}) if refusal == "500" else RawResponse(GARBLED["bad-status-line"])
+        return None
+
+    hub.on_post = as_posted
+    return seen
+
+
+@pytest.mark.req("FN-9")
+@pytest.mark.parametrize("path", ["archive", "finalize"])
+@pytest.mark.parametrize("refusal", ["500", "bad-status-line"])
+def test_fn9_a_correction_after_a_success_that_fails_once_is_tried_again(tmp_path, hub, path, refusal):
+    world = Ready(tmp_path, hub)
+    seen = lose_corrections(world, hub, refusal, lost=1)
+    if path == "archive":
+        res = world.archive_post(world.archive_read())
+    else:
+        res = world.finalize(world.first, "A")
+    hub.on_post = None
+    ran(res)
+    assert len(hub.refused) == 1 and len(seen) == 3, f"precondition: one correction was lost and one more was sent: {seen}"
+    assert_newest_final(hub, "blocked", "REVIEW_FAILED", f"a lost correction ({refusal}, {path})")
+
+
+@pytest.mark.req("FN-9")
+@pytest.mark.parametrize("refusal", ["500", "bad-status-line"])
+def test_fn9_a_correction_that_fails_twice_ends_the_run_with_exit_1_and_no_traceback(tmp_path, hub, refusal):
+    """When GitHub refuses the correction twice the run cannot do more: it must fail visibly (exit 1), not crash."""
+    world = Ready(tmp_path, hub)
+    seen = lose_corrections(world, hub, refusal, lost=2)
+    res = world.finalize(world.first, "A")
+    hub.on_post = None
+    assert len(hub.refused) == 2 and len(seen) == 3, f"precondition: two corrections were sent and lost: {seen}"
+    assert_no_traceback(res)
+    assert TOKEN not in res.both
+    assert res.rc == 1, res.describe()

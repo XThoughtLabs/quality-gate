@@ -459,6 +459,10 @@ class Req:
         return f"<Req {self.method} {self.path}?{self.query}>"
 
 
+class RawResponse(bytes):
+    """A handler's answer sent byte for byte, for an answer the HTTP client cannot parse (a cut body, a bad status line)."""
+
+
 class StubServer:
     """A small stand-in for the GitHub API. Routes are matched in the order they were added."""
 
@@ -481,6 +485,8 @@ class StubServer:
         for method, rx, handler in self._routes:
             if method == req.method and rx.fullmatch(req.path):
                 resp = handler(req) if callable(handler) else handler
+                if isinstance(resp, RawResponse):
+                    return resp
                 if len(resp) == 2:
                     resp = (*resp, {})
                 return resp
@@ -503,7 +509,11 @@ class StubServer:
                           {k.lower(): v for k, v in self.headers.items()}, body)
                 with server._lock:
                     server.requests.append(req)
-                status, payload, headers = server._dispatch(req)
+                found = server._dispatch(req)
+                if isinstance(found, RawResponse):
+                    self.wfile.write(bytes(found))
+                    return
+                status, payload, headers = found
                 ctype = "text/plain; charset=utf-8"
                 if isinstance(payload, (dict, list)):
                     payload, ctype = json.dumps(payload).encode("utf-8"), "application/json"
