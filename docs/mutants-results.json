@@ -1699,5 +1699,421 @@
     "outcome": "killed",
     "killed_by": "FAILED tests/spec/test_security_check.py::test_s2_a_row_that_does_not_match_or_has_no_reason_does_not_review[blank-reason-row0]",
     "run_at": "2026-11-03, this code unchanged since"
+  },
+  {
+    "id": "FIN-creator-login",
+    "rule": "FN-1 a creator with another login",
+    "outcome": "killed",
+    "killed_by": "FAILED tests/unit/test_unit_final_decision.py::test_no_valid_review_keeps_gate_final_in_progress[other-login-archive]",
+    "run_at": "df83efd (after the four tests were added)",
+    "confirmed_alone": true
+  },
+  {
+    "id": "FIN-creator-id",
+    "rule": "FN-1 a creator with another account id",
+    "outcome": "killed",
+    "killed_by": "FAILED tests/unit/test_unit_final_decision.py::test_no_valid_review_keeps_gate_final_in_progress[other-id-archive]",
+    "run_at": "815255c",
+    "confirmed_alone": true
+  },
+  {
+    "id": "FIN-creator-type",
+    "rule": "FN-1 a creator that is not a bot",
+    "outcome": "killed",
+    "killed_by": "FAILED tests/unit/test_unit_final_decision.py::test_no_valid_review_keeps_gate_final_in_progress[not-a-bot-archive]",
+    "run_at": "815255c",
+    "confirmed_alone": true
+  },
+  {
+    "id": "FIN-count-bool",
+    "rule": "True taken for an id",
+    "outcome": "killed",
+    "killed_by": "FAILED tests/spec/test_final_after_review.py::test_final_facts_an_account_that_is_not_the_reviewers_bot_is_null[id-as-bool]",
+    "run_at": "815255c",
+    "confirmed_alone": true
+  },
+  {
+    "id": "FIN-review-newest",
+    "rule": "FN-1 the oldest review counts",
+    "outcome": "killed",
+    "killed_by": "FAILED tests/unit/test_unit_final_decision.py::test_no_valid_review_keeps_gate_final_in_progress[newest-by-another-archive]",
+    "run_at": "815255c",
+    "confirmed_alone": true
+  },
+  {
+    "id": "FIN-review-unreadable",
+    "rule": "FN-4 an unreadable reviewer account named otherwise",
+    "outcome": "killed",
+    "killed_by": "FAILED tests/unit/test_unit_final_decision.py::test_the_reviewer_unreadable_is_never_success",
+    "run_at": "815255c",
+    "confirmed_alone": true
+  },
+  {
+    "id": "FIN-review-error",
+    "rule": "FN-4 an error review counted as success",
+    "outcome": "killed",
+    "killed_by": "FAILED tests/unit/test_unit_final_decision.py::test_a_failed_review_is_blocked_review_failed[error-archive]",
+    "run_at": "815255c",
+    "confirmed_alone": true
+  },
+  {
+    "id": "FIN-pending-finalize",
+    "rule": "FN-4 a pending review posts",
+    "outcome": "killed",
+    "killed_by": "FAILED tests/unit/test_unit_final_decision.py::test_a_pending_review_in_finalize_posts_nothing",
+    "run_at": "815255c",
+    "confirmed_alone": true
+  },
+  {
+    "id": "FIN-not-ready-stays",
+    "rule": "FN-2 a verdict that is not ready made ready by a review",
+    "outcome": "killed",
+    "killed_by": "FAILED tests/unit/test_unit_final_decision.py::test_a_gate_verdict_that_is_not_ready_stays_in_the_archive_job[success-blocked]",
+    "run_at": "815255c",
+    "confirmed_alone": true
+  },
+  {
+    "id": "FIN-archive-ok",
+    "rule": "FN-1 an archive that is not complete",
+    "outcome": "killed",
+    "killed_by": "FAILED tests/unit/test_unit_final_decision.py::test_a_ready_gate_verdict_with_an_archive_that_is_not_complete_is_never_success",
+    "run_at": "815255c",
+    "confirmed_alone": true
+  },
+  {
+    "id": "FIN-review-failed",
+    "rule": "FN-4 a failed review not blocked",
+    "outcome": "killed",
+    "killed_by": "FAILED tests/unit/test_unit_final_decision.py::test_a_failed_review_is_blocked_review_failed[failure-archive]",
+    "run_at": "815255c",
+    "confirmed_alone": true
+  },
+  {
+    "id": "FIN-check-failed",
+    "rule": "FN-1 a failed check on the head",
+    "outcome": "killed",
+    "killed_by": "FAILED tests/unit/test_unit_final_decision.py::test_one_mandatory_check_failed_on_the_head_is_blocked[gate/env]",
+    "run_at": "815255c",
+    "confirmed_alone": true
+  },
+  {
+    "id": "FIN-check-missing",
+    "rule": "FN-1 a missing check on the head",
+    "outcome": "killed",
+    "killed_by": "FAILED tests/unit/test_unit_final_decision.py::test_one_mandatory_check_missing_on_the_head_is_incomplete[gate/env]",
+    "run_at": "815255c",
+    "confirmed_alone": true
+  },
+  {
+    "id": "FIN-check-unreadable",
+    "rule": "FN-4 unreadable check runs named as missing",
+    "outcome": "killed",
+    "killed_by": "FAILED tests/unit/test_unit_final_decision.py::test_unreadable_check_runs_are_incomplete",
+    "run_at": "815255c",
+    "confirmed_alone": true
+  },
+  {
+    "id": "FIN-check-app",
+    "rule": "FN-1 a check run of another app",
+    "outcome": "killed",
+    "killed_by": "FAILED tests/unit/test_unit_final_decision.py::test_only_a_completed_success_of_the_actions_app_on_the_head_counts[another-app]",
+    "run_at": "815255c",
+    "confirmed_alone": true
+  },
+  {
+    "id": "FIN-check-head",
+    "rule": "FN-1 a check run of another commit",
+    "outcome": "killed",
+    "killed_by": "FAILED tests/unit/test_unit_final_decision.py::test_only_a_completed_success_of_the_actions_app_on_the_head_counts[another-commit]",
+    "run_at": "815255c",
+    "confirmed_alone": true
+  },
+  {
+    "id": "FIN-check-newest",
+    "rule": "FN-1 an older check run counts",
+    "outcome": "killed",
+    "killed_by": "FAILED tests/unit/test_unit_final_decision.py::test_the_newest_run_of_a_name_counts_by_its_id",
+    "run_at": "815255c",
+    "confirmed_alone": true
+  },
+  {
+    "id": "FIN-check-completed",
+    "rule": "FN-4 a check in progress named failed",
+    "outcome": "killed",
+    "killed_by": "FAILED tests/unit/test_unit_final_decision.py::test_a_mandatory_check_not_yet_completed_on_the_head_counts_as_missing_never_as_passed[in_progress]",
+    "run_at": "df83efd (after the four tests were added)",
+    "confirmed_alone": true
+  },
+  {
+    "id": "FIN-own-checks",
+    "rule": "FN-8 the archive job's own gate/archive ignored",
+    "outcome": "killed",
+    "killed_by": "FAILED tests/unit/test_unit_final_decision.py::test_everything_right_is_ready_for_human_completed_success[archive]",
+    "run_at": "815255c",
+    "confirmed_alone": true
+  },
+  {
+    "id": "FIN-final-facts",
+    "rule": "FN-8 the facts ignored",
+    "outcome": "killed",
+    "killed_by": "FAILED tests/spec/test_final_after_review.py::test_fn2_a_ready_run_whose_head_has_no_review_status_waits",
+    "run_at": "815255c",
+    "confirmed_alone": true
+  },
+  {
+    "id": "FIN-final-verdict",
+    "rule": "FN-1 the gate's own verdict written as final",
+    "outcome": "killed",
+    "killed_by": "FAILED tests/spec/test_final_after_review.py::test_fn2_a_ready_run_with_no_review_leaves_gate_final_in_progress_never_success",
+    "run_at": "815255c",
+    "confirmed_alone": true
+  },
+  {
+    "id": "FIN-final-check",
+    "rule": "FN-2 gate/final completed before the review",
+    "outcome": "killed",
+    "killed_by": "FAILED tests/spec/test_final_after_review.py::test_fn2_a_ready_run_with_no_review_leaves_gate_final_in_progress_never_success",
+    "run_at": "815255c",
+    "confirmed_alone": true
+  },
+  {
+    "id": "FIN-markdown",
+    "rule": "FN-7 the comment says ready",
+    "outcome": "killed",
+    "killed_by": "FAILED tests/spec/test_final_after_review.py::test_fn7_the_comment_of_a_ready_run_says_the_checks_passed_and_waits_for_the_review",
+    "run_at": "815255c",
+    "confirmed_alone": true
+  },
+  {
+    "id": "FIN-post-checks",
+    "rule": "FN-7 post-checks says ready",
+    "outcome": "killed",
+    "killed_by": "FAILED tests/spec/test_final_after_review.py::test_fn7_post_checks_of_a_ready_run_never_says_ready_for_human",
+    "run_at": "815255c",
+    "confirmed_alone": true
+  },
+  {
+    "id": "FIN-post-waiting",
+    "rule": "FN-2 waiting posted as failure",
+    "outcome": "killed",
+    "killed_by": "FAILED tests/spec/test_final_after_review.py::test_fn2_a_ready_run_with_no_review_leaves_gate_final_in_progress_never_success",
+    "run_at": "815255c",
+    "confirmed_alone": true
+  },
+  {
+    "id": "FIN-post-success",
+    "rule": "FN-1 success posted from an inconsistent file",
+    "outcome": "killed",
+    "killed_by": "FAILED tests/spec/test_final_after_review.py::test_post_final_success_only_for_a_completed_success_whose_final_verdict_is_ready[success-but-blocked]",
+    "run_at": "df83efd (after the four tests were added)",
+    "confirmed_alone": true
+  },
+  {
+    "id": "FIN-post-no-check",
+    "rule": "FN-1 a file without final_check posts its old conclusion",
+    "outcome": "killed",
+    "killed_by": "FAILED tests/spec/test_final_after_review.py::test_post_final_a_file_without_a_readable_final_check_never_posts_success[no-final-check]",
+    "run_at": "815255c",
+    "confirmed_alone": true
+  },
+  {
+    "id": "FIN-facts-sha",
+    "rule": "FN-3 a malformed head read",
+    "outcome": "killed",
+    "killed_by": "FAILED tests/spec/test_final_after_review.py::test_final_facts_a_head_that_is_not_40_lowercase_hex_exits_2[111111111111111111111111111111111111111]",
+    "run_at": "815255c",
+    "confirmed_alone": true
+  },
+  {
+    "id": "FIN-account-login",
+    "rule": "FN-1 another login taken as the reviewer",
+    "outcome": "killed",
+    "killed_by": "FAILED tests/spec/test_final_after_review.py::test_final_facts_an_account_that_is_not_the_reviewers_bot_is_null[another-login]",
+    "run_at": "815255c",
+    "confirmed_alone": true
+  },
+  {
+    "id": "FIN-account-type",
+    "rule": "FN-1 a user taken as the reviewer's bot",
+    "outcome": "killed",
+    "killed_by": "FAILED tests/spec/test_final_after_review.py::test_final_facts_an_account_that_is_not_the_reviewers_bot_is_null[not-a-bot]",
+    "run_at": "815255c",
+    "confirmed_alone": true
+  },
+  {
+    "id": "FIN-account-id",
+    "rule": "FN-1 an id that is not a number",
+    "outcome": "killed",
+    "killed_by": "FAILED tests/spec/test_final_after_review.py::test_final_facts_an_account_that_is_not_the_reviewers_bot_is_null[id-as-text]",
+    "run_at": "815255c",
+    "confirmed_alone": true
+  },
+  {
+    "id": "FIN-event-context",
+    "rule": "FN-3 another context acted on",
+    "outcome": "killed",
+    "killed_by": "FAILED tests/spec/test_final_after_review.py::test_fn3_every_event_field_is_untrusted_and_checked_before_anything_is_posted[-context-ci-other--IGNORED_CONTEXT]",
+    "run_at": "815255c",
+    "confirmed_alone": true
+  },
+  {
+    "id": "FIN-event-sha",
+    "rule": "FN-3 a malformed SHA acted on",
+    "outcome": "killed",
+    "killed_by": "FAILED tests/spec/test_final_after_review.py::test_fn3_every_event_field_is_untrusted_and_checked_before_anything_is_posted[-sha-1111111111111111111111111-IGNORED_SHA0]",
+    "run_at": "815255c",
+    "confirmed_alone": true
+  },
+  {
+    "id": "FIN-event-creator",
+    "rule": "FN-5 another creator acted on",
+    "outcome": "killed",
+    "killed_by": "FAILED tests/spec/test_final_after_review.py::test_fn5_a_status_created_by_anyone_but_the_reviewer_posts_nothing[ceo]",
+    "run_at": "815255c",
+    "confirmed_alone": true
+  },
+  {
+    "id": "FIN-status-context",
+    "rule": "FN-3 the API's status of another context acted on",
+    "outcome": "killed",
+    "killed_by": "FAILED tests/spec/test_final_after_review.py::test_fn3_an_event_whose_status_id_is_a_status_of_another_context_posts_nothing",
+    "run_at": "df83efd (after the four tests were added)",
+    "confirmed_alone": true
+  },
+  {
+    "id": "FIN-pr-head",
+    "rule": "FN-3 a SHA that is not the head",
+    "outcome": "killed",
+    "killed_by": "FAILED tests/spec/test_final_after_review.py::test_fn5_a_review_of_an_earlier_head_after_a_new_push_posts_nothing",
+    "run_at": "815255c",
+    "confirmed_alone": true
+  },
+  {
+    "id": "FIN-pr-base",
+    "rule": "FN-3 a PR into another base",
+    "outcome": "killed",
+    "killed_by": "FAILED tests/spec/test_final_after_review.py::test_fn3_a_sha_that_is_not_the_head_of_an_open_pr_into_the_integration_branch_posts_nothing[pr-into-another-base]",
+    "run_at": "815255c",
+    "confirmed_alone": true
+  },
+  {
+    "id": "FIN-actors",
+    "rule": "FN-4 untrusted reports read",
+    "outcome": "killed",
+    "killed_by": "FAILED tests/spec/test_final_after_review.py::test_fn4_untrusted_reports_are_never_success",
+    "run_at": "815255c",
+    "confirmed_alone": true
+  },
+  {
+    "id": "FIN-record-head",
+    "rule": "FN-4 a record of another commit",
+    "outcome": "killed",
+    "killed_by": "FAILED tests/spec/test_final_after_review.py::test_fn4_a_record_of_another_commit_does_not_count",
+    "run_at": "815255c",
+    "confirmed_alone": true
+  },
+  {
+    "id": "FIN-record-newest",
+    "rule": "FN-4 the oldest record counts",
+    "outcome": "killed",
+    "killed_by": "FAILED tests/spec/test_final_after_review.py::test_fn4_the_newest_stored_run_for_the_head_counts",
+    "run_at": "815255c",
+    "confirmed_alone": true
+  },
+  {
+    "id": "FIN-record-numeric",
+    "rule": "FN-4 run ids compared as text",
+    "outcome": "killed",
+    "killed_by": "FAILED tests/spec/test_final_after_review.py::test_fn4_control_an_older_run_that_was_blocked_does_not_hide_a_newer_ready_one",
+    "run_at": "815255c",
+    "confirmed_alone": true
+  },
+  {
+    "id": "FIN-record-preliminary",
+    "rule": "FN-4 a preliminary that is not ready",
+    "outcome": "killed",
+    "killed_by": "FAILED tests/spec/test_final_after_review.py::test_fn4_a_successful_review_with_the_archive_or_the_preliminary_not_ready_is_never_success[preliminary-not-ready]",
+    "run_at": "815255c",
+    "confirmed_alone": true
+  },
+  {
+    "id": "FIN-record-archive",
+    "rule": "FN-4 a failed archive",
+    "outcome": "killed",
+    "killed_by": "FAILED tests/spec/test_final_after_review.py::test_fn4_a_successful_review_with_the_archive_or_the_preliminary_not_ready_is_never_success[archive-failed]",
+    "run_at": "815255c",
+    "confirmed_alone": true
+  },
+  {
+    "id": "FIN-post-pending",
+    "rule": "FN-4 a pending review posts",
+    "outcome": "killed",
+    "killed_by": "FAILED tests/spec/test_final_after_review.py::test_fn4_a_pending_review_changes_nothing",
+    "run_at": "815255c",
+    "confirmed_alone": true
+  },
+  {
+    "id": "FIN-feedback",
+    "rule": "awaiting-review stops a fix round",
+    "outcome": "killed",
+    "killed_by": "FAILED tests/spec/test_final_after_review.py::test_feedback_reads_a_stored_awaiting_review_as_not_a_failure",
+    "run_at": "815255c",
+    "confirmed_alone": true
+  },
+  {
+    "id": "FIN-wf-facts",
+    "rule": "Y-24 the facts never read",
+    "outcome": "killed",
+    "killed_by": "FAILED tests/spec/test_workflows_finalize.py::test_y24_the_archive_job_reads_the_facts_for_the_head_after_the_store_and_before_the_final_verdict",
+    "run_at": "815255c",
+    "confirmed_alone": true
+  },
+  {
+    "id": "FIN-wf-facts-arg",
+    "rule": "Y-24 the facts not given",
+    "outcome": "killed",
+    "killed_by": "FAILED tests/spec/test_workflows_finalize.py::test_y24_both_calls_of_gate_report_final_take_the_facts",
+    "run_at": "815255c",
+    "confirmed_alone": true
+  },
+  {
+    "id": "FIN-wf-if",
+    "rule": "FN-3 every status starts finalize",
+    "outcome": "killed",
+    "killed_by": "FAILED tests/spec/test_workflows_finalize.py::test_fn3_the_job_runs_on_ubuntu_24_04_only_for_an_independent_review_status",
+    "run_at": "815255c",
+    "confirmed_alone": true
+  },
+  {
+    "id": "FIN-wf-perm",
+    "rule": "FN-6 more than pull-requests read",
+    "outcome": "killed",
+    "killed_by": "FAILED tests/spec/test_workflows_finalize.py::test_fn6_the_job_has_exactly_checks_write_contents_read_pull_requests_read_and_the_workflow_nothing",
+    "run_at": "815255c",
+    "confirmed_alone": true
+  },
+  {
+    "id": "FIN-wf-cancel",
+    "rule": "FN-6 a run in progress cancelled",
+    "outcome": "killed",
+    "killed_by": "FAILED tests/spec/test_workflows_finalize.py::test_fn6_concurrency_per_sha_without_cancelling_a_run_in_progress",
+    "run_at": "815255c",
+    "confirmed_alone": true
+  },
+  {
+    "id": "FIN-wf-persist",
+    "rule": "FN-3 a credential left in a checkout",
+    "outcome": "killed",
+    "killed_by": "FAILED tests/spec/test_workflows_finalize.py::test_fn3_it_checks_out_only_the_gate_at_its_own_commit_and_the_default_branchs_configuration",
+    "run_at": "815255c",
+    "confirmed_alone": true
+  },
+  {
+    "id": "FIN-wf-actors",
+    "rule": "FN-4 the stored runs read unchecked",
+    "outcome": "killed",
+    "killed_by": "FAILED tests/spec/test_workflows_finalize.py::test_fn4_the_stored_runs_are_fetched_only_after_check_actors_then_finalize_runs",
+    "run_at": "815255c",
+    "confirmed_alone": true
   }
 ]
