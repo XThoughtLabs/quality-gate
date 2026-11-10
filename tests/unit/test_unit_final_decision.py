@@ -25,6 +25,7 @@ def creator(kind="reviewer"):
         "executor": {"login": "example-executor[bot]", "id": 9002, "type": "Bot"},
         "other-id": {"login": "example-reviewer[bot]", "id": 4242, "type": "Bot"},
         "not-a-bot": {"login": "example-reviewer[bot]", "id": 9001, "type": "User"},
+        "other-login": {"login": "someone-else[bot]", "id": 9001, "type": "Bot"},
     }[kind]
 
 
@@ -77,10 +78,12 @@ def test_everything_right_is_ready_for_human_completed_success(mode):
     ([review("success", who="executor")], "REVIEW_NOT_BY_REVIEWER"),
     ([review("success", who="other-id")], "REVIEW_NOT_BY_REVIEWER"),
     ([review("success", who="not-a-bot")], "REVIEW_NOT_BY_REVIEWER"),
+    ([review("success", who="other-login")], "REVIEW_NOT_BY_REVIEWER"),
     ([review("success", who="ceo"), review("success")], "REVIEW_NOT_BY_REVIEWER"),
     ([review("weird")], "REVIEW_UNREADABLE"),
     (["not-a-status"], "REVIEW_MISSING"),
-], ids=["none", "unreadable", "other-context", "ceo", "executor", "other-id", "not-a-bot", "newest-by-another", "unknown-state", "junk"])
+], ids=["none", "unreadable", "other-context", "ceo", "executor", "other-id", "not-a-bot", "other-login", "newest-by-another",
+        "unknown-state", "junk"])
 def test_no_valid_review_keeps_gate_final_in_progress(mode, statuses, code):
     d = decide(**world(mode, statuses=statuses))
     assert (d["post"], d["status"], d["conclusion"], d["verdict"]) == (True, "in_progress", None, "awaiting-review")
@@ -159,6 +162,14 @@ def test_only_a_completed_success_of_the_actions_app_on_the_head_counts(bad):
     runs = [run(n, run_id=i + 1) for i, n in enumerate(SEVEN) if n != "gate/tests"] + [bad]
     d = decide(**world(check_runs=runs))
     assert d["conclusion"] == "failure"
+
+
+@pytest.mark.parametrize("status", ["in_progress", "queued"])
+def test_a_mandatory_check_not_yet_completed_on_the_head_counts_as_missing_never_as_passed(status):
+    runs = [run(n, run_id=i + 1) for i, n in enumerate(SEVEN) if n != "gate/tests"]
+    runs.append(run("gate/tests", status=status, conclusion=None, run_id=50))
+    d = decide(**world(check_runs=runs))
+    assert (d["conclusion"], d["verdict"]) == ("failure", "incomplete") and "MISSING_CHECK" in codes(d)
 
 
 def test_the_newest_run_of_a_name_counts_by_its_id():

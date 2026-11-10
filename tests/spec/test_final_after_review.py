@@ -36,8 +36,9 @@ CREATORS = {
     "executor": {"login": "example-executor[bot]", "id": 9002, "type": "Bot"},
     "same-login-other-id": {"login": "example-reviewer[bot]", "id": 4242, "type": "Bot"},
     "same-login-not-a-bot": {"login": "example-reviewer[bot]", "id": 9001, "type": "User"},
+    "same-id-other-login": {"login": "someone-else[bot]", "id": 9001, "type": "Bot"},
 }
-NOT_THE_REVIEWER = ["ceo", "executor", "same-login-other-id", "same-login-not-a-bot"]
+NOT_THE_REVIEWER = ["ceo", "executor", "same-login-other-id", "same-login-not-a-bot", "same-id-other-login"]
 
 _ids = iter(range(70_000, 10**9))
 
@@ -466,6 +467,22 @@ def test_post_final_a_file_without_a_readable_final_check_never_posts_success(tm
     assert_completed(hub.posted("gate/final"), "failure")
 
 
+@pytest.mark.req("FN-1", "F-3")
+@pytest.mark.parametrize("verdict,check", [
+    ("blocked", {"status": "completed", "conclusion": "success"}),
+    ("awaiting-review", {"status": "completed", "conclusion": "success"}),
+    ("ready-for-human", {"status": "in_progress", "conclusion": "success"}),
+    ("ready-for-human", {"status": "queued", "conclusion": "success"}),
+], ids=["success-but-blocked", "success-but-awaiting", "success-but-in-progress", "success-but-queued"])
+def test_post_final_success_only_for_a_completed_success_whose_final_verdict_is_ready(tmp_path, hub, verdict, check):
+    final = write_json(tmp_path / "final.json", {"verdict": verdict, "reasons": [], "final_check": check,
+                                                 "conclusions": {"gate/archive": "success", "gate/final": "success"}})
+    res = run_gate("publish", "post-final", "--final", final, "--head-sha", HEAD, env=hub.env())
+    assert res.rc == 0, res.describe()
+    assert all(b.get("conclusion") != "success" for b in hub.posted("gate/final")), hub.posted("gate/final")
+    assert hub.posted("gate/final"), "gate/final is still posted"
+
+
 # ----------------------------------------------------------------------------- finalize (FN-3, FN-4, FN-5)
 
 
@@ -602,6 +619,17 @@ def test_fn3_every_event_field_is_untrusted_and_checked_before_anything_is_poste
     assert res.rc == 0, res.describe()
     assert hub.writes() == []
     assert out["acted"] is False and out["code"] == code
+
+
+@pytest.mark.req("FN-3")
+def test_fn3_an_event_whose_status_id_is_a_status_of_another_context_posts_nothing(tmp_path, hub):
+    """The event says independent-review; the API's status with that id is of another context: the API decides."""
+    reviewed(hub)
+    other = status("success", context="ci/other")
+    hub.statuses[HEAD].insert(0, other)
+    res, out = finalize(tmp_path, hub, status_event(other, context=REVIEW))
+    assert hub.writes() == []
+    assert out["acted"] is False and out["code"] == "IGNORED_EVENT"
 
 
 @pytest.mark.req("FN-3")
