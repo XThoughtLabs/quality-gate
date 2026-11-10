@@ -27,6 +27,8 @@ Add to the application's repository, on its default branch:
 
 `pull_request_target`, `workflow_run` and `issue_comment` all run workflows from the default branch, so these files must be there. The thin `feedback` workflow should also set `concurrency` for the whole workflow, so that two events on one PR are decided in turn.
 
+The final verdict waits for the independent review (`docs/CONTRACTS.md` section 8.5). A thin `finalize` workflow on `status` events calls `finalize.yml` at the same full commit SHA as the judge, with `permissions` `checks: write`, `contents: read` and `pull-requests: read` and no secret. `status`, too, runs workflows only from the default branch. The reviewer's app posts its status with its own installation token, which starts this workflow; a status posted by a workflow's own `GITHUB_TOKEN` starts nothing.
+
 ## 3. Commands
 
 | Command | What it does |

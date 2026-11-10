@@ -352,10 +352,13 @@ jobs:
           folder="reports/$GATE_PR/$GATE_RUN_ID-$GATE_RUN_ATTEMPT"
           "$GATE_PY" -P -m gate.publish context --config "$GATE_CONFIG" --hash-root .trusted --hash quality.toml --hash CODEOWNERS --hash .github/workflows/judge.yml --hash .github/workflows/executor.yml --hash .github/workflows/spec-tests.yml --hash .github/workflows/feedback.yml --hash prompts/executor.md --hash prompts/spec-tests.md --hash security-review.md --out context.json
           "$GATE_PY" -P -m gate.archive store --api-repo "$GATE_REPOSITORY" --branch reports --pr "$GATE_PR" --run-id "$GATE_RUN_ID" --attempt "$GATE_RUN_ATTEMPT" --artifact evidence --publish publish-out --context context.json --config "$GATE_CONFIG" --out archive-result.json || true
+          # The head's review, check runs and the reviewer's account (FN-2, FN-8). A failed read leaves a fact unknown:
+          # the final verdict then waits or fails, never passes.
+          "$GATE_PY" -P -m gate.publish final-facts --head-sha "$GATE_HEAD_SHA" --config "$GATE_CONFIG" --out facts.json || true
           mkdir -p final
-          "$GATE_PY" -P -m gate.report final --verdict publish-out/verdict.json --expect-verdict-sha256 "$GATE_EXPECT_VERDICT" --archive archive-result.json --env-result archive-env.json --out final/final.json
+          "$GATE_PY" -P -m gate.report final --verdict publish-out/verdict.json --expect-verdict-sha256 "$GATE_EXPECT_VERDICT" --archive archive-result.json --env-result archive-env.json --facts facts.json --out final/final.json
           if ! "$GATE_PY" -P -m gate.archive append --api-repo "$GATE_REPOSITORY" --branch reports --path "$folder/final.json" --file final/final.json --config "$GATE_CONFIG" --out append-result.json; then
             # The final verdict could not be stored, so the evidence is not complete.
-            "$GATE_PY" -P -m gate.report final --verdict publish-out/verdict.json --expect-verdict-sha256 "$GATE_EXPECT_VERDICT" --archive append-result.json --env-result archive-env.json --out final/final.json
+            "$GATE_PY" -P -m gate.report final --verdict publish-out/verdict.json --expect-verdict-sha256 "$GATE_EXPECT_VERDICT" --archive append-result.json --env-result archive-env.json --facts facts.json --out final/final.json
           fi
           "$GATE_PY" -P -m gate.publish post-final --final final/final.json --head-sha "$GATE_HEAD_SHA"

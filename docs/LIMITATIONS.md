@@ -17,7 +17,7 @@ What the gate does not do or does not prove, written down rather than dropped. E
 - **L8** A green `gate/final` outlives new acceptance tests on the default branch: the design's rulesets have no up-to-date rule.
 - **L9** `gate.publish extras` calls a commit a direct push when no merged PR brought it. A rebase merge rewrites commits, so all but the last of them would be flagged too. This over-reports and never hides.
 - **L10** `resources.executor_runs` and `executor_turns` stay `"unknown"`: the action's numbers are not carried to the report. `actions_minutes` covers this attempt's jobs as the API gives them when `publish` runs.
-- **L11** `verdicts.final` in `report.json` is always `null`. The stored report is sealed before the final verdict exists. The final verdict is in `final.json` beside it and in the check `gate/final`.
+- **L11** `verdicts.final` in `report.json` is always `null`. The stored report is sealed before the final verdict exists. The final verdict is in `final.json` beside it and in the check `gate/final`. Since round 2, `final.json` holds the archive job's view (often `awaiting-review`); a later verdict given by finalize is only in `gate/final` and in finalize's log (L52).
 - **L12** `app-id` of `actions/create-github-app-token` is deprecated at this pin. It works; replace it when the pin moves.
 
 ## Carried from review round 2 (decision X)
@@ -73,6 +73,14 @@ What the gate does not do or does not prove, written down rather than dropped. E
 - **L49** If an application adds `junit` to `gate/acceptance`, a listed failure turns it red. The example does not.
 - **L50** Measured under heavy load on Windows: 5,000 files with 500 changed took 390 s (287 s before these rules), so about 385 changed files would hit `gate/guard`'s `timeout_seconds = 300` on this machine. Ubuntu was not measured.
 
+## Round 2: the final verdict after the review (FN-1 to FN-8)
+
+- **L51, the reviewer's app is matched by its bot account.** A commit status names its creator as the app's bot account (`<app>[bot]`, its account id, type `Bot`) and never the app's own id, and `GET /apps/<slug>` answers 404 for this private app. So FN-1 checks the login, the type and the account id GitHub gives for that login. The app id (5653361 for `xtl-gate-reviewer`) is checked by the ruleset's own `independent-review` rule at merge, not by the gate.
+- **L52, finalize writes no record.** finalize has no `contents: write` (FN-6), so a final verdict it gives after the archive job is not stored on `reports`: `final.json` keeps the archive job's `awaiting-review`, and the newer verdict is in `gate/final` and in finalize's job log. `gate.feedback` reads `awaiting-review` as `NOT_A_FAILURE`, and a failed review starts its fix round from the review's own comment.
+- **L53, a narrow race between the archive job and finalize.** The archive job reads the review, then stores `final.json` and posts `gate/final` a few seconds later. A review posted inside those seconds starts finalize, which must check out, set up Python and read `reports` before it can post, so its post comes after the archive job's. If finalize ever posted first, the archive job's later "in progress" would be the newest `gate/final`: it fails closed, and a rerun of the archive job (FN-8) or a new review clears it.
+- **L54, two PRs with one head.** If two open PRs into the integration branch share a head SHA, finalize takes the first the API lists. `gate/final` belongs to the commit, so both PRs show it.
+- **L55, finalize's permissions are checked from the YAML only.** No `gate.env_check` role probes them at run time, as the judge's jobs do; FN-6 is proved by the workflow tests.
+
 ## Open until a real run
 
 These can only be seen on GitHub, in Part 3:
@@ -81,3 +89,4 @@ These can only be seen on GitHub, in Part 3:
 - whether `decide` and `publish` can read a commit's statuses without `statuses: read` on this public repository, since no permission is added (decision R). A refusal fails closed in `decide`, and in `publish` it says `unknown`;
 - whether the action's environment scrub leaves the model able to push through git;
 - `if: always()` after a real cancellation, artifact behaviour on a rerun, and nested workflow resolution.
+- Round 2 (to be shown in part C of HQ's round-2 task): that the reviewer app's `status` starts the caller of `finalize.yml`; that an older `gate/final` left in progress, followed by a newer completed `success`, satisfies the required check (GitHub's documents do not say which of two runs of one name counts; on PR #30 a newer success counted over two older failures); and that finalize reads statuses with `pull-requests: read` (the judge's `publish` job read them without a statuses permission in run 42751543290).
