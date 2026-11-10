@@ -224,12 +224,15 @@ def stored_files(world: World) -> list[str]:
     return listing.splitlines()
 
 
-@pytest.mark.req("V-5", "F-1")
+@pytest.mark.req("V-5", "F-1", "FN-2")
 def test_a_clean_change_is_ready_for_a_person_and_stored(world):
+    # Round 2 (FN-2): the gate's own verdict is ready, and the final verdict waits for the independent review
+    # (before round 2 this test expected the final verdict ready-for-human and gate/final success).
     world.change()
     final = world.judge(world.run_job())
-    assert final["verdict"] == "ready-for-human", final["reasons"]
-    assert final["conclusions"] == {"gate/archive": "success", "gate/final": "success"}
+    assert final["gate_verdict"] == "ready-for-human", final["reasons"]
+    assert final["verdict"] == "awaiting-review"
+    assert final["conclusions"] == {"gate/archive": "success", "gate/final": None}
     assert "reports/7/1001-1/report.json" in stored_files(world)
     assert "reports/7/1001-1/artifact/exit-codes.tsv" in stored_files(world)
 

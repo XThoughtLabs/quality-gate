@@ -62,12 +62,16 @@ def codes(d):
 # ----------------------------------------------------------------------------- F-1
 
 
-@pytest.mark.req("F-1", "F-3")
-def test_f1_ready_with_stored_and_matching_archive_is_ready_for_human(tmp_path):
+@pytest.mark.req("F-1", "F-3", "FN-1", "FN-2")
+def test_f1_ready_with_stored_and_matching_archive_gives_a_ready_gate_verdict_and_waits_for_the_review(tmp_path):
+    # Round 2 (FN-1, FN-2): before it, this test expected the final verdict ready-for-human and gate/final success
+    # here, with no independent review. The gate's own verdict is still ready; the final verdict waits.
     res, d = final(tmp_path, verdict_obj("ready-for-human"), ARCH_OK)
     assert_rc(res, 0)
-    assert d["verdict"] == "ready-for-human" and d["reasons"] == []
-    assert d["conclusions"] == {"gate/archive": "success", "gate/final": "success"}
+    assert d["gate_verdict"] == "ready-for-human"
+    assert d["verdict"] == "awaiting-review", "without the independent review the final verdict is never ready (FN-1)"
+    assert d["conclusions"] == {"gate/archive": "success", "gate/final": None}
+    assert d["final_check"] == {"status": "in_progress", "conclusion": None}
 
 
 @pytest.mark.req("F-1")
@@ -156,7 +160,7 @@ def test_f2_any_other_verdict_stays_and_gains_the_reason(tmp_path, prelim, archi
 # ----------------------------------------------------------------------------- F-3
 
 
-@pytest.mark.req("F-3")
+@pytest.mark.req("F-3", "FN-2")
 @pytest.mark.parametrize("prelim", ["ready-for-human"] + NOT_READY)
 @pytest.mark.parametrize("name,archive,archive_ok", [
     ("stored-and-matching", ARCH_OK, True),
@@ -164,14 +168,16 @@ def test_f2_any_other_verdict_stays_and_gains_the_reason(tmp_path, prelim, archi
     ("not-matching", dict(ARCH_OK, sha256sums_match=False), False),
     ("missing", MISSING, False),
 ])
-def test_f3_conclusions_are_only_success_or_failure_and_follow_the_rules(tmp_path, prelim, name, archive, archive_ok):
+def test_f3_conclusions_are_success_failure_or_in_progress_and_follow_the_rules(tmp_path, prelim, name, archive, archive_ok):
+    # Round 2 (FN-2): a ready gate verdict with no review is in progress (None), where this test expected success.
     res, d = final(tmp_path, verdict_obj(prelim), archive)
     assert set(d["conclusions"]) >= {"gate/archive", "gate/final"}
     assert d["conclusions"]["gate/archive"] == ("success" if archive_ok else "failure")
-    expected_final = "success" if (prelim == "ready-for-human" and archive_ok) else "failure"
+    expected_final = None if (prelim == "ready-for-human" and archive_ok) else "failure"
     assert d["conclusions"]["gate/final"] == expected_final
-    assert d["conclusions"]["gate/final"] in ("success", "failure"), "never neutral or skipped: GitHub counts those as success"
-    assert (d["verdict"] == "ready-for-human") == (expected_final == "success")
+    assert d["conclusions"]["gate/final"] in ("success", "failure", None), "never neutral or skipped: GitHub counts those as success"
+    assert d["final_check"]["status"] == ("in_progress" if expected_final is None else "completed")
+    assert d["verdict"] != "ready-for-human", "no review was given, so the final verdict is never ready (FN-1)"
 
 
 # ----------------------------------------------------------------------------- the chain generate -> final
@@ -204,10 +210,12 @@ def test_chain_a_green_run_is_not_ready_without_stored_evidence(tmp_path):
     assert d["conclusions"]["gate/final"] == "failure"
 
 
-@pytest.mark.req("F-1")
-def test_chain_control_a_green_run_with_stored_evidence_is_ready(tmp_path):
+@pytest.mark.req("F-1", "FN-2")
+def test_chain_control_a_green_run_with_stored_evidence_has_a_ready_gate_verdict_and_waits(tmp_path):
+    # Round 2 (FN-2): this control expected ready-for-human and gate/final success with no review.
     o, res, d = chain(tmp_path, World(tmp_path), ARCH_OK)
-    assert d["verdict"] == "ready-for-human" and d["conclusions"] == {"gate/archive": "success", "gate/final": "success"}
+    assert d["gate_verdict"] == "ready-for-human" and d["verdict"] == "awaiting-review"
+    assert d["conclusions"] == {"gate/archive": "success", "gate/final": None}
 
 
 @pytest.mark.req("F-3", "V-1", "V-2", "V-3", "V-4")
@@ -358,7 +366,8 @@ def test_f2a_a_verdict_file_that_matches_the_publish_jobs_hash_is_trusted(tmp_pa
     obj = verdict_obj("ready-for-human")
     digest = hashed_verdict(tmp_path, obj)
     res, d = final(tmp_path, obj, ARCH_OK, extra=["--expect-verdict-sha256", digest])
-    assert d["verdict"] == "ready-for-human" and d["conclusions"]["gate/final"] == "success"
+    # Round 2 (FN-2): the gate's own verdict is ready; gate/final waits for the review (it was success here).
+    assert d["gate_verdict"] == "ready-for-human" and d["conclusions"]["gate/final"] is None
     assert "PUBLISH_OUTPUT_MISMATCH" not in codes(d)
 
 
@@ -399,7 +408,7 @@ def test_f2a_env_result_without_ok_true_counts_as_not_ok(tmp_path):
 def test_f2a_env_result_that_is_ok_changes_nothing(tmp_path):
     env_result = write_json(tmp_path / "env-result.json", {"role": "publish", "ok": True, "items": []})
     res, d = final(tmp_path, verdict_obj("ready-for-human"), ARCH_OK, extra=["--env-result", env_result])
-    assert d["verdict"] == "ready-for-human" and "FAILED_CHECK" not in codes(d)
+    assert d["gate_verdict"] == "ready-for-human" and "FAILED_CHECK" not in codes(d)  # round 2: was d["verdict"]
 
 
 @pytest.mark.req("F-2a")
@@ -435,7 +444,7 @@ def test_f4_for_any_other_verdict_the_code_is_added_and_the_verdict_stays(tmp_pa
 @pytest.mark.req("F-4")
 def test_f4_control_actors_ok_true_is_no_reason(tmp_path):
     res, d = final(tmp_path, verdict_obj("ready-for-human"), dict(ARCH_OK, actors_ok=True))
-    assert d["verdict"] == "ready-for-human"
+    assert d["gate_verdict"] == "ready-for-human"  # round 2: was d["verdict"]; the final verdict waits for the review
     assert "REPORTS_WRITTEN_BY_ANOTHER_ACTOR" not in codes(d)
 
 
