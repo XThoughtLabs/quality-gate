@@ -1,0 +1,25 @@
+# The launcher's configuration. Copy it as launcher.toml beside xtl_launcher.py, in a folder the
+# executor's user can read but not change (see INSTRUCTION-CEO.md, step 5).
+
+[launcher]
+# Written by setup_apps.py v2, readable only by the executor's user.
+key_file = 'C:\xtl-gate-executor\xtl-gate-executor.pem'
+app_file = 'C:\xtl-gate-executor\xtl-gate-executor.app.json'
+
+# The executor's own working folder: clones, logs, one virtual environment per run.
+runs_dir = 'C:\Users\mp-claude\xtl-runs'
+
+# Claude Code, signed in to the CEO's subscription for this Windows user. On Windows give the full
+# path to claude.exe: the plain ["claude"] does not start there. Replace <executor user> with that
+# Windows user's name (mp-claude in the pilot).
+claude_command = ['C:\Users\<executor user>\.local\bin\claude.exe']
+
+# The Python that makes each run's virtual environment for the application's tests.
+app_python = 'C:\Users\mp-claude\AppData\Local\Programs\Python\Python313\python.exe'
+
+# Claude's deny rules: the model's file tools may not read these (defence in depth, DEV-03).
+# Replace <operator> with the operator's own Windows user name.
+deny_read_paths = ['C:\Users\Public', 'C:\Users\<operator>', 'C:\xtl-gate-executor']
+
+# Folders this user must not be able to open. If one can be opened, the launcher stops before the model.
+must_not_open = ['C:\Users\Public\Documents\codex-candidate']
