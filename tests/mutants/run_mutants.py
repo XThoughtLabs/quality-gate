@@ -373,9 +373,9 @@ MUTANTS: list[tuple[str, str, str, str, str]] = [
     ("FIN-wf-actors", ".github/workflows/finalize.yml", '          if python -P -m gate.archive check-actors --api-repo "$GITHUB_REPOSITORY" --branch reports --config "$GATE_CONFIG" --out actors.json; then\n', '          python -P -m gate.archive check-actors --api-repo "$GITHUB_REPOSITORY" --branch reports --config "$GATE_CONFIG" --out actors.json || true\n          if true; then\n', "FN-4 the stored runs read unchecked"),
     # Round 2, finding M-1: the newest review decides last (FN-9). The re-read around a success.
     ("FN9-before-read", "gate/publish.py", '    state, code = newest_review(repository, head_sha, reviewer)\n    if state != "success":\n        return post_without_success(repository, head_sha, state, code, reasons)\n', "", "FN-9 no re-read before the success post"),
-    ("FN9-after-read", "gate/publish.py", '    state, code = newest_review(repository, head_sha, reviewer)\n    if state != "success":\n        return [READY, *post_without_success(repository, head_sha, state, code, reasons)]\n', "", "FN-9 no re-read after the success post"),
+    ("FN9-after-read", "gate/publish.py", '    state, code = newest_review(repository, head_sha, reviewer)\n    if state != "success":\n        try:\n', '    state, code = "success", None\n    if state != "success":\n        try:\n', "FN-9 no re-read after the success post"),
     ("FN9-before-state", "gate/publish.py", 'if state != "success":\n        return post_without_success(', 'if state == "failed":\n        return post_without_success(', "FN-9 only a failed review stops the success before the post"),
-    ("FN9-after-state", "gate/publish.py", 'if state != "success":\n        return [READY, ', 'if state == "failed":\n        return [READY, ', "FN-9 only a failed review follows the success after the post"),
+    ("FN9-after-state", "gate/publish.py", 'if state != "success":\n        try:\n', 'if state == "failed":\n        try:\n', "FN-9 only a failed review follows the success after the post"),
     ("FN9-failed-blocked", "gate/publish.py", '    if state == "failed":\n        return post_gate_final(repository, head_sha, "completed", "failure", BLOCKED,', '    if False:\n        return post_gate_final(repository, head_sha, "completed", "failure", BLOCKED,', "FN-9 a failed newest review left waiting, not blocked"),
     ("FN9-waiting-code", "gate/publish.py", 'review_reason(str(code), head_sha)])', 'review_reason("REVIEW_PENDING", head_sha)])', "FN-9 the reason of the waiting post lost"),
     ("FN9-reread-anyone", "gate/publish.py", "    return review_of(statuses, reviewer)\n", '    return ("success", None) if statuses and statuses[0].get("state") == "success" else review_of(statuses, reviewer)\n', "FN-9 a newer success by anyone confirms the post"),
@@ -390,6 +390,16 @@ MUTANTS: list[tuple[str, str, str, str, str]] = [
     ("FN9-pending", "gate/report.py", '    if state == "failed":\n        reasons.append(review_reason("REVIEW_FAILED", head_sha))\n', '    if mode == "finalize" and state == "pending":\n        return result(None, None)\n    if state == "failed":\n        reasons.append(review_reason("REVIEW_FAILED", head_sha))\n', "FN-9 a pending review posts nothing in finalize"),
     ("FN9-failed-reason", "gate/report.py", '        reasons.append(review_reason("REVIEW_FAILED", head_sha))\n', "        pass\n", "FN-4 a failed review without REVIEW_FAILED"),
     ("FN9-reason-code", "gate/report.py", '    return {"code": code, "detail"', '    return {"code": "REVIEW_MISSING", "detail"', "FN-2 a review reason with the wrong code"),
+    # The narrow check's mutants MA and MB (L63), proved by the tests added for them.
+    ("FN9-before-unreadable-only", "gate/publish.py", '    if state != "success":\n        return post_without_success(', '    if code == "REVIEW_UNREADABLE":\n        return post_without_success(', "FN-9 success posted before the after-read corrects it"),
+    ("FN9-decide-on-event", "gate/publish.py", "        statuses=statuses,\n", "        statuses=[this],\n", "FN-9 finalize decides on the status that started it"),
+    # A failure is never silence (L65).
+    ("FN9-http-errors", "gate/publish.py", "NETWORK_FAILURES = (urllib.error.URLError, OSError, http.client.HTTPException)", "NETWORK_FAILURES = (urllib.error.URLError, OSError)", "FN-9 http.client's errors escape a read"),
+    ("FN9-main-http", "gate/publish.py", "    except (urllib.error.URLError, OSError, http.client.HTTPException, ValueError, KeyError) as error:", "    except (urllib.error.URLError, OSError, ValueError, KeyError) as error:", "FN-9 http.client's errors end the run with a traceback"),
+    ("FN9-correction-retry", "gate/publish.py", "        except NETWORK_FAILURES:\n", "        except ZeroDivisionError:\n", "FN-9 a lost correction is not tried again"),
+    ("FN9-unreadable-post", "gate/publish.py", '        post_gate_final(repository, sha, "in_progress", None, AWAITING, [review_reason("REVIEW_UNREADABLE", sha)])\n', "", "FN-9 a run that cannot read posts nothing"),
+    ("FN9-unreadable-account", "gate/publish.py", "    if reviewer is None:\n        return unreadable()\n", '    if reviewer is None:\n        return stop("READ_FAILED", EXIT_RULE_FAILED)\n', "FN-9 a reviewer account that is not the bot posts nothing"),
+    ("FN9-unreadable-pulls", "gate/publish.py", "    except READ_FAILURES:\n        return unreadable()\n    pull = next(", '    except READ_FAILURES:\n        return stop("READ_FAILED", EXIT_RULE_FAILED)\n    pull = next(', "FN-9 a failed read of the PRs posts nothing"),
 ]
 
 

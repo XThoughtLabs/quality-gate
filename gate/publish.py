@@ -8,6 +8,7 @@ from __future__ import annotations
 
 import argparse
 import datetime
+import http.client
 import json
 import os
 import re
@@ -49,7 +50,10 @@ DEFAULT_SEMI_AUTOMATIC = [
 _TIME_COMMENT = re.compile(r"^/time\s+(\d+)\s*$", re.MULTILINE)
 FULL_SHA = re.compile(r"[0-9a-f]{40}")
 APP_NAME = re.compile(r"[A-Za-z0-9._-]+")
-READ_FAILURES = (urllib.error.URLError, OSError, ValueError, KeyError, TypeError, UsageError)
+# What the HTTP client can raise: URLError (an HTTP error answer among them), OSError, and http.client's own errors
+# (IncompleteRead, BadStatusLine), which are neither (FN-9: a failure is never silence).
+NETWORK_FAILURES = (urllib.error.URLError, OSError, http.client.HTTPException)
+READ_FAILURES = (*NETWORK_FAILURES, ValueError, KeyError, TypeError, UsageError)
 CONTEXT_VARIABLES = {
     "repository": "GATE_REPOSITORY",
     "head_repository": "GATE_HEAD_REPOSITORY",
@@ -372,7 +376,12 @@ def post_confirmed_success(repository: str, head_sha: str, reasons: list[dict], 
     post_check(repository, "gate/final", head_sha, "success", f"Final verdict: {READY}\n{reasons_text(reasons)}")
     state, code = newest_review(repository, head_sha, reviewer)
     if state != "success":
-        return [READY, *post_without_success(repository, head_sha, state, code, reasons)]
+        try:
+            return [READY, *post_without_success(repository, head_sha, state, code, reasons)]
+        except NETWORK_FAILURES:
+            # FN-9: a lost correction would leave the success newest; it is tried once more, then the run fails.
+            print("publish: the post after the success failed; trying once more", file=sys.stderr)
+            return [READY, *post_without_success(repository, head_sha, state, code, reasons)]
     return [READY]
 
 
@@ -468,7 +477,8 @@ def stored_gate_result(reports_dir: Path, pr: int, sha: str, actors: Any) -> tup
 
 
 def cmd_finalize(args: argparse.Namespace) -> int:
-    """FN-3 to FN-5: act on the reviewer's status for the head of an open PR, and post gate/final by the one decision."""
+    """FN-3 to FN-5 and FN-9: on an independent-review status for the head of an open PR, whoever created it, post
+    gate/final by the one decision for the newest review."""
     repository = os.environ["GITHUB_REPOSITORY"]
     config = load_config(args.config)
     integration = str((config.get("project") or {}).get("integration_branch") or "")
@@ -482,6 +492,15 @@ def cmd_finalize(args: argparse.Namespace) -> int:
         write_json(args.out, outcome)
         print(f"finalize: nothing posted ({code})")
         return exit_code
+
+    def unreadable() -> int:
+        # FN-9: a run that cannot read is never silent, or an earlier success could stay newest over the review it
+        # could not read. The event's three fields were checked before any read.
+        outcome["code"] = "READ_FAILED"
+        write_json(args.out, outcome)
+        post_gate_final(repository, sha, "in_progress", None, AWAITING, [review_reason("REVIEW_UNREADABLE", sha)])
+        print(f"finalize: a read failed; gate/final waits on {sha} (READ_FAILED)")
+        return EXIT_RULE_FAILED
 
     # Every field of the event is untrusted (FN-3): only these three are used, and each is checked.
     if not isinstance(event, dict) or event.get("context") != REVIEW_CONTEXT:
@@ -497,9 +516,9 @@ def cmd_finalize(args: argparse.Namespace) -> int:
         reviewer = reviewer_account(config)
         statuses = get_all(f"/repos/{repository}/commits/{sha}/statuses")
     except READ_FAILURES:
-        return stop("READ_FAILED", EXIT_RULE_FAILED)
+        return unreadable()
     if reviewer is None:
-        return stop("READ_FAILED", EXIT_RULE_FAILED)
+        return unreadable()
     this = next((item for item in statuses if isinstance(item, dict) and item.get("id") == status_id), None)
     if this is None or this.get("context") != REVIEW_CONTEXT:
         return stop("IGNORED_EVENT")
@@ -508,7 +527,7 @@ def cmd_finalize(args: argparse.Namespace) -> int:
     try:
         pulls = get_all(f"/repos/{repository}/pulls?state=open")
     except READ_FAILURES:
-        return stop("READ_FAILED", EXIT_RULE_FAILED)
+        return unreadable()
     pull = next(
         (
             item
@@ -867,7 +886,7 @@ def main(argv: list[str] | None = None) -> int:
         return args.handler(args)
     except UsageError as error:
         return fail_usage(str(error))
-    except (urllib.error.URLError, OSError, ValueError, KeyError) as error:
+    except (urllib.error.URLError, OSError, http.client.HTTPException, ValueError, KeyError) as error:
         # The message names the kind of failure only: a token never enters it, and a file's
         # name or content never does either.
         print(f"publish: {type(error).__name__} in {args.command}", file=sys.stderr)
