@@ -73,12 +73,16 @@ class Hub:
         self.pulls = [pull()]
         self.users = {c["login"]: c for c in (CREATORS["reviewer"], CREATORS["executor"], CREATORS["ceo"])}
         self.broken: set[str] = set()      # reads that answer 500: statuses, runs, users, pulls
+        # The seams of FN-9's interleaving tests: a test changes the stand-in's state at a named moment, never by time.
+        self.reads = 0                     # statuses reads answered so far
+        self.after_read = None             # called with the read's number once its answer is fixed, before it is sent
+        self.on_post = None                # called with a check-run post's body as it arrives, before it is answered
         repo = re.escape(REPO)
         stub.route("GET", r"/users/(.+)", self._user)
         stub.route("GET", rf"/repos/{repo}/commits/([^/]+)/statuses", self._statuses)
         stub.route("GET", rf"/repos/{repo}/commits/([^/]+)/check-runs", self._runs)
         stub.route("GET", rf"/repos/{repo}/pulls", self._pulls)
-        stub.route("POST", rf"/repos/{repo}/check-runs", (201, {"id": 1}))
+        stub.route("POST", rf"/repos/{repo}/check-runs", self._post)
 
     def _user(self, req):
         if "users" in self.broken:
@@ -90,7 +94,16 @@ class Hub:
         if "statuses" in self.broken:
             return 500, {"message": "boom"}
         sha = req.path.split("/commits/", 1)[1].split("/", 1)[0]
-        return 200, (self.statuses.get(sha, []) if (req.q("page") or "1") == "1" else [])
+        answer = list(self.statuses.get(sha, [])) if (req.q("page") or "1") == "1" else []
+        self.reads += 1
+        if self.after_read is not None:
+            self.after_read(self.reads)
+        return 200, answer
+
+    def _post(self, req):
+        if self.on_post is not None:
+            self.on_post(req.json())
+        return 201, {"id": 1}
 
     def _runs(self, req):
         if "runs" in self.broken:
@@ -557,12 +570,18 @@ def test_fn4_a_failed_review_gives_blocked_review_failed(tmp_path, hub, state):
     assert out["decision"]["verdict"] == "blocked"
 
 
-@pytest.mark.req("FN-4")
-def test_fn4_a_pending_review_changes_nothing(tmp_path, hub):
+@pytest.mark.req("FN-9", "FN-4")
+def test_fn9_a_pending_review_keeps_gate_final_in_progress_in_finalize(tmp_path, hub):
+    # Changed by FN-9 (M-1 repair, 2026-11-11): FN-4 said a pending review posts nothing, which let an earlier success
+    # stay the newest gate/final. Was test_fn4_a_pending_review_changes_nothing (asserted no write at all).
     st = reviewed(hub, "pending")
     res, out = finalize(tmp_path, hub, status_event(st))
     assert res.rc == 0, res.describe()
-    assert hub.writes() == [], "a pending review posts nothing"
+    posted = hub.posted()
+    assert len(posted) == 1 and posted[0]["status"] == "in_progress" and posted[0].get("conclusion") is None, posted
+    assert posted[0]["output"]["title"] == f"gate/final: waiting for the independent review on {HEAD}", posted[0]
+    assert "REVIEW_PENDING" in posted[0]["output"]["summary"] and "ready-for-human" not in text_of(posted[0])
+    assert out["decision"]["verdict"] == "awaiting-review"
 
 
 @pytest.mark.req("FN-4", "FN-5", "FN-1")
@@ -576,27 +595,36 @@ def test_fn4_a_newer_review_by_another_creator_keeps_gate_final_in_progress(tmp_
     assert "ready-for-human" not in text_of(posted[0])
 
 
-@pytest.mark.req("FN-5", "FN-3")
+@pytest.mark.req("FN-9", "FN-5", "FN-3")
 @pytest.mark.parametrize("who", NOT_THE_REVIEWER)
-def test_fn5_a_status_created_by_anyone_but_the_reviewer_posts_nothing(tmp_path, hub, who):
+def test_fn9_a_status_created_by_anyone_but_the_reviewer_gets_the_decision_for_the_newest_review_never_success(
+        tmp_path, hub, who):
+    # Changed by FN-9 (M-1 repair, 2026-11-11): FN-5 said such a status posts nothing (IGNORED_CREATOR), so a run it
+    # started could not correct an earlier success. Now finalize decides on the newest review, here that very status,
+    # which is no valid review. Was test_fn5_a_status_created_by_anyone_but_the_reviewer_posts_nothing.
     hub.runs[HEAD] = green_runs(SEVEN)
     st = status("success", who=who)
     hub.statuses[HEAD] = [st]
     res, out = finalize(tmp_path, hub, status_event(st))
     assert res.rc == 0, res.describe()
-    assert hub.writes() == []
-    assert out["acted"] is False and out["code"] == "IGNORED_CREATOR"
+    posted = hub.posted()
+    assert len(posted) == 1 and posted[0]["status"] == "in_progress" and posted[0].get("conclusion") is None, posted
+    assert "REVIEW_NOT_BY_REVIEWER" in posted[0]["output"]["summary"] and "ready-for-human" not in text_of(posted[0])
+    assert out["acted"] is True and out["code"] is None
 
 
-@pytest.mark.req("FN-3", "FN-5")
+@pytest.mark.req("FN-3", "FN-5", "FN-9")
 def test_fn3_the_events_sender_is_not_believed_the_creator_comes_from_the_api(tmp_path, hub):
+    # Changed by FN-9 (M-1 repair, 2026-11-11): the run now decides instead of stopping with IGNORED_CREATOR; the API's
+    # creator still decides, so the payload's claim of the reviewer never makes gate/final success.
     hub.runs[HEAD] = green_runs(SEVEN)
     st = status("success", who="ceo")
     hub.statuses[HEAD] = [st]
     event = status_event(st, sender=copy.deepcopy(CREATORS["reviewer"]))   # the payload claims the reviewer
     res, out = finalize(tmp_path, hub, event)
-    assert hub.writes() == []
-    assert out["code"] == "IGNORED_CREATOR"
+    posted = hub.posted()
+    assert posted and all(b.get("conclusion") != "success" for b in posted), posted
+    assert "REVIEW_NOT_BY_REVIEWER" in posted[-1]["output"]["summary"], posted[-1]
 
 
 @pytest.mark.req("FN-3")
@@ -825,3 +853,222 @@ def test_feedback_reads_a_stored_awaiting_review_as_not_a_failure(tmp_path):
     assert res.rc == 0, res.describe()
     decision = load_out(res, out)
     assert decision["reason_code"] == "NOT_A_FAILURE" and decision["act"] is False and decision["post"] is False
+
+
+# ----------------------------------------------------------------------------- FN-9: the newest review decides last (M-1)
+#
+# Finding M-1 of round 2's review round 1. Each interleaving is fixed by the stand-in's seams (Hub.after_read and
+# Hub.on_post), never by time: a status is added or a read is broken at a named moment, or a second finalize process is
+# run from inside the stand-in while the first one waits for its answer (the stand-in serves each request on its own
+# thread). A run whose status GitHub's concurrency rule replaced (L18) is simply never run.
+
+
+EXPECT = {   # the newest review -> what the newest gate/final must be (FN-9)
+    ("failure", "reviewer"): ("blocked", "REVIEW_FAILED"),
+    ("error", "reviewer"): ("blocked", "REVIEW_FAILED"),
+    ("pending", "reviewer"): ("waiting", "REVIEW_PENDING"),
+    ("success", "ceo"): ("waiting", "REVIEW_NOT_BY_REVIEWER"),
+    ("success", "executor"): ("waiting", "REVIEW_NOT_BY_REVIEWER"),
+}
+NEWER_STATUSES = [("failure", "reviewer"), ("error", "reviewer"), ("pending", "reviewer"), ("success", "ceo")]
+NEWER_IDS = ["failure", "error", "pending", "ceo-success"]
+
+
+class Ready:
+    """A ready head: one stored ready record, every mandatory check green, the reviewer's success the newest review."""
+
+    def __init__(self, tmp_path, hub):
+        self.tmp, self.hub = tmp_path, hub
+        self.cfg = config(tmp_path)
+        self.stored = tmp_path / "stored" / "reports"
+        store_record(self.stored)
+        hub.runs[HEAD] = green_runs(SEVEN)
+        self.first = status("success")
+        hub.statuses[HEAD] = [self.first]
+
+    def add(self, state, who="reviewer"):
+        """A new independent-review status on the head: the newest review from now on."""
+        st = status(state, who=who)
+        self.hub.statuses[HEAD].insert(0, st)
+        return st
+
+    def finalize(self, st, name):
+        """One run of finalize for the event of `st`, in its own folder, as one run of the workflow."""
+        folder = self.tmp / f"finalize-{name}"
+        actors = write_json(folder / "actors.json", {"actors_ok": True, "foreign_commits": [], "accepted_commits": [],
+                                                     "reason": None})
+        event = write_json(folder / "event.json", status_event(st))
+        return run_gate("publish", "finalize", "--event", event, "--config", self.cfg, "--reports-dir", self.stored,
+                        "--actors", actors, "--out", folder / "finalize.json", env=self.hub.env())
+
+    def archive_read(self):
+        """The archive job up to its post (Y-24): final-facts, then report final, with the review already there (FN-8)."""
+        folder = self.tmp / "archive"
+        verdict = write_json(folder / "verdict.json", verdict_obj())
+        archive = write_json(folder / "archive.json", ARCH_OK)
+        facts, out = folder / "facts.json", folder / "final" / "final.json"
+        res = run_gate("publish", "final-facts", "--head-sha", HEAD, "--config", self.cfg, "--out", facts, env=self.hub.env())
+        assert res.rc == 0, res.describe()
+        res = run_gate("report", "final", "--verdict", verdict, "--archive", archive, "--facts", facts, "--out", out)
+        assert res.rc == 0, res.describe()
+        assert load_out(res, out)["verdict"] == "ready-for-human", "precondition: the archive job read the reviewer's success"
+        return out
+
+    def archive_post(self, out):
+        """The archive job's post, as judge.yml runs it."""
+        return run_gate("publish", "post-final", "--final", out, "--head-sha", HEAD, env=self.hub.env())
+
+
+def ran(res):
+    """A run that ends as a workflow run must: exit 0, no traceback, no token."""
+    assert "invalid choice" not in res.err, res.describe()
+    assert_no_traceback(res)
+    assert TOKEN not in res.both
+    assert res.rc == 0, res.describe()
+
+
+def assert_newest_final(hub, expect, code, why):
+    posted = hub.posted()
+    seen = [(b.get("status"), b.get("conclusion")) for b in posted]
+    assert posted, f"gate/final was posted ({why})"
+    last = posted[-1]
+    assert not (last.get("status") == "completed" and last.get("conclusion") == "success"), (
+        f"FN-9: the newest gate/final is success while the newest review is not the reviewer's success ({why}); "
+        f"gate/final posts in order: {seen}")
+    if expect == "blocked":
+        assert (last["status"], last.get("conclusion")) == ("completed", "failure"), seen
+        assert last["output"]["summary"].startswith("Final verdict: blocked"), last["output"]
+    else:
+        assert last["status"] == "in_progress" and last.get("conclusion") is None, seen
+        assert last["output"]["title"] == f"gate/final: waiting for the independent review on {HEAD}", last["output"]
+    assert code in last["output"]["summary"], last["output"]
+    assert last["head_sha"] == HEAD
+    assert "ready-for-human" not in text_of(last)
+
+
+@pytest.mark.req("FN-9", "FN-8")
+@pytest.mark.parametrize("state,who", NEWER_STATUSES, ids=NEWER_IDS)
+def test_fn9_b_a_review_that_changes_between_the_archive_jobs_read_and_its_post_is_not_overtaken(tmp_path, hub, state, who):
+    """M-1 (b): the archive job read the reviewer's success; a newer status came and its finalize run acted on it; only
+    then did the archive job post. The archive job's success must not become the newest gate/final."""
+    world = Ready(tmp_path, hub)
+    out = world.archive_read()
+    newer = world.add(state, who)
+    ran(world.finalize(newer, "B"))
+    ran(world.archive_post(out))
+    expect, code = EXPECT[(state, who)]
+    assert_newest_final(hub, expect, code, f"a {who} {state} status between the archive job's read and its post")
+
+
+@pytest.mark.req("FN-9", "FN-4")
+@pytest.mark.parametrize("state,who", [NEWER_STATUSES[0], NEWER_STATUSES[2], NEWER_STATUSES[3]],
+                         ids=["failure", "pending", "ceo-success"])
+def test_fn9_a_a_success_posted_after_a_newer_reviews_run_read_and_posted_is_not_the_newest(tmp_path, hub, state, who):
+    """M-1 (a): run A read the reviewer's success; before A posted, a newer status came, and its run B read it and
+    posted. Run A's success must not become the newest gate/final."""
+    world = Ready(tmp_path, hub)
+    second = {}
+
+    def between(number):
+        if number == 1:   # run A's read is answered with the success alone; then the newer status and run B
+            second["status"] = world.add(state, who)
+            try:
+                second["res"] = world.finalize(second["status"], "B")
+            except BaseException as error:   # kept for the test: an error here would be lost in the stand-in's thread
+                second["error"] = error
+
+    hub.after_read = between
+    first = world.finalize(world.first, "A")
+    hub.after_read = None
+    assert "error" not in second, second.get("error")
+    ran(second["res"])
+    ran(first)
+    expect, code = EXPECT[(state, who)]
+    assert_newest_final(hub, expect, code, f"run A posted after run B read a {who} {state} status")
+
+
+@pytest.mark.req("FN-9")
+@pytest.mark.parametrize("path", ["archive", "finalize"])
+@pytest.mark.parametrize("state,who", NEWER_STATUSES, ids=NEWER_IDS)
+def test_fn9_a_review_that_changes_right_after_a_success_post_is_followed_by_its_decision(tmp_path, hub, path, state, who):
+    """The re-read after the post: the newer status came just after the success was posted, and its own finalize run was
+    replaced while it waited (L18), so no queued run will correct the success."""
+    world = Ready(tmp_path, hub)
+    came = []
+
+    def as_posted(body):
+        if body.get("name") == "gate/final" and body.get("conclusion") == "success" and not came:
+            came.append(world.add(state, who))
+
+    hub.on_post = as_posted
+    if path == "archive":
+        ran(world.archive_post(world.archive_read()))
+    else:
+        ran(world.finalize(world.first, "A"))
+    hub.on_post = None
+    assert came, "precondition: a success was posted while the reviewer's success was the newest review"
+    expect, code = EXPECT[(state, who)]
+    assert_newest_final(hub, expect, code, f"a {who} {state} status just after the success post ({path})")
+
+
+@pytest.mark.req("FN-9", "FN-5", "FN-6")
+@pytest.mark.parametrize("state,who", [("success", "ceo"), ("success", "executor"), ("pending", "reviewer")],
+                         ids=["ceo-success", "executor-success", "reviewer-pending"])
+def test_fn9_a_a_run_that_replaced_the_waiting_run_decides_on_the_newest_review(tmp_path, hub, state, who):
+    """M-1 (a): run A posted success; the reviewer's failure came next and its run B waited; a third independent-review
+    status made GitHub replace B by C (L18). C, whoever created its status, posts the decision for the newest review."""
+    world = Ready(tmp_path, hub)
+    ran(world.finalize(world.first, "A"))
+    assert [b.get("conclusion") for b in hub.posted()] == ["success"], "precondition: run A posted success"
+    world.add("failure")   # run B of this status never runs: replaced while it waited
+    third = world.add(state, who)
+    ran(world.finalize(third, "C"))
+    expect, code = EXPECT[(state, who)]
+    assert_newest_final(hub, expect, code, f"run C for a {who} {state} status, after run B was replaced")
+
+
+@pytest.mark.req("FN-9", "FN-6")
+def test_fn9_control_a_run_that_replaced_the_waiting_run_posts_success_for_a_newer_success_by_the_reviewer(tmp_path, hub):
+    world = Ready(tmp_path, hub)
+    ran(world.finalize(world.first, "A"))
+    world.add("failure")
+    third = world.add("success")
+    ran(world.finalize(third, "C"))
+    assert [(b["status"], b.get("conclusion")) for b in hub.posted()] == [("completed", "success")] * 2, hub.posted()
+
+
+@pytest.mark.req("FN-9", "FN-8", "FN-4")
+@pytest.mark.parametrize("path", ["archive", "finalize"])
+def test_fn9_control_a_review_unchanged_around_the_post_gives_one_success_and_nothing_after(tmp_path, hub, path):
+    world = Ready(tmp_path, hub)
+    if path == "archive":
+        ran(world.archive_post(world.archive_read()))
+    else:
+        ran(world.finalize(world.first, "A"))
+    posted = hub.posted()
+    assert [(b["status"], b.get("conclusion")) for b in posted] == [("completed", "success")], posted
+    assert posted[0]["output"]["summary"].startswith("Final verdict: ready-for-human"), posted[0]["output"]
+
+
+@pytest.mark.req("FN-9")
+@pytest.mark.parametrize("path", ["archive", "finalize"])
+@pytest.mark.parametrize("when", ["before", "after"])
+def test_fn9_a_re_read_that_fails_is_never_success(tmp_path, hub, path, when):
+    """Every read of the statuses after the decision's own read answers 500: before the post, or once success is posted."""
+    world = Ready(tmp_path, hub)
+    if when == "before":
+        hub.after_read = lambda number: hub.broken.add("statuses")
+    else:
+        hub.on_post = lambda body: (hub.broken.add("statuses")
+                                    if body.get("name") == "gate/final" and body.get("conclusion") == "success" else None)
+    if path == "archive":
+        ran(world.archive_post(world.archive_read()))
+    else:
+        ran(world.finalize(world.first, "A"))
+    hub.after_read = hub.on_post = None
+    posted = hub.posted()
+    if when == "before":
+        assert all(b.get("conclusion") != "success" for b in posted), f"no success without a re-read that confirms it: {posted}"
+    else:
+        assert any(b.get("conclusion") == "success" for b in posted), "precondition: the re-read before the post confirmed it"
+    assert_newest_final(hub, "waiting", "REVIEW_UNREADABLE", f"the re-read {when} the post failed ({path})")

@@ -101,9 +101,13 @@ def test_a_pending_review_in_the_archive_job_waits():
     assert "REVIEW_PENDING" in codes(d)
 
 
-def test_a_pending_review_in_finalize_posts_nothing():
+@pytest.mark.req("FN-9")
+def test_a_pending_review_in_finalize_waits_as_in_the_archive_job():
+    # Changed by FN-9 (M-1 repair, 2026-11-11): a pending review posted nothing in finalize, which let an earlier
+    # success stay the newest gate/final. Was test_a_pending_review_in_finalize_posts_nothing.
     d = decide(**world("finalize", statuses=[review("pending")]))
-    assert d["post"] is False and d["status"] is None and d["conclusion"] is None
+    assert (d["post"], d["status"], d["conclusion"], d["verdict"]) == (True, "in_progress", None, "awaiting-review")
+    assert "REVIEW_PENDING" in codes(d)
 
 
 @pytest.mark.parametrize("mode", ["archive", "finalize"])
