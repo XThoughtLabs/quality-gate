@@ -488,8 +488,12 @@ def test_post_final_a_file_without_a_readable_final_check_never_posts_success(tm
     ("ready-for-human", {"status": "queued", "conclusion": "success"}),
 ], ids=["success-but-blocked", "success-but-awaiting", "success-but-in-progress", "success-but-queued"])
 def test_post_final_success_only_for_a_completed_success_whose_final_verdict_is_ready(tmp_path, hub, verdict, check):
+    # FN-9 (M-1 repair): the reviewer's success is on the head and the file names the reviewer, so FN-9's re-read would
+    # confirm a success; only the file's own consistency may keep it away (mutant FIN-post-success).
+    hub.statuses[HEAD] = [status("success")]
     final = write_json(tmp_path / "final.json", {"verdict": verdict, "reasons": [], "final_check": check,
-                                                 "conclusions": {"gate/archive": "success", "gate/final": "success"}})
+                                                 "conclusions": {"gate/archive": "success", "gate/final": "success"},
+                                                 "reviewer": {"login": CREATORS["reviewer"]["login"], "id": CREATORS["reviewer"]["id"]}})
     res = run_gate("publish", "post-final", "--final", final, "--head-sha", HEAD, env=hub.env())
     assert res.rc == 0, res.describe()
     assert all(b.get("conclusion") != "success" for b in hub.posted("gate/final")), hub.posted("gate/final")
