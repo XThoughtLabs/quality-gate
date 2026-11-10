@@ -80,6 +80,7 @@ What the gate does not do or does not prove, written down rather than dropped. E
 - **L53, a narrow race between the archive job and finalize.** The archive job reads the review, then stores `final.json` and posts `gate/final` a few seconds later. A review posted inside those seconds starts finalize, which must check out, set up Python and read `reports` before it can post, so its post comes after the archive job's. If finalize ever posted first, the archive job's later "in progress" would be the newest `gate/final`: it fails closed, and a rerun of the archive job (FN-8) or a new review clears it.
 - **L54, two PRs with one head.** If two open PRs into the integration branch share a head SHA, finalize takes the first the API lists. `gate/final` belongs to the commit, so both PRs show it.
 - **L55, finalize's permissions are checked from the YAML only.** No `gate.env_check` role probes them at run time, as the judge's jobs do; FN-6 is proved by the workflow tests.
+- **L56, records stored before round 2.** Their `final.json` has no `gate_verdict`, so finalize reads them as no record and posts `gate/final` completed `failure`, verdict `incomplete`, `NO_RECORD`. It fails closed; a new judge run of the head (a push or a rerun) stores a record in the new form.
 
 ## Open until a real run
 
