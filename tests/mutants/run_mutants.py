@@ -48,6 +48,8 @@ TESTS_FOR = {
     "SEC": ["tests/spec/test_security_check.py"],
     # Round 2, the final verdict after the review (FN-1 to FN-8).
     "FIN": ["tests/unit/test_unit_final_decision.py", "tests/spec/test_workflows_finalize.py", "tests/spec/test_final_after_review.py"],
+    # Round 2, finding M-1: the newest review decides last (FN-9).
+    "FN9": ["tests/unit/test_unit_final_decision.py", "tests/spec/test_workflows_finalize.py", "tests/spec/test_final_after_review.py"],
 }
 
 # id, file, the exact text, what it becomes, the rule it should break.
@@ -322,7 +324,8 @@ MUTANTS: list[tuple[str, str, str, str, str]] = [
     ("FIN-review-newest", "gate/report.py", "    newest = latest_review_status(statuses)\n", '    newest = next((s for s in reversed(statuses) if isinstance(s, dict) and s.get("context") == "independent-review"), None)\n', "FN-1 the oldest review counts"),
     ("FIN-review-unreadable", "gate/report.py", "if not isinstance(statuses, list) or not isinstance(reviewer, dict):", "if not isinstance(statuses, list):", "FN-4 an unreadable reviewer account named otherwise"),
     ("FIN-review-error", "gate/report.py", '"error": "failed"', '"error": "success"', "FN-4 an error review counted as success"),
-    ("FIN-pending-finalize", "gate/report.py", 'if mode == "finalize" and state == "pending":', "if False:", "FN-4 a pending review posts"),
+    # FIN-pending-finalize, FIN-event-creator and FIN-post-pending are gone: FN-9 removed the code they changed (their
+    # results of round 2 stay in docs/mutants-results.json). FN9-pending and FN9-finalize-creator put that code back.
     ("FIN-not-ready-stays", "gate/report.py", "    if gate_verdict != READY:\n        return result(\"completed\", gate_verdict)\n", "", "FN-2 a verdict that is not ready made ready by a review"),
     ("FIN-archive-ok", "gate/report.py", "    if archive_ok is not True:\n", "    if False:\n", "FN-1 an archive that is not complete"),
     ("FIN-review-failed", "gate/report.py", '    if state == "failed":\n        return result("completed", BLOCKED)\n', "", "FN-4 a failed review not blocked"),
@@ -342,7 +345,7 @@ MUTANTS: list[tuple[str, str, str, str, str]] = [
     # publish
     ("FIN-post-checks", "gate/publish.py", '    if verdict["verdict"] == READY:\n', "    if False:\n", "FN-7 post-checks says ready"),
     ("FIN-post-waiting", "gate/publish.py", 'if status == "in_progress" and verdict == AWAITING:', "if False:", "FN-2 waiting posted as failure"),
-    ("FIN-post-success", "gate/publish.py", 'elif status == "completed" and conclusion == "success" and verdict == READY:', 'elif conclusion == "success":', "FN-1 success posted from an inconsistent file"),
+    ("FIN-post-success", "gate/publish.py", 'if status == "completed" and conclusion == "success" and verdict == READY:', 'if conclusion == "success":', "FN-1 success posted from an inconsistent file"),
     ("FIN-post-no-check", "gate/publish.py", "        check = {}\n        reasons = [*reasons,", "        check = {\"status\": \"completed\", \"conclusion\": final.get(\"conclusions\", {}).get(\"gate/final\")}\n        reasons = [*reasons,", "FN-1 a file without final_check posts its old conclusion"),
     ("FIN-facts-sha", "gate/publish.py", "    if not FULL_SHA.fullmatch(args.head_sha):\n", "    if False:\n", "FN-3 a malformed head read"),
     ("FIN-account-login", "gate/publish.py", 'user.get("login") != login or ', "", "FN-1 another login taken as the reviewer"),
@@ -350,7 +353,6 @@ MUTANTS: list[tuple[str, str, str, str, str]] = [
     ("FIN-account-id", "gate/publish.py", ' or not is_count(user.get("id")):\n        return None', ":\n        return None", "FN-1 an id that is not a number"),
     ("FIN-event-context", "gate/publish.py", 'if not isinstance(event, dict) or event.get("context") != REVIEW_CONTEXT:', "if not isinstance(event, dict):", "FN-3 another context acted on"),
     ("FIN-event-sha", "gate/publish.py", "if not isinstance(sha, str) or not FULL_SHA.fullmatch(sha):", "if not isinstance(sha, str):", "FN-3 a malformed SHA acted on"),
-    ("FIN-event-creator", "gate/publish.py", '    if not same_account(this.get("creator"), reviewer):\n', "    if False:\n", "FN-5 another creator acted on"),
     ("FIN-status-context", "gate/publish.py", 'if this is None or this.get("context") != REVIEW_CONTEXT:', "if this is None:", "FN-3 the API's status of another context acted on"),
     ("FIN-pr-head", "gate/publish.py", '            and (item.get("head") or {}).get("sha") == sha\n', "", "FN-3 a SHA that is not the head"),
     ("FIN-pr-base", "gate/publish.py", '            and (item.get("base") or {}).get("ref") == integration\n', "", "FN-3 a PR into another base"),
@@ -360,7 +362,6 @@ MUTANTS: list[tuple[str, str, str, str, str]] = [
     ("FIN-record-numeric", "gate/publish.py", "records.append((int(match.group(1)), int(match.group(2)), path.parent))", "records.append((match.group(1), match.group(2), path.parent))", "FN-4 run ids compared as text"),
     ("FIN-record-preliminary", "gate/publish.py", 'if final.get("gate_verdict") == READY and not preliminary_ok:', "if False:", "FN-4 a preliminary that is not ready"),
     ("FIN-record-archive", "gate/publish.py", 'archive_ok = (final.get("conclusions") or {}).get("gate/archive") == "success"', "archive_ok = True", "FN-4 a failed archive"),
-    ("FIN-post-pending", "gate/publish.py", '    if decision["post"]:\n', "    if True:\n", "FN-4 a pending review posts"),
     ("FIN-feedback", "gate/feedback.py", 'if verdict in ("ready-for-human", "awaiting-review"):', 'if verdict == "ready-for-human":', "awaiting-review stops a fix round"),
     # The workflows.
     ("FIN-wf-facts", ".github/workflows/judge.yml", '"$GATE_PY" -P -m gate.publish final-facts --head-sha "$GATE_HEAD_SHA" --config "$GATE_CONFIG" --out facts.json || true', "true", "Y-24 the facts never read"),
@@ -370,6 +371,25 @@ MUTANTS: list[tuple[str, str, str, str, str]] = [
     ("FIN-wf-cancel", ".github/workflows/finalize.yml", "cancel-in-progress: false", "cancel-in-progress: true", "FN-6 a run in progress cancelled"),
     ("FIN-wf-persist", ".github/workflows/finalize.yml", "persist-credentials: false", "persist-credentials: true", "FN-3 a credential left in a checkout"),
     ("FIN-wf-actors", ".github/workflows/finalize.yml", '          if python -P -m gate.archive check-actors --api-repo "$GITHUB_REPOSITORY" --branch reports --config "$GATE_CONFIG" --out actors.json; then\n', '          python -P -m gate.archive check-actors --api-repo "$GITHUB_REPOSITORY" --branch reports --config "$GATE_CONFIG" --out actors.json || true\n          if true; then\n', "FN-4 the stored runs read unchecked"),
+    # Round 2, finding M-1: the newest review decides last (FN-9). The re-read around a success.
+    ("FN9-before-read", "gate/publish.py", '    state, code = newest_review(repository, head_sha, reviewer)\n    if state != "success":\n        return post_without_success(repository, head_sha, state, code, reasons)\n', "", "FN-9 no re-read before the success post"),
+    ("FN9-after-read", "gate/publish.py", '    state, code = newest_review(repository, head_sha, reviewer)\n    if state != "success":\n        return [READY, *post_without_success(repository, head_sha, state, code, reasons)]\n', "", "FN-9 no re-read after the success post"),
+    ("FN9-before-state", "gate/publish.py", 'if state != "success":\n        return post_without_success(', 'if state == "failed":\n        return post_without_success(', "FN-9 only a failed review stops the success before the post"),
+    ("FN9-after-state", "gate/publish.py", 'if state != "success":\n        return [READY, ', 'if state == "failed":\n        return [READY, ', "FN-9 only a failed review follows the success after the post"),
+    ("FN9-failed-blocked", "gate/publish.py", '    if state == "failed":\n        return post_gate_final(repository, head_sha, "completed", "failure", BLOCKED,', '    if False:\n        return post_gate_final(repository, head_sha, "completed", "failure", BLOCKED,', "FN-9 a failed newest review left waiting, not blocked"),
+    ("FN9-waiting-code", "gate/publish.py", 'review_reason(str(code), head_sha)])', 'review_reason("REVIEW_PENDING", head_sha)])', "FN-9 the reason of the waiting post lost"),
+    ("FN9-reread-anyone", "gate/publish.py", "    return review_of(statuses, reviewer)\n", '    return ("success", None) if statuses and statuses[0].get("state") == "success" else review_of(statuses, reviewer)\n', "FN-9 a newer success by anyone confirms the post"),
+    ("FN9-reread-unreadable", "gate/publish.py", '/statuses"))\n    return review_of(statuses, reviewer)', '/statuses")) or []\n    return review_of(statuses, reviewer)', "FN-9 an unreadable re-read named missing"),
+    ("FN9-success-unchecked", "gate/publish.py", "        return post_confirmed_success(repository, head_sha, listed, reviewer)\n", '        post_check(repository, "gate/final", head_sha, "success", f"Final verdict: {READY}\\n{text}")\n        return [READY]\n', "FN-9 a success posted without the re-read"),
+    # The reviewer's account reaches the re-read.
+    ("FN9-final-json-reviewer", "gate/report.py", '"reviewer": facts.get("reviewer") if isinstance(facts.get("reviewer"), dict) else None,', '"reviewer": None,', "FN-9 final.json without the reviewer's account"),
+    ("FN9-post-final-reviewer", "gate/publish.py", 'reasons, reviewer=final.get("reviewer"))', "reasons, reviewer=None)", "FN-9 post-final re-reads without the reviewer"),
+    ("FN9-finalize-reviewer", "gate/publish.py", 'decision["reasons"], reviewer=reviewer)', 'decision["reasons"], reviewer=None)', "FN-9 finalize re-reads without the reviewer"),
+    # finalize decides on the newest review, and a pending review waits.
+    ("FN9-finalize-creator", "gate/publish.py", '        return stop("IGNORED_EVENT")\n    # FN-9:', '        return stop("IGNORED_EVENT")\n    from gate.report import same_account\n    if not same_account(this.get("creator"), reviewer):\n        return stop("IGNORED_CREATOR")\n    # FN-9:', "FN-9 a run for another creator's status posts nothing"),
+    ("FN9-pending", "gate/report.py", '    if state == "failed":\n        reasons.append(review_reason("REVIEW_FAILED", head_sha))\n', '    if mode == "finalize" and state == "pending":\n        return result(None, None)\n    if state == "failed":\n        reasons.append(review_reason("REVIEW_FAILED", head_sha))\n', "FN-9 a pending review posts nothing in finalize"),
+    ("FN9-failed-reason", "gate/report.py", '        reasons.append(review_reason("REVIEW_FAILED", head_sha))\n', "        pass\n", "FN-4 a failed review without REVIEW_FAILED"),
+    ("FN9-reason-code", "gate/report.py", '    return {"code": code, "detail"', '    return {"code": "REVIEW_MISSING", "detail"', "FN-2 a review reason with the wrong code"),
 ]
 
 

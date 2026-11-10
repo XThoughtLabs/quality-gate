@@ -55,6 +55,7 @@ _REVIEW_DETAIL = {
     "REVIEW_PENDING": "the independent review of {sha} is pending",
     "REVIEW_NOT_BY_REVIEWER": "the newest independent-review status on {sha} was not created by the reviewer's app",
     "REVIEW_UNREADABLE": "the independent review of {sha} could not be read",
+    "REVIEW_FAILED": "the independent review of {sha} did not pass",
 }
 
 RUN_STEPS = ("gate/env", "gate/guard", "gate/tests", "gate/acceptance", "gate/security")
@@ -122,6 +123,11 @@ def review_of(statuses: Any, reviewer: Any) -> tuple[str, str | None]:
     return state, "REVIEW_PENDING" if state == "pending" else None
 
 
+def review_reason(code: str, head_sha: str) -> dict:
+    """The reason a review gives the final verdict: REVIEW_FAILED, or why there is no valid review yet."""
+    return {"code": code, "detail": _REVIEW_DETAIL.get(code, "no valid review").format(sha=head_sha)}
+
+
 def check_conclusions(check_runs: Any, head_sha: str, own_checks: dict | None) -> dict[str, str] | None:
     """The newest check run of each mandatory check on the head, from the GitHub Actions app only. None when unreadable."""
     if not isinstance(check_runs, list):
@@ -154,9 +160,10 @@ def final_decision(
 ) -> dict:
     """FN-1, FN-2, FN-4, FN-5 and FN-8: the one decision of gate/final, for the archive job and for finalize.
 
-    mode is "archive" or "finalize". The check runs and the statuses are the head's, as the API lists them, or None
-    when they could not be read. Returns whether to post, the check's status and conclusion, the final verdict and
-    the reasons. Nothing here is ever success unless every fact FN-1 names is there.
+    mode is "archive" or "finalize"; since FN-9 both decide alike, and a pending review waits in both, so "post" is
+    always true. The check runs and the statuses are the head's, as the API lists them, or None when they could not
+    be read. Returns whether to post, the check's status and conclusion, the final verdict and the reasons. Nothing
+    here is ever success unless every fact FN-1 names is there; a success is posted only through FN-9's re-read.
     """
     state, review_code = review_of(statuses, reviewer)
     reasons = [item for item in gate_reasons if isinstance(item, dict)] if isinstance(gate_reasons, list) else []
@@ -172,10 +179,8 @@ def final_decision(
             "review": {"state": state, "code": review_code},
         }
 
-    if mode == "finalize" and state == "pending":
-        return result(None, None)
     if state == "failed":
-        reasons.append({"code": "REVIEW_FAILED", "detail": f"the independent review of {head_sha} did not pass"})
+        reasons.append(review_reason("REVIEW_FAILED", head_sha))
     if gate_verdict not in GATE_VERDICTS:
         reasons.append({"code": "NO_RECORD", "detail": f"no readable gate verdict is stored for {head_sha}"})
         return result("completed", INCOMPLETE)
@@ -200,7 +205,7 @@ def final_decision(
         if missing:
             return result("completed", INCOMPLETE)
         return result("completed", READY)
-    reasons.append({"code": str(review_code), "detail": _REVIEW_DETAIL.get(str(review_code), "no valid review").format(sha=head_sha)})
+    reasons.append(review_reason(str(review_code), head_sha))
     return result("in_progress", AWAITING)
 
 
@@ -760,6 +765,8 @@ def cmd_final(args: argparse.Namespace) -> int:
             "conclusions": {"gate/archive": archive_conclusion, "gate/final": decision["conclusion"]},
             "final_check": {"status": decision["status"], "conclusion": decision["conclusion"]},
             "review": decision["review"],
+            # FN-9: post-final re-reads the review around a success with the account final-facts read.
+            "reviewer": facts.get("reviewer") if isinstance(facts.get("reviewer"), dict) else None,
         },
     )
     print(f"gate verdict: {verdict}; final verdict: {decision['verdict']}")

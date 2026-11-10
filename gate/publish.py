@@ -23,7 +23,7 @@ from typing import Any
 
 from gate.feedback import MARKER as REVIEW_MARKER
 from gate.feedback import REVIEW_CONTEXT
-from gate.report import AWAITING, BLOCKED, INCOMPLETE, NEEDS_HUMAN, READY, final_decision, is_count, same_account
+from gate.report import AWAITING, BLOCKED, INCOMPLETE, NEEDS_HUMAN, READY, final_decision, is_count, review_of, review_reason
 from gate.common import (
     EXIT_OK,
     EXIT_RULE_FAILED,
@@ -341,17 +341,46 @@ def cmd_post_checks(args: argparse.Namespace) -> int:
     return EXIT_OK
 
 
-def post_gate_final(repository: str, head_sha: str, status: Any, conclusion: Any, verdict: Any, reasons: Any) -> None:
-    """Post gate/final: success only for a completed ready verdict, in progress only while waiting, failure otherwise."""
+def post_gate_final(repository: str, head_sha: str, status: Any, conclusion: Any, verdict: Any, reasons: Any, *, reviewer: Any = None) -> list[str]:
+    """Post gate/final: success only for a completed ready verdict that FN-9's re-read confirms, in progress only while
+    waiting, failure otherwise. Returns the final verdicts posted, in order."""
     text = reasons_text(reasons)
     if status == "in_progress" and verdict == AWAITING:
         title = f"gate/final: waiting for the independent review on {head_sha}"
         post_check(repository, "gate/final", head_sha, None, f"{waiting_text(head_sha)}\n{text}", status="in_progress", title=title)
-    elif status == "completed" and conclusion == "success" and verdict == READY:
-        post_check(repository, "gate/final", head_sha, "success", f"Final verdict: {READY}\n{text}")
-    else:
-        shown = verdict if verdict in (BLOCKED, NEEDS_HUMAN, INCOMPLETE) else INCOMPLETE
-        post_check(repository, "gate/final", head_sha, "failure", f"Final verdict: {shown}\n{text}")
+        return [AWAITING]
+    if status == "completed" and conclusion == "success" and verdict == READY:
+        listed = [item for item in reasons if isinstance(item, dict)] if isinstance(reasons, list) else []
+        return post_confirmed_success(repository, head_sha, listed, reviewer)
+    shown = verdict if verdict in (BLOCKED, NEEDS_HUMAN, INCOMPLETE) else INCOMPLETE
+    post_check(repository, "gate/final", head_sha, "failure", f"Final verdict: {shown}\n{text}")
+    return [shown]
+
+
+def newest_review(repository: str, sha: str, reviewer: Any) -> tuple[str, str | None]:
+    """FN-9: the newest review on the SHA as the API lists it now. A failed read is no valid review, never a pass."""
+    statuses = read_or_none(lambda: get_all(f"/repos/{repository}/commits/{sha}/statuses"))
+    return review_of(statuses, reviewer)
+
+
+def post_confirmed_success(repository: str, head_sha: str, reasons: list[dict], reviewer: Any) -> list[str]:
+    """FN-9: gate/final success only while the newest review is the reviewer's success, read just before the post and
+    again just after it. Otherwise blocked or waiting stands instead of the success, or after it."""
+    state, code = newest_review(repository, head_sha, reviewer)
+    if state != "success":
+        return post_without_success(repository, head_sha, state, code, reasons)
+    post_check(repository, "gate/final", head_sha, "success", f"Final verdict: {READY}\n{reasons_text(reasons)}")
+    state, code = newest_review(repository, head_sha, reviewer)
+    if state != "success":
+        return [READY, *post_without_success(repository, head_sha, state, code, reasons)]
+    return [READY]
+
+
+def post_without_success(repository: str, head_sha: str, state: str, code: str | None, reasons: list[dict]) -> list[str]:
+    """FN-9: a failed newest review is blocked; any other that is no success by the reviewer keeps gate/final waiting."""
+    if state == "failed":
+        return post_gate_final(repository, head_sha, "completed", "failure", BLOCKED, [*reasons, review_reason("REVIEW_FAILED", head_sha)])
+    return post_gate_final(repository, head_sha, "in_progress", None, AWAITING, [*reasons, review_reason(str(code), head_sha)])
 
 
 def cmd_post_final(args: argparse.Namespace) -> int:
@@ -364,7 +393,8 @@ def cmd_post_final(args: argparse.Namespace) -> int:
         # FN-1: a final verdict that does not say how gate/final stands is never success.
         check = {}
         reasons = [*reasons, {"code": "NO_FINAL_CHECK", "detail": "the final verdict file holds no readable final_check"}]
-    post_gate_final(repository, args.head_sha, check.get("status"), check.get("conclusion"), final.get("verdict"), reasons)
+    posted = post_gate_final(repository, args.head_sha, check.get("status"), check.get("conclusion"), final.get("verdict"), reasons, reviewer=final.get("reviewer"))
+    print(f"post-final: gate/final posted on {args.head_sha}: {', '.join(posted)}")
     return EXIT_OK
 
 
@@ -473,9 +503,8 @@ def cmd_finalize(args: argparse.Namespace) -> int:
     this = next((item for item in statuses if isinstance(item, dict) and item.get("id") == status_id), None)
     if this is None or this.get("context") != REVIEW_CONTEXT:
         return stop("IGNORED_EVENT")
-    # The creator comes from the API's record of this status, never from the event (FN-3, FN-5).
-    if not same_account(this.get("creator"), reviewer):
-        return stop("IGNORED_CREATOR")
+    # FN-9: whoever created the status that started this run, the decision rests on the newest review the API lists,
+    # and the decision checks that review's creator (FN-1, FN-5). So the last run to run decides for the newest review.
     try:
         pulls = get_all(f"/repos/{repository}/pulls?state=open")
     except READ_FAILURES:
@@ -509,11 +538,8 @@ def cmd_finalize(args: argparse.Namespace) -> int:
     )
     outcome.update(acted=True, decision=decision)
     write_json(args.out, outcome)
-    if decision["post"]:
-        post_gate_final(repository, sha, decision["status"], decision["conclusion"], decision["verdict"], decision["reasons"])
-        print(f"finalize: gate/final {decision['status']} {decision['conclusion'] or ''} on {sha}, verdict {decision['verdict']}")
-    else:
-        print(f"finalize: the review of {sha} is pending; nothing posted")
+    posted = post_gate_final(repository, sha, decision["status"], decision["conclusion"], decision["verdict"], decision["reasons"], reviewer=reviewer)
+    print(f"finalize: decided {decision['verdict']} on {sha}; gate/final posted: {', '.join(posted)}")
     return EXIT_OK
 
 
