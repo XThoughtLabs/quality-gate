@@ -1220,52 +1220,111 @@ def break_read(hub, broken):
         hub.broken.add(broken)
 
 
-def lose_success_answers(world, hub, times):
-    """The reviewer's failure comes as the first success post arrives (its own run replaced, L18); the answers of the
-    first `times` success posts are lost after GitHub stored them."""
+NOT_JSON_201 = b"HTTP/1.0 201 Created\r\nContent-Type: application/json\r\nContent-Length: 9\r\n\r\nnot-json!"
+UNREADABLE = "unreadable"
+EXPECT[UNREADABLE] = ("waiting", "REVIEW_UNREADABLE")
+LATER = NEWER_STATUSES + [UNREADABLE]
+LATER_IDS = NEWER_IDS + ["re-read-fails"]
+
+
+def on_success_posts(world, hub, *, lost, arrive_at, newer, answer=CUT_201):
+    """The answers of the first `lost` success posts are lost after GitHub stored them (`answer`: a cut body, or a body
+    that is not JSON). As success post number `arrive_at` arrives, the newer status `newer` comes (its own run replaced,
+    L18), or, for UNREADABLE, every later read of the statuses fails."""
     seen = []
 
     def as_posted(body):
         if body.get("name") != "gate/final":
             return None
         seen.append(body)
-        if body.get("conclusion") == "success":
-            if len(seen) == 1:
-                world.add("failure")
-            if sum(b.get("conclusion") == "success" for b in seen) <= times:
-                return Lost(CUT_201)
-        return None
+        if body.get("conclusion") != "success":
+            return None
+        number = sum(b.get("conclusion") == "success" for b in seen)
+        if number == arrive_at:
+            if newer == UNREADABLE:
+                hub.broken.add("statuses")
+            else:
+                world.add(*newer)
+        return Lost(answer) if number <= lost else None
 
     hub.on_post = as_posted
     return seen
 
 
+def expected_conclusion(newer):
+    return "failure" if EXPECT[newer if newer == UNREADABLE else tuple(newer)][0] == "blocked" else None
+
+
 @pytest.mark.req("FN-9")
 @pytest.mark.parametrize("path", ["archive", "finalize"])
-def test_fn9_a_success_post_whose_answer_is_lost_once_is_tried_again_and_then_followed(tmp_path, hub, path):
-    """L67 and L68: the success is posted again, and the re-read after it follows the newer failed review."""
+@pytest.mark.parametrize("newer", NEWER_STATUSES, ids=NEWER_IDS)
+def test_fn9_a_success_post_whose_answer_is_lost_is_not_tried_again_once_the_newest_review_no_longer_allows_it(
+        tmp_path, hub, path, newer):
+    # Changed by FN-9's amendment for L75 (the CEO's decision of 2026-11-11): the success was tried again without a
+    # re-read, and only the after-read corrected it. Was test_fn9_a_success_post_whose_answer_is_lost_once_is_tried_
+    # again_and_then_followed (failure only; it asserted the posts [success, success, failure]).
     world = Ready(tmp_path, hub)
-    seen = lose_success_answers(world, hub, times=1)
+    seen = on_success_posts(world, hub, lost=1, arrive_at=1, newer=newer)
     res = world.archive_post(world.archive_read()) if path == "archive" else world.finalize(world.first, "A")
     hub.on_post = None
     ran(res)
-    assert [b.get("conclusion") for b in seen] == ["success", "success", "failure"], seen
-    assert_newest_final(hub, "blocked", "REVIEW_FAILED", f"a success answer lost once ({path})")
+    assert [b.get("conclusion") for b in seen] == ["success", expected_conclusion(newer)], seen
+    expect, code = EXPECT[tuple(newer)]
+    assert_newest_final(hub, expect, code, f"a success answer lost, then a {newer} status ({path})")
 
 
 @pytest.mark.req("FN-9")
 @pytest.mark.parametrize("path", ["archive", "finalize"])
-def test_fn9_a_success_post_whose_answer_is_lost_twice_is_followed_by_the_newest_review_then_exit_1(tmp_path, hub, path):
-    """L67: GitHub stored both successes; the run cannot know it, so it reads the newest review again and follows it."""
+def test_fn9_control_a_success_post_whose_answer_is_lost_once_is_tried_again_while_the_review_allows_it(tmp_path, hub, path):
     world = Ready(tmp_path, hub)
-    seen = lose_success_answers(world, hub, times=2)
+    seen = on_success_posts(world, hub, lost=1, arrive_at=0, newer=UNREADABLE)
+    res = world.archive_post(world.archive_read()) if path == "archive" else world.finalize(world.first, "A")
+    hub.on_post = None
+    ran(res)
+    assert [b.get("conclusion") for b in seen] == ["success", "success"], seen
+
+
+@pytest.mark.req("FN-9")
+@pytest.mark.parametrize("path", ["archive", "finalize"])
+@pytest.mark.parametrize("newer", LATER, ids=LATER_IDS)
+def test_fn9_a_success_post_whose_answer_is_lost_twice_is_followed_by_the_newest_review_then_exit_1(tmp_path, hub, path, newer):
+    # Changed by L72 (the third check's medium, the CEO's decision of 2026-11-11): the test had only a failed review, so
+    # a follow-up for a failed review only (mutant C8) or one that ignores a failed re-read (C9) passed. Now every kind
+    # of newer status and a failed re-read, arriving at the second success post.
+    world = Ready(tmp_path, hub)
+    seen = on_success_posts(world, hub, lost=2, arrive_at=2, newer=newer)
     res = world.archive_post(world.archive_read()) if path == "archive" else world.finalize(world.first, "A")
     hub.on_post = None
     assert_no_traceback(res)
     assert TOKEN not in res.both
     assert res.rc == 1, res.describe()
-    assert [b.get("conclusion") for b in seen] == ["success", "success", "failure"], seen
-    assert_newest_final(hub, "blocked", "REVIEW_FAILED", f"a success answer lost twice ({path})")
+    assert [b.get("conclusion") for b in seen] == ["success", "success", expected_conclusion(newer)], seen
+    expect, code = EXPECT[newer if newer == UNREADABLE else tuple(newer)]
+    assert_newest_final(hub, expect, code, f"a success answer lost twice, then {newer} ({path})")
+
+
+@pytest.mark.req("FN-9")
+@pytest.mark.parametrize("path", ["archive", "finalize"])
+def test_fn9_a_success_post_whose_answer_is_not_json_counts_as_a_failed_post(tmp_path, hub, path):
+    """L73: GitHub stored the success and answered with a body that is not JSON while the reviewer's failure came."""
+    world = Ready(tmp_path, hub)
+    seen = on_success_posts(world, hub, lost=1, arrive_at=1, newer=("failure", "reviewer"), answer=NOT_JSON_201)
+    res = world.archive_post(world.archive_read()) if path == "archive" else world.finalize(world.first, "A")
+    hub.on_post = None
+    ran(res)
+    assert [b.get("conclusion") for b in seen] == ["success", "failure"], seen
+    assert_newest_final(hub, "blocked", "REVIEW_FAILED", f"a success answer that is not JSON ({path})")
+
+
+@pytest.mark.req("FN-9", "FN-2")
+def test_fn9_a_waiting_post_whose_answer_is_not_json_is_tried_once_more(tmp_path, hub):
+    """L73: the archive job's in-progress gate/final, with no review yet, is answered with a body that is not JSON."""
+    hub.runs[HEAD] = green_runs(SIX)
+    hub.on_post = lambda body: RawResponse(NOT_JSON_201) if body.get("name") == "gate/final" and not hub.refused else None
+    final, posted, _archive = archive_chain(tmp_path, hub)
+    hub.on_post = None
+    assert len(hub.refused) == 1, "precondition: the first gate/final post had an answer that is not JSON"
+    assert_waiting(final, posted)
 
 
 @pytest.mark.req("FN-9")
