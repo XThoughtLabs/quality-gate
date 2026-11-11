@@ -2531,5 +2531,197 @@
     "killed_by": "FAILED tests/spec/test_final_after_review.py::test_fn9_a_read_needed_before_deciding_that_fails_posts_gate_final_in_progress_and_exits_1[pulls]",
     "run_at": "632722e",
     "confirmed_alone": true
+  },
+  {
+    "id": "FIN-post-waiting",
+    "rule": "FN-2 waiting posted as failure",
+    "outcome": "killed",
+    "killed_by": "FAILED tests/spec/test_final_after_review.py::test_fn2_a_ready_run_with_no_review_leaves_gate_final_in_progress_never_success",
+    "run_at": "b293aaa",
+    "confirmed_alone": true
+  },
+  {
+    "id": "FIN-post-success",
+    "rule": "FN-1 success posted from an inconsistent file",
+    "outcome": "killed",
+    "killed_by": "FAILED tests/spec/test_final_after_review.py::test_post_final_success_only_for_a_completed_success_whose_final_verdict_is_ready[success-but-blocked]",
+    "run_at": "b293aaa",
+    "confirmed_alone": true
+  },
+  {
+    "id": "FIN-event-context",
+    "rule": "FN-3 another context acted on",
+    "outcome": "killed",
+    "killed_by": "FAILED tests/spec/test_final_after_review.py::test_fn3_every_event_field_is_untrusted_and_checked_before_anything_is_posted[-context-ci-other--IGNORED_CONTEXT]",
+    "run_at": "b293aaa",
+    "confirmed_alone": true
+  },
+  {
+    "id": "FIN-event-sha",
+    "rule": "FN-3 a malformed SHA acted on",
+    "outcome": "killed",
+    "killed_by": "FAILED tests/spec/test_final_after_review.py::test_fn3_every_event_field_is_untrusted_and_checked_before_anything_is_posted[-sha-1111111111111111111111111-IGNORED_SHA0]",
+    "run_at": "b293aaa",
+    "confirmed_alone": true
+  },
+  {
+    "id": "FIN-status-context",
+    "rule": "FN-3 the API's status of another context acted on",
+    "outcome": "killed",
+    "killed_by": "FAILED tests/spec/test_final_after_review.py::test_fn3_an_event_whose_status_id_is_a_status_of_another_context_posts_nothing",
+    "run_at": "b293aaa",
+    "confirmed_alone": true
+  },
+  {
+    "id": "FIN-pr-head",
+    "rule": "FN-3 a SHA that is not the head",
+    "outcome": "killed",
+    "killed_by": "FAILED tests/spec/test_final_after_review.py::test_fn5_a_review_of_an_earlier_head_after_a_new_push_posts_nothing",
+    "run_at": "b293aaa",
+    "confirmed_alone": true
+  },
+  {
+    "id": "FIN-pr-base",
+    "rule": "FN-3 a PR into another base",
+    "outcome": "killed",
+    "killed_by": "FAILED tests/spec/test_final_after_review.py::test_fn3_a_sha_that_is_not_the_head_of_an_open_pr_into_the_integration_branch_posts_nothing[pr-into-another-base]",
+    "run_at": "b293aaa",
+    "confirmed_alone": true
+  },
+  {
+    "id": "FN9-before-read",
+    "rule": "FN-9 no re-read before the success post",
+    "outcome": "killed",
+    "killed_by": "FAILED tests/spec/test_final_after_review.py::test_fn9_b_a_review_that_changes_between_the_archive_jobs_read_and_its_post_is_not_overtaken[failure]",
+    "run_at": "b293aaa",
+    "confirmed_alone": true
+  },
+  {
+    "id": "FN9-after-read",
+    "rule": "FN-9 no re-read after the success post",
+    "outcome": "killed",
+    "killed_by": "FAILED tests/spec/test_final_after_review.py::test_fn9_a_review_that_changes_right_after_a_success_post_is_followed_by_its_decision[failure-archive]",
+    "run_at": "b293aaa",
+    "confirmed_alone": true
+  },
+  {
+    "id": "FN9-before-state",
+    "rule": "FN-9 only a failed review stops the success before the post",
+    "outcome": "killed",
+    "killed_by": "FAILED tests/spec/test_final_after_review.py::test_fn9_b_a_review_that_changes_between_the_archive_jobs_read_and_its_post_is_not_overtaken[pending]",
+    "run_at": "b293aaa",
+    "confirmed_alone": true
+  },
+  {
+    "id": "FN9-after-state",
+    "rule": "FN-9 only a failed review follows the success after the post",
+    "outcome": "killed",
+    "killed_by": "FAILED tests/spec/test_final_after_review.py::test_fn9_a_review_that_changes_right_after_a_success_post_is_followed_by_its_decision[pending-archive]",
+    "run_at": "b293aaa",
+    "confirmed_alone": true
+  },
+  {
+    "id": "FN9-success-unchecked",
+    "rule": "FN-9 a success posted without the re-read",
+    "outcome": "killed",
+    "killed_by": "FAILED tests/spec/test_final_after_review.py::test_fn9_b_a_review_that_changes_between_the_archive_jobs_read_and_its_post_is_not_overtaken[failure]",
+    "run_at": "b293aaa",
+    "confirmed_alone": true
+  },
+  {
+    "id": "FN9-finalize-reviewer",
+    "rule": "FN-9 finalize re-reads without the reviewer",
+    "outcome": "killed",
+    "killed_by": "FAILED tests/spec/test_final_after_review.py::test_fn4_everything_right_gives_gate_final_success_and_ready_for_human",
+    "run_at": "b293aaa",
+    "confirmed_alone": true
+  },
+  {
+    "id": "FN9-finalize-creator",
+    "rule": "FN-9 a run for another creator's status posts nothing",
+    "outcome": "killed",
+    "killed_by": "FAILED tests/spec/test_final_after_review.py::test_fn9_a_status_created_by_anyone_but_the_reviewer_gets_the_decision_for_the_newest_review_never_success[ceo]",
+    "run_at": "b293aaa",
+    "confirmed_alone": true
+  },
+  {
+    "id": "FN9-before-unreadable-only",
+    "rule": "FN-9 success posted before the after-read corrects it",
+    "outcome": "killed",
+    "killed_by": "FAILED tests/spec/test_final_after_review.py::test_fn9_b_a_review_that_changes_between_the_archive_jobs_read_and_its_post_is_not_overtaken[failure]",
+    "run_at": "b293aaa",
+    "confirmed_alone": true
+  },
+  {
+    "id": "FN9-decide-on-event",
+    "rule": "FN-9 finalize decides on the status that started it",
+    "outcome": "killed",
+    "killed_by": "FAILED tests/spec/test_final_after_review.py::test_fn4_a_newer_review_by_another_creator_keeps_gate_final_in_progress",
+    "run_at": "b293aaa",
+    "confirmed_alone": true
+  },
+  {
+    "id": "FN9-correction-retry",
+    "rule": "FN-9 a failed gate/final post is not tried again (L68)",
+    "outcome": "killed",
+    "killed_by": "FAILED tests/spec/test_final_after_review.py::test_fn9_a_correction_after_a_success_that_fails_once_is_tried_again[500-archive]",
+    "run_at": "b293aaa",
+    "confirmed_alone": true
+  },
+  {
+    "id": "FN9-unreadable-post",
+    "rule": "FN-9 a run that cannot read posts nothing",
+    "outcome": "killed",
+    "killed_by": "FAILED tests/spec/test_final_after_review.py::test_fn9_a_read_needed_before_deciding_that_fails_posts_gate_final_in_progress_and_exits_1[users]",
+    "run_at": "b293aaa",
+    "confirmed_alone": true
+  },
+  {
+    "id": "FN9-unreadable-account",
+    "rule": "FN-9 a reviewer account that is not the bot posts nothing",
+    "outcome": "killed",
+    "killed_by": "FAILED tests/spec/test_final_after_review.py::test_fn9_a_read_needed_before_deciding_that_fails_posts_gate_final_in_progress_and_exits_1[users-not-a-bot]",
+    "run_at": "b293aaa",
+    "confirmed_alone": true
+  },
+  {
+    "id": "FN9-lost-success-followed",
+    "rule": "FN-9 a lost success answer not followed (L67)",
+    "outcome": "killed",
+    "killed_by": "FAILED tests/spec/test_final_after_review.py::test_fn9_a_success_post_whose_answer_is_lost_twice_is_followed_by_the_newest_review_then_exit_1[archive]",
+    "run_at": "b293aaa",
+    "confirmed_alone": true
+  },
+  {
+    "id": "FN9-account-before-pr",
+    "rule": "FN-9 the reviewer's account read before the PR head is known (L69)",
+    "outcome": "killed",
+    "killed_by": "FAILED tests/spec/test_final_after_review.py::test_fn9_a_read_needed_before_deciding_that_fails_posts_gate_final_in_progress_and_exits_1[users]",
+    "run_at": "b293aaa",
+    "confirmed_alone": true
+  },
+  {
+    "id": "FN9-statuses-before-pr",
+    "rule": "FN-9 the statuses read before the PR head is known (L69)",
+    "outcome": "killed",
+    "killed_by": "FAILED tests/spec/test_final_after_review.py::test_fn9_a_re_read_that_fails_is_never_success[before-finalize]",
+    "run_at": "b293aaa",
+    "confirmed_alone": true
+  },
+  {
+    "id": "FN9-account-before-event",
+    "rule": "FN-9 the reviewer's account read before the event's status is checked (L69)",
+    "outcome": "killed",
+    "killed_by": "FAILED tests/spec/test_final_after_review.py::test_fn9_a_read_needed_before_deciding_that_fails_posts_gate_final_in_progress_and_exits_1[users]",
+    "run_at": "b293aaa",
+    "confirmed_alone": true
+  },
+  {
+    "id": "FN9-unreadable-pulls",
+    "rule": "FN-9 a failed read of the PRs posts nothing",
+    "outcome": "killed",
+    "killed_by": "FAILED tests/spec/test_final_after_review.py::test_fn9_a_read_needed_before_deciding_that_fails_posts_gate_final_in_progress_and_exits_1[pulls]",
+    "run_at": "b293aaa",
+    "confirmed_alone": true
   }
 ]
