@@ -54,6 +54,8 @@ APP_NAME = re.compile(r"[A-Za-z0-9._-]+")
 # (IncompleteRead, BadStatusLine), which are neither (FN-9: a failure is never silence).
 NETWORK_FAILURES = (urllib.error.URLError, OSError, http.client.HTTPException)
 READ_FAILURES = (*NETWORK_FAILURES, ValueError, KeyError, TypeError, UsageError)
+# A post fails also when GitHub's answer cannot be parsed (FN-9, L73): json raises ValueError.
+POST_FAILURES = (*NETWORK_FAILURES, ValueError)
 CONTEXT_VARIABLES = {
     "repository": "GATE_REPOSITORY",
     "head_repository": "GATE_HEAD_REPOSITORY",
@@ -362,10 +364,11 @@ def post_gate_final(repository: str, head_sha: str, status: Any, conclusion: Any
 
 
 def post_final_check(repository: str, head_sha: str, conclusion: str | None, summary: str, *, status: str = "completed", title: str | None = None) -> None:
-    """FN-9: a gate/final post that fails is tried once more, so that a lost post does not leave an older one newest."""
+    """FN-9: a gate/final post that fails is tried once more, so that a lost post does not leave an older one newest.
+    A success does not come here: post_confirmed_success tries it again only after a re-read (L75)."""
     try:
         post_check(repository, "gate/final", head_sha, conclusion, summary, status=status, title=title)
-    except NETWORK_FAILURES:
+    except POST_FAILURES:
         print("publish: a gate/final post failed; trying once more", file=sys.stderr)
         post_check(repository, "gate/final", head_sha, conclusion, summary, status=status, title=title)
 
@@ -382,15 +385,25 @@ def post_confirmed_success(repository: str, head_sha: str, reasons: list[dict], 
     state, code = newest_review(repository, head_sha, reviewer)
     if state != "success":
         return post_without_success(repository, head_sha, state, code, reasons)
+    summary = f"Final verdict: {READY}\n{reasons_text(reasons)}"
     try:
-        post_final_check(repository, head_sha, "success", f"Final verdict: {READY}\n{reasons_text(reasons)}")
-    except NETWORK_FAILURES:
-        # FN-9 (L67): GitHub may have stored the success whose answer was lost, so the newest review is followed all
-        # the same; then the run fails.
+        post_check(repository, "gate/final", head_sha, "success", summary)
+    except POST_FAILURES:
+        # FN-9 (L75): the success is tried again only after the newest review is read again. GitHub may have stored
+        # the first try, so a review that no longer allows it is followed instead of the second try.
+        print("publish: the success post failed; reading the review again before trying once more", file=sys.stderr)
         state, code = newest_review(repository, head_sha, reviewer)
         if state != "success":
-            post_without_success(repository, head_sha, state, code, reasons)
-        raise
+            return [READY, *post_without_success(repository, head_sha, state, code, reasons)]
+        try:
+            post_check(repository, "gate/final", head_sha, "success", summary)
+        except POST_FAILURES:
+            # FN-9 (L67): GitHub may have stored the success whose answer was lost, so the newest review is followed
+            # all the same; then the run fails.
+            state, code = newest_review(repository, head_sha, reviewer)
+            if state != "success":
+                post_without_success(repository, head_sha, state, code, reasons)
+            raise
     state, code = newest_review(repository, head_sha, reviewer)
     if state != "success":
         return [READY, *post_without_success(repository, head_sha, state, code, reasons)]
