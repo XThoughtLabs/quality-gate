@@ -24,6 +24,7 @@ from gate.common import (
     EXIT_OK,
     EXIT_RULE_FAILED,
     FIXED_CLASSES,
+    MANDATORY_CHECKS,
     UsageError,
     fail_usage,
     load_config,
@@ -34,11 +35,28 @@ from gate.common import (
     slug,
     write_json,
 )
+from gate.feedback import latest_review_status
 
 READY = "ready-for-human"
 BLOCKED = "blocked"
 NEEDS_HUMAN = "needs-human"
 INCOMPLETE = "incomplete"
+# The final verdict while gate/final waits for the independent review (FN-2). Never a pass.
+AWAITING = "awaiting-review"
+GATE_VERDICTS = (READY, BLOCKED, NEEDS_HUMAN, INCOMPLETE)
+
+# The GitHub Actions app on github.com: the integration the ruleset requires for the gate's checks (FN-1).
+ACTIONS_APP_ID = 15368
+# What must be green on the head before gate/final may be: every mandatory class but gate/final itself (FN-1).
+FINAL_INPUTS = tuple(check for check in MANDATORY_CHECKS if check != "gate/final")
+REVIEW_STATES = {"success": "success", "failure": "failed", "error": "failed", "pending": "pending"}
+_REVIEW_DETAIL = {
+    "REVIEW_MISSING": "no independent review of {sha} exists yet",
+    "REVIEW_PENDING": "the independent review of {sha} is pending",
+    "REVIEW_NOT_BY_REVIEWER": "the newest independent-review status on {sha} was not created by the reviewer's app",
+    "REVIEW_UNREADABLE": "the independent review of {sha} could not be read",
+    "REVIEW_FAILED": "the independent review of {sha} did not pass",
+}
 
 RUN_STEPS = ("gate/env", "gate/guard", "gate/tests", "gate/acceptance", "gate/security")
 CONTRADICTIONS = {"FORK_PR", "SHA_MISMATCH", "EXIT_CODE_MISMATCH", "CHECKSUM_MISMATCH", "CLAIM_MISMATCH", "REPORTS_UNTRUSTED"}
@@ -71,6 +89,124 @@ SCHEMA_PATH = Path(__file__).parent / "schema" / "report.schema.json"
 def conclusion_for(verdict: str) -> str:
     """Only ready passes. GitHub counts neutral and skipped as success, so neither is ever used."""
     return "success" if verdict == READY else "failure"
+
+
+def is_count(value: Any) -> bool:
+    """A positive integer. True and False are integers in Python, and are refused."""
+    return isinstance(value, int) and not isinstance(value, bool) and value > 0
+
+
+def same_account(creator: Any, reviewer: Any) -> bool:
+    """The status's creator is the reviewer's bot account: login, id and type, never a text (FN-1)."""
+    if not isinstance(creator, dict) or not isinstance(reviewer, dict) or not is_count(reviewer.get("id")):
+        return False
+    return (
+        creator.get("login") == reviewer.get("login")
+        and is_count(creator.get("id"))
+        and creator.get("id") == reviewer.get("id")
+        and creator.get("type") == "Bot"
+    )
+
+
+def review_of(statuses: Any, reviewer: Any) -> tuple[str, str | None]:
+    """The state of the newest independent review of the head, and the reason when it is no valid review."""
+    if not isinstance(statuses, list) or not isinstance(reviewer, dict):
+        return "missing", "REVIEW_UNREADABLE"
+    newest = latest_review_status(statuses)
+    if newest is None:
+        return "missing", "REVIEW_MISSING"
+    if not same_account(newest.get("creator"), reviewer):
+        return "missing", "REVIEW_NOT_BY_REVIEWER"
+    state = REVIEW_STATES.get(newest.get("state"))
+    if state is None:
+        return "missing", "REVIEW_UNREADABLE"
+    return state, "REVIEW_PENDING" if state == "pending" else None
+
+
+def review_reason(code: str, head_sha: str) -> dict:
+    """The reason a review gives the final verdict: REVIEW_FAILED, or why there is no valid review yet."""
+    return {"code": code, "detail": _REVIEW_DETAIL.get(code, "no valid review").format(sha=head_sha)}
+
+
+def check_conclusions(check_runs: Any, head_sha: str, own_checks: dict | None) -> dict[str, str] | None:
+    """The newest check run of each mandatory check on the head, from the GitHub Actions app only. None when unreadable."""
+    if not isinstance(check_runs, list):
+        return None
+    newest: dict[str, dict] = {}
+    for run in check_runs:
+        if not isinstance(run, dict) or run.get("head_sha") != head_sha or run.get("name") not in FINAL_INPUTS:
+            continue
+        app = run.get("app") if isinstance(run.get("app"), dict) else {}
+        if not is_count(app.get("id")) or app.get("id") != ACTIONS_APP_ID or not is_count(run.get("id")):
+            continue
+        if run["name"] not in newest or run["id"] > newest[run["name"]]["id"]:
+            newest[run["name"]] = run
+    found = {name: str(run.get("conclusion")) if run.get("status") == "completed" else "not-completed" for name, run in newest.items()}
+    found.update(own_checks or {})
+    return found
+
+
+def final_decision(
+    *,
+    mode: str,
+    head_sha: str,
+    gate_verdict: Any,
+    gate_reasons: Any,
+    archive_ok: Any,
+    check_runs: Any,
+    statuses: Any,
+    reviewer: Any,
+    own_checks: dict | None = None,
+) -> dict:
+    """FN-1, FN-2, FN-4, FN-5 and FN-8: the one decision of gate/final, for the archive job and for finalize.
+
+    mode is "archive" or "finalize"; since FN-9 both decide alike, and a pending review waits in both, so "post" is
+    always true. The check runs and the statuses are the head's, as the API lists them, or None when they could not
+    be read. Returns whether to post, the check's status and conclusion, the final verdict and the reasons. Nothing
+    here is ever success unless every fact FN-1 names is there; a success is posted only through FN-9's re-read.
+    """
+    state, review_code = review_of(statuses, reviewer)
+    reasons = [item for item in gate_reasons if isinstance(item, dict)] if isinstance(gate_reasons, list) else []
+
+    def result(status: str | None, verdict: str | None) -> dict:
+        conclusion = conclusion_for(str(verdict)) if status == "completed" else None
+        return {
+            "post": status is not None,
+            "status": status,
+            "conclusion": conclusion,
+            "verdict": verdict,
+            "reasons": reasons,
+            "review": {"state": state, "code": review_code},
+        }
+
+    if state == "failed":
+        reasons.append(review_reason("REVIEW_FAILED", head_sha))
+    if gate_verdict not in GATE_VERDICTS:
+        reasons.append({"code": "NO_RECORD", "detail": f"no readable gate verdict is stored for {head_sha}"})
+        return result("completed", INCOMPLETE)
+    if gate_verdict != READY:
+        return result("completed", gate_verdict)
+    if archive_ok is not True:
+        reasons.append({"code": "EVIDENCE_NOT_STORED", "detail": "the stored archive of this run is not complete"})
+        return result("completed", INCOMPLETE)
+    if state == "failed":
+        return result("completed", BLOCKED)
+    if state == "success":
+        found = check_conclusions(check_runs, head_sha, own_checks)
+        if found is None:
+            reasons.append({"code": "CHECKS_UNREADABLE", "detail": f"the check runs on {head_sha} could not be read"})
+            return result("completed", INCOMPLETE)
+        failed = [name for name in FINAL_INPUTS if found.get(name) not in (None, "success", "not-completed")]
+        missing = [name for name in FINAL_INPUTS if found.get(name) in (None, "not-completed")]
+        reasons += [{"code": "FAILED_CHECK", "detail": f"{name} did not succeed on {head_sha}"} for name in failed]
+        reasons += [{"code": "MISSING_CHECK", "detail": f"{name} has no completed check run on {head_sha}"} for name in missing]
+        if failed:
+            return result("completed", BLOCKED)
+        if missing:
+            return result("completed", INCOMPLETE)
+        return result("completed", READY)
+    reasons.append(review_reason(str(review_code), head_sha))
+    return result("in_progress", AWAITING)
 
 
 def find_run_job(jobs: dict) -> dict | None:
@@ -428,12 +564,25 @@ def cell(value: Any) -> str:
 def render_markdown(report: dict) -> str:
     """Render the Markdown from the JSON only."""
     verification = report["verification"]
+    preliminary = report["verdicts"]["preliminary"]
+    if preliminary == READY:
+        # FN-7: the word ready belongs to the final verdict alone, which waits for the independent review.
+        headline = [
+            "**Preliminary result: the gate's checks passed.**",
+            "",
+            "The final verdict waits for the independent review on the same commit, after the evidence is stored: "
+            "see the check `gate/final`, and `final.json` beside this report.",
+        ]
+    else:
+        headline = [
+            f"**Preliminary verdict: {cell(preliminary)}**",
+            "",
+            "The final verdict comes after the evidence is stored: see the check `gate/final`, and `final.json` beside this report.",
+        ]
     lines = [
         "# Quality gate report",
         "",
-        f"**Preliminary verdict: {cell(report['verdicts']['preliminary'])}**",
-        "",
-        "The final verdict comes after the evidence is stored: see the check `gate/final`, and `final.json` beside this report.",
+        *headline,
         "",
         "## Verification record",
         "",
@@ -587,21 +736,40 @@ def cmd_final(args: argparse.Namespace) -> int:
         reasons.append({"code": "REPORTS_WRITTEN_BY_ANOTHER_ACTOR", "detail": str(archive.get("reason"))})
         if verdict == READY:
             verdict = BLOCKED
-    if verdict not in (READY, BLOCKED, NEEDS_HUMAN, INCOMPLETE):
+    if verdict not in GATE_VERDICTS:
         verdict = INCOMPLETE
         reasons.append({"code": "UNKNOWN_VERDICT", "detail": "the preliminary verdict is not known"})
+    archive_conclusion = "success" if stored and actors_ok else "failure"
+    # FN-2 and FN-8: the gate's own verdict is not yet the final one. A missing or unreadable facts file leaves every
+    # fact unreadable, so the final verdict can only wait or fail.
+    facts = read_json_or_none(args.facts) if args.facts else None
+    facts = facts if isinstance(facts, dict) else {}
+    decision = final_decision(
+        mode="archive",
+        head_sha=str(facts.get("head_sha") or ""),
+        gate_verdict=verdict,
+        gate_reasons=list(reasons),
+        archive_ok=stored and actors_ok,
+        check_runs=facts.get("check_runs"),
+        statuses=facts.get("statuses"),
+        reviewer=facts.get("reviewer"),
+        own_checks={"gate/archive": archive_conclusion},
+    )
     write_json(
         args.out,
         {
-            "verdict": verdict,
-            "reasons": reasons,
-            "conclusions": {
-                "gate/archive": "success" if stored and actors_ok else "failure",
-                "gate/final": conclusion_for(verdict),
-            },
+            "verdict": decision["verdict"],
+            "gate_verdict": verdict,
+            "gate_reasons": reasons,
+            "reasons": decision["reasons"],
+            "conclusions": {"gate/archive": archive_conclusion, "gate/final": decision["conclusion"]},
+            "final_check": {"status": decision["status"], "conclusion": decision["conclusion"]},
+            "review": decision["review"],
+            # FN-9: post-final re-reads the review around a success with the account final-facts read.
+            "reviewer": facts.get("reviewer") if isinstance(facts.get("reviewer"), dict) else None,
         },
     )
-    print(f"final verdict: {verdict}")
+    print(f"gate verdict: {verdict}; final verdict: {decision['verdict']}")
     return EXIT_OK
 
 
@@ -684,6 +852,7 @@ def main(argv: list[str] | None = None) -> int:
     final.add_argument("--out", required=True)
     final.add_argument("--expect-verdict-sha256")
     final.add_argument("--env-result")
+    final.add_argument("--facts", help="the head's statuses, check runs and reviewer account, from gate.publish final-facts")
 
     compare = commands.add_parser("compare")
     compare.add_argument("first")

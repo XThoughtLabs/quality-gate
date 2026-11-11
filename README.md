@@ -12,7 +12,7 @@ The pipeline names no application, so it can be pointed at another one.
 
 | Where | What |
 |---|---|
-| `.github/workflows/` | the reusable workflows: `judge`, `executor`, `spec-tests`, `feedback` |
+| `.github/workflows/` | the reusable workflows: `judge`, `executor`, `spec-tests`, `feedback`, and `finalize`, which gives the final verdict once the independent review is in |
 | `gate/` | the scripts: `env_check`, `run_checks`, `guard`, `acceptance`, `security_check`, `concurrency_harness`, `report`, `publish`, `archive`, `feedback`, `reproduce`, `review_local` |
 | `docs/CONTRACTS.md` | the numbered rules each script must meet |
 | `ACTIONS-LOCK.md` | every pin, with the date it was checked |

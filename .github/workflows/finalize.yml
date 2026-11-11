@@ -1,0 +1,67 @@
+# The final verdict after the independent review (CONTRACTS.md section 8.5, FN-3 to FN-6).
+# Reusable: a repository calls it on `status` events, so it runs from that repository's default
+# branch. It acts only on the reviewer's independent-review status for the head of an open PR,
+# runs no PR code and reads no PR file. It holds no secret and cannot write code or runs (FN-6).
+name: finalize
+
+on:
+  workflow_call:
+    inputs:
+      config-path:
+        description: Path of the configuration on the default branch.
+        type: string
+        default: quality.toml
+
+permissions: {}
+
+jobs:
+  finalize:
+    name: finalize
+    # Only the review's statuses start work; gate.publish finalize checks every field of the event again (FN-3).
+    if: ${{ github.event_name == 'status' && github.event.context == 'independent-review' }}
+    runs-on: ubuntu-24.04
+    timeout-minutes: 10
+    permissions:
+      checks: write
+      contents: read
+      pull-requests: read
+    # One run per commit at a time. A run that may already have posted is never cancelled (FN-6).
+    concurrency:
+      group: gate-finalize-${{ github.event.sha }}
+      cancel-in-progress: false
+    env:
+      PYTHONPATH: ${{ github.workspace }}/.gate
+      GATE_TOKEN: ${{ github.token }}
+      GATE_CONFIG: ${{ github.workspace }}/.trusted/${{ inputs.config-path }}
+    steps:
+      - name: Get the gate at its pinned commit
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          repository: ${{ job.workflow_repository }}
+          ref: ${{ job.workflow_sha }}
+          path: .gate
+          persist-credentials: false
+
+      - name: Get the configuration from the default branch
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          path: .trusted
+          persist-credentials: false
+
+      - name: Set up Python
+        uses: actions/setup-python@6d4fd22b20465ccc0f7354476588e8df7c9ca0e0 # v7.1.0
+        with:
+          python-version: "3.13.15"
+
+      # Decision V.4: the stored runs are read only after their branch was checked.
+      # When the check fails the folder stays empty, and finalize says the reports are untrusted.
+      - name: Get the stored runs
+        run: |
+          mkdir -p "$GITHUB_WORKSPACE/.stored/reports"
+          if python -P -m gate.archive check-actors --api-repo "$GITHUB_REPOSITORY" --branch reports --config "$GATE_CONFIG" --out actors.json; then
+            rm -rf "$GITHUB_WORKSPACE/.stored"
+            bash .gate/scripts/get_stored_runs.sh .trusted "$GITHUB_WORKSPACE/.stored"
+          fi
+
+      - name: Finalize
+        run: python -P -m gate.publish finalize --event "$GITHUB_EVENT_PATH" --config "$GATE_CONFIG" --reports-dir .stored/reports --actors actors.json --out finalize.json

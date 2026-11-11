@@ -8,6 +8,7 @@ from __future__ import annotations
 
 import argparse
 import datetime
+import http.client
 import json
 import os
 import re
@@ -22,6 +23,8 @@ from pathlib import Path
 from typing import Any
 
 from gate.feedback import MARKER as REVIEW_MARKER
+from gate.feedback import REVIEW_CONTEXT
+from gate.report import AWAITING, BLOCKED, INCOMPLETE, NEEDS_HUMAN, READY, final_decision, is_count, review_of, review_reason
 from gate.common import (
     EXIT_OK,
     EXIT_RULE_FAILED,
@@ -45,6 +48,14 @@ DEFAULT_SEMI_AUTOMATIC = [
     "A person approves and merges each PR.",
 ]
 _TIME_COMMENT = re.compile(r"^/time\s+(\d+)\s*$", re.MULTILINE)
+FULL_SHA = re.compile(r"[0-9a-f]{40}")
+APP_NAME = re.compile(r"[A-Za-z0-9._-]+")
+# What the HTTP client can raise: URLError (an HTTP error answer among them), OSError, and http.client's own errors
+# (IncompleteRead, BadStatusLine), which are neither (FN-9: a failure is never silence).
+NETWORK_FAILURES = (urllib.error.URLError, OSError, http.client.HTTPException)
+READ_FAILURES = (*NETWORK_FAILURES, ValueError, KeyError, TypeError, UsageError)
+# A post fails also when GitHub's answer cannot be parsed (FN-9, L73): json raises ValueError.
+POST_FAILURES = (*NETWORK_FAILURES, ValueError)
 CONTEXT_VARIABLES = {
     "repository": "GATE_REPOSITORY",
     "head_repository": "GATE_HEAD_REPOSITORY",
@@ -301,40 +312,283 @@ def cmd_extras(args: argparse.Namespace) -> int:
     return EXIT_OK
 
 
-def post_check(repository: str, name: str, head_sha: str, conclusion: str, summary: str) -> None:
-    call(
-        "POST",
-        f"/repos/{repository}/check-runs",
-        {
-            "name": name,
-            "head_sha": head_sha,
-            "status": "completed",
-            "conclusion": conclusion,
-            "output": {"title": f"{name}: {conclusion}", "summary": neutralize(summary)[:60_000]},
-        },
-    )
+def post_check(repository: str, name: str, head_sha: str, conclusion: str | None, summary: str, *, status: str = "completed", title: str | None = None) -> None:
+    """Create a new check run. A run in progress has no conclusion; a completed one always has one."""
+    body: dict[str, Any] = {
+        "name": name,
+        "head_sha": head_sha,
+        "status": status,
+        "output": {"title": title or f"{name}: {conclusion}", "summary": neutralize(summary)[:60_000]},
+    }
+    if status == "completed":
+        body["conclusion"] = conclusion
+    call("POST", f"/repos/{repository}/check-runs", body)
 
 
-def reasons_text(reasons: list[Any]) -> str:
-    lines = [f"- {item.get('code')}: {item.get('detail')}" for item in reasons if isinstance(item, dict)]
+def reasons_text(reasons: Any) -> str:
+    lines = [f"- {item.get('code')}: {item.get('detail')}" for item in reasons if isinstance(item, dict)] if isinstance(reasons, list) else []
     return "\n".join(lines) or "No reasons."
+
+
+def waiting_text(head_sha: str) -> str:
+    return f"The gate's checks passed. The final verdict waits for the independent review on {head_sha}."
 
 
 def cmd_post_checks(args: argparse.Namespace) -> int:
     repository = os.environ["GITHUB_REPOSITORY"]
     verdict = read_json(args.verdict)
-    summary = f"Preliminary verdict: {verdict['verdict']}\n{reasons_text(verdict.get('reasons', []))}"
+    if verdict["verdict"] == READY:
+        # FN-7: ready is the final verdict's word, and the final verdict waits for the review.
+        summary = waiting_text(args.head_sha)
+    else:
+        summary = f"Preliminary verdict: {verdict['verdict']}\n{reasons_text(verdict.get('reasons', []))}"
     for name, conclusion in sorted(verdict["checks"].items()):
         post_check(repository, name, args.head_sha, conclusion, summary)
     return EXIT_OK
 
 
+def post_gate_final(repository: str, head_sha: str, status: Any, conclusion: Any, verdict: Any, reasons: Any, *, reviewer: Any = None) -> list[str]:
+    """Post gate/final: success only for a completed ready verdict that FN-9's re-read confirms, in progress only while
+    waiting, failure otherwise. Returns the final verdicts posted, in order."""
+    text = reasons_text(reasons)
+    if status == "in_progress" and verdict == AWAITING:
+        title = f"gate/final: waiting for the independent review on {head_sha}"
+        post_final_check(repository, head_sha, None, f"{waiting_text(head_sha)}\n{text}", status="in_progress", title=title)
+        return [AWAITING]
+    if status == "completed" and conclusion == "success" and verdict == READY:
+        listed = [item for item in reasons if isinstance(item, dict)] if isinstance(reasons, list) else []
+        return post_confirmed_success(repository, head_sha, listed, reviewer)
+    shown = verdict if verdict in (BLOCKED, NEEDS_HUMAN, INCOMPLETE) else INCOMPLETE
+    post_final_check(repository, head_sha, "failure", f"Final verdict: {shown}\n{text}")
+    return [shown]
+
+
+def post_final_check(repository: str, head_sha: str, conclusion: str | None, summary: str, *, status: str = "completed", title: str | None = None) -> None:
+    """FN-9: a gate/final post that fails is tried once more, so that a lost post does not leave an older one newest.
+    A success does not come here: post_confirmed_success tries it again only after a re-read (L75)."""
+    try:
+        post_check(repository, "gate/final", head_sha, conclusion, summary, status=status, title=title)
+    except POST_FAILURES:
+        print("publish: a gate/final post failed; trying once more", file=sys.stderr)
+        post_check(repository, "gate/final", head_sha, conclusion, summary, status=status, title=title)
+
+
+def newest_review(repository: str, sha: str, reviewer: Any) -> tuple[str, str | None]:
+    """FN-9: the newest review on the SHA as the API lists it now. A failed read is no valid review, never a pass."""
+    statuses = read_or_none(lambda: get_all(f"/repos/{repository}/commits/{sha}/statuses"))
+    return review_of(statuses, reviewer)
+
+
+def post_confirmed_success(repository: str, head_sha: str, reasons: list[dict], reviewer: Any) -> list[str]:
+    """FN-9: gate/final success only while the newest review is the reviewer's success, read just before the post and
+    again just after it. Otherwise blocked or waiting stands instead of the success, or after it."""
+    state, code = newest_review(repository, head_sha, reviewer)
+    if state != "success":
+        return post_without_success(repository, head_sha, state, code, reasons)
+    summary = f"Final verdict: {READY}\n{reasons_text(reasons)}"
+    try:
+        post_check(repository, "gate/final", head_sha, "success", summary)
+    except POST_FAILURES:
+        # FN-9 (L75): the success is tried again only after the newest review is read again. GitHub may have stored
+        # the first try, so a review that no longer allows it is followed instead of the second try.
+        print("publish: the success post failed; reading the review again before trying once more", file=sys.stderr)
+        state, code = newest_review(repository, head_sha, reviewer)
+        if state != "success":
+            return [READY, *post_without_success(repository, head_sha, state, code, reasons)]
+        try:
+            post_check(repository, "gate/final", head_sha, "success", summary)
+        except POST_FAILURES:
+            # FN-9 (L67): GitHub may have stored the success whose answer was lost, so the newest review is followed
+            # all the same; then the run fails.
+            state, code = newest_review(repository, head_sha, reviewer)
+            if state != "success":
+                post_without_success(repository, head_sha, state, code, reasons)
+            raise
+    state, code = newest_review(repository, head_sha, reviewer)
+    if state != "success":
+        return [READY, *post_without_success(repository, head_sha, state, code, reasons)]
+    return [READY]
+
+
+def post_without_success(repository: str, head_sha: str, state: str, code: str | None, reasons: list[dict]) -> list[str]:
+    """FN-9: a failed newest review is blocked; any other that is no success by the reviewer keeps gate/final waiting."""
+    if state == "failed":
+        return post_gate_final(repository, head_sha, "completed", "failure", BLOCKED, [*reasons, review_reason("REVIEW_FAILED", head_sha)])
+    return post_gate_final(repository, head_sha, "in_progress", None, AWAITING, [*reasons, review_reason(str(code), head_sha)])
+
+
 def cmd_post_final(args: argparse.Namespace) -> int:
     repository = os.environ["GITHUB_REPOSITORY"]
     final = read_json(args.final)
-    summary = f"Final verdict: {final['verdict']}\n{reasons_text(final.get('reasons', []))}"
-    for name in ("gate/archive", "gate/final"):
-        post_check(repository, name, args.head_sha, final["conclusions"][name], summary)
+    reasons = final.get("reasons") if isinstance(final.get("reasons"), list) else []
+    post_check(repository, "gate/archive", args.head_sha, final["conclusions"]["gate/archive"], f"Final verdict: {final.get('verdict')}\n{reasons_text(reasons)}")
+    check = final.get("final_check")
+    if not isinstance(check, dict):
+        # FN-1: a final verdict that does not say how gate/final stands is never success.
+        check = {}
+        reasons = [*reasons, {"code": "NO_FINAL_CHECK", "detail": "the final verdict file holds no readable final_check"}]
+    posted = post_gate_final(repository, args.head_sha, check.get("status"), check.get("conclusion"), final.get("verdict"), reasons, reviewer=final.get("reviewer"))
+    print(f"post-final: gate/final posted on {args.head_sha}: {', '.join(posted)}")
+    return EXIT_OK
+
+
+def reviewer_account(config: dict) -> dict | None:
+    """The reviewer's bot account as GitHub gives it: None unless it is that login, of type Bot, with a positive id."""
+    slug_name = str((config.get("feedback") or {}).get("reviewer_app") or "")
+    if not APP_NAME.fullmatch(slug_name):
+        return None
+    login = f"{slug_name}[bot]"
+    user = call("GET", f"/users/{urllib.parse.quote(login, safe='')}")
+    if not isinstance(user, dict) or user.get("login") != login or user.get("type") != "Bot" or not is_count(user.get("id")):
+        return None
+    return {"login": login, "id": user["id"]}
+
+
+def read_or_none(read: Any) -> Any:
+    """A read whose failure is a fact (None), never an empty answer."""
+    try:
+        return read()
+    except READ_FAILURES:
+        return None
+
+
+def cmd_final_facts(args: argparse.Namespace) -> int:
+    """The head's statuses, check runs and the reviewer's account, for gate.report final (FN-2, FN-8)."""
+    if not FULL_SHA.fullmatch(args.head_sha):
+        raise UsageError("the head SHA is not 40 lowercase hex digits")
+    repository = os.environ["GITHUB_REPOSITORY"]
+    config = load_config(args.config)
+    sha = args.head_sha
+    statuses = read_or_none(lambda: get_all(f"/repos/{repository}/commits/{sha}/statuses"))
+    runs = read_or_none(lambda: get_all(f"/repos/{repository}/commits/{sha}/check-runs?filter=all", "check_runs"))
+    write_json(
+        args.out,
+        {
+            "head_sha": sha,
+            "statuses": statuses if isinstance(statuses, list) else None,
+            "check_runs": runs if isinstance(runs, list) else None,
+            "reviewer": read_or_none(lambda: reviewer_account(config)),
+        },
+    )
+    return EXIT_OK
+
+
+def stored_gate_result(reports_dir: Path, pr: int, sha: str, actors: Any) -> tuple[Any, list[dict], bool]:
+    """FN-4: the gate's own verdict, its reasons and the archive's state, from the newest stored run of this head."""
+    if not (isinstance(actors, dict) and actors.get("actors_ok") is True) or not reports_dir.is_dir():
+        return None, [{"code": "REPORTS_UNTRUSTED", "detail": "the reports branch could not be read or holds a commit the gate did not write"}], False
+    records = []
+    for path in (reports_dir / str(pr)).glob("*/context.json"):
+        match = re.fullmatch(r"([0-9]+)-([0-9]+)", path.parent.name)
+        context = read_json_or_none(path)
+        if match and isinstance(context, dict) and context.get("head_sha") == sha and str(context.get("pr")) == str(pr):
+            records.append((int(match.group(1)), int(match.group(2)), path.parent))
+    if not records:
+        return None, [], False
+    folder = max(records)[2]
+    final = read_json_or_none(folder / "final.json")
+    preliminary = read_json_or_none(folder / "verdict.json")
+    if not isinstance(final, dict) or not isinstance(preliminary, dict):
+        return None, [], False
+    given = final.get("gate_reasons")
+    reasons = [item for item in given if isinstance(item, dict)] if isinstance(given, list) else []
+    archive_ok = (final.get("conclusions") or {}).get("gate/archive") == "success"
+    own = preliminary.get("checks")
+    preliminary_ok = preliminary.get("verdict") == READY and isinstance(own, dict) and bool(own) and all(value == "success" for value in own.values())
+    if final.get("gate_verdict") == READY and not preliminary_ok:
+        reasons.append({"code": "RECORD_INCONSISTENT", "detail": "the stored preliminary verdict is not ready with every check green"})
+        return INCOMPLETE, reasons, archive_ok
+    return final.get("gate_verdict"), reasons, archive_ok
+
+
+def cmd_finalize(args: argparse.Namespace) -> int:
+    """FN-3 to FN-5 and FN-9: on an independent-review status for the head of an open PR, whoever created it, post
+    gate/final by the one decision for the newest review."""
+    repository = os.environ["GITHUB_REPOSITORY"]
+    config = load_config(args.config)
+    integration = str((config.get("project") or {}).get("integration_branch") or "")
+    if not integration:
+        raise UsageError("no integration branch is named")
+    event = read_json(args.event)
+    outcome: dict[str, Any] = {"acted": False, "code": None, "pr": None, "sha": None, "decision": None}
+
+    def stop(code: str, exit_code: int = EXIT_OK) -> int:
+        outcome["code"] = code
+        write_json(args.out, outcome)
+        print(f"finalize: nothing posted ({code})")
+        return exit_code
+
+    def unreadable() -> int:
+        # FN-9: a run that cannot read is never silent, or an earlier success could stay newest over the review it
+        # could not read. The event's three fields were checked before any read.
+        outcome["code"] = "READ_FAILED"
+        write_json(args.out, outcome)
+        post_gate_final(repository, sha, "in_progress", None, AWAITING, [review_reason("REVIEW_UNREADABLE", sha)])
+        print(f"finalize: a read failed; gate/final waits on {sha} (READ_FAILED)")
+        return EXIT_RULE_FAILED
+
+    # Every field of the event is untrusted (FN-3): only these three are used, and each is checked.
+    if not isinstance(event, dict) or event.get("context") != REVIEW_CONTEXT:
+        return stop("IGNORED_CONTEXT")
+    sha = event.get("sha")
+    if not isinstance(sha, str) or not FULL_SHA.fullmatch(sha):
+        return stop("IGNORED_SHA")
+    outcome["sha"] = sha
+    status_id = event.get("id")
+    if not is_count(status_id):
+        return stop("IGNORED_EVENT")
+    # FN-9 (L69): the PR head and the event's status are known before anything is posted. Only when the open PRs
+    # cannot be read is the head unknown, and waiting is then the side that never leaves an older success newest.
+    try:
+        pulls = get_all(f"/repos/{repository}/pulls?state=open")
+    except READ_FAILURES:
+        return unreadable()
+    pull = next(
+        (
+            item
+            for item in pulls
+            if isinstance(item, dict)
+            and item.get("state", "open") == "open"
+            and (item.get("head") or {}).get("sha") == sha
+            and (item.get("base") or {}).get("ref") == integration
+            and is_count(item.get("number"))
+        ),
+        None,
+    )
+    if pull is None:
+        return stop("NOT_A_PR_HEAD")
+    outcome["pr"] = pull["number"]
+    try:
+        statuses = get_all(f"/repos/{repository}/commits/{sha}/statuses")
+    except READ_FAILURES:
+        return unreadable()
+    this = next((item for item in statuses if isinstance(item, dict) and item.get("id") == status_id), None)
+    if this is None or this.get("context") != REVIEW_CONTEXT:
+        return stop("IGNORED_EVENT")
+    # FN-9: whoever created the status that started this run, the decision rests on the newest review the API lists,
+    # and the decision checks that review's creator (FN-1, FN-5). So the last run to run decides for the newest review.
+    try:
+        reviewer = reviewer_account(config)
+    except READ_FAILURES:
+        return unreadable()
+    if reviewer is None:
+        return unreadable()
+    gate_verdict, gate_reasons, archive_ok = stored_gate_result(Path(args.reports_dir), pull["number"], sha, read_json_or_none(args.actors))
+    runs = read_or_none(lambda: get_all(f"/repos/{repository}/commits/{sha}/check-runs?filter=all", "check_runs"))
+    decision = final_decision(
+        mode="finalize",
+        head_sha=sha,
+        gate_verdict=gate_verdict,
+        gate_reasons=gate_reasons,
+        archive_ok=archive_ok,
+        check_runs=runs if isinstance(runs, list) else None,
+        statuses=statuses,
+        reviewer=reviewer,
+    )
+    outcome.update(acted=True, decision=decision)
+    write_json(args.out, outcome)
+    posted = post_gate_final(repository, sha, decision["status"], decision["conclusion"], decision["verdict"], decision["reasons"], reviewer=reviewer)
+    print(f"finalize: decided {decision['verdict']} on {sha}; gate/final posted: {', '.join(posted)}")
     return EXIT_OK
 
 
@@ -586,6 +840,20 @@ def main(argv: list[str] | None = None) -> int:
     post_final.add_argument("--head-sha", required=True)
     post_final.set_defaults(handler=cmd_post_final)
 
+    final_facts = commands.add_parser("final-facts")
+    final_facts.add_argument("--head-sha", required=True)
+    final_facts.add_argument("--config", required=True)
+    final_facts.add_argument("--out", required=True)
+    final_facts.set_defaults(handler=cmd_final_facts)
+
+    finalize = commands.add_parser("finalize")
+    finalize.add_argument("--event", required=True)
+    finalize.add_argument("--config", required=True)
+    finalize.add_argument("--reports-dir", required=True)
+    finalize.add_argument("--actors", required=True, help="the result of gate.archive check-actors")
+    finalize.add_argument("--out", required=True)
+    finalize.set_defaults(handler=cmd_finalize)
+
     comment = commands.add_parser("comment")
     comment.add_argument("--pr", type=int, required=True)
     comment.add_argument("--body", required=True)
@@ -648,7 +916,7 @@ def main(argv: list[str] | None = None) -> int:
         return args.handler(args)
     except UsageError as error:
         return fail_usage(str(error))
-    except (urllib.error.URLError, OSError, ValueError, KeyError) as error:
+    except (urllib.error.URLError, OSError, http.client.HTTPException, ValueError, KeyError) as error:
         # The message names the kind of failure only: a token never enters it, and a file's
         # name or content never does either.
         print(f"publish: {type(error).__name__} in {args.command}", file=sys.stderr)

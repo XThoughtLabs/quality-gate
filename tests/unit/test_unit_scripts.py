@@ -223,7 +223,8 @@ def test_final_accepts_the_verdict_publish_computed(gate, tmp_path):
     archive = write_json(tmp_path / "a.json", {"stored": True, "sha256sums_match": True})
     out = tmp_path / "final.json"
     assert gate.run("report", "final", "--verdict", verdict, "--expect-verdict-sha256", digest, "--archive", archive, "--out", out).returncode == 0
-    assert json.loads(out.read_text(encoding="utf-8"))["verdict"] == "ready-for-human"
+    # Round 2 (FN-2): the gate's own verdict is ready; the final verdict waits for the review (it was ["verdict"] here).
+    assert json.loads(out.read_text(encoding="utf-8"))["gate_verdict"] == "ready-for-human"
 
 
 def test_final_blocks_when_the_archive_jobs_environment_is_broken(gate, tmp_path):

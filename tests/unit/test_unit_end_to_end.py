@@ -224,12 +224,15 @@ def stored_files(world: World) -> list[str]:
     return listing.splitlines()
 
 
-@pytest.mark.req("V-5", "F-1")
+@pytest.mark.req("V-5", "F-1", "FN-2")
 def test_a_clean_change_is_ready_for_a_person_and_stored(world):
+    # Round 2 (FN-2): the gate's own verdict is ready, and the final verdict waits for the independent review
+    # (before round 2 this test expected the final verdict ready-for-human and gate/final success).
     world.change()
     final = world.judge(world.run_job())
-    assert final["verdict"] == "ready-for-human", final["reasons"]
-    assert final["conclusions"] == {"gate/archive": "success", "gate/final": "success"}
+    assert final["gate_verdict"] == "ready-for-human", final["reasons"]
+    assert final["verdict"] == "awaiting-review"
+    assert final["conclusions"] == {"gate/archive": "success", "gate/final": None}
     assert "reports/7/1001-1/report.json" in stored_files(world)
     assert "reports/7/1001-1/artifact/exit-codes.tsv" in stored_files(world)
 
@@ -279,7 +282,7 @@ def reproduce_env(world: World) -> dict[str, str]:
 
 def test_reproduce_gives_the_stored_report_again(world, short_tmp):
     head = world.change()
-    assert world.judge(world.run_job())["verdict"] == "ready-for-human"
+    assert world.judge(world.run_job())["gate_verdict"] == "ready-for-human"  # round 2: was ["verdict"]; the final one waits (FN-2)
     out = short_tmp / "rerun"
     process = world.gate.run("reproduce", "--repo", world.remote, "--sha", head, "--out", out, env=reproduce_env(world))
     assert process.returncode == 0, process.stdout + process.stderr
@@ -331,7 +334,7 @@ def test_reproduce_refuses_a_reports_branch_written_by_another_actor(world, shor
 def test_reproduce_refuses_to_start_with_a_secret_in_its_environment(world, short_tmp):
     """PR code would run under this user, and could read this process's environment."""
     head = world.change()
-    assert world.judge(world.run_job())["verdict"] == "ready-for-human"
+    assert world.judge(world.run_job())["gate_verdict"] == "ready-for-human"  # round 2: was ["verdict"]; the final one waits (FN-2)
     env = {**reproduce_env(world), "GATE_TOKEN": "FAKE-VALUE-NOT-A-TOKEN", "SOME_API_KEY": "FAKE-VALUE-TWO"}
     out = short_tmp / "rerun"
     process = world.gate.run("reproduce", "--repo", world.remote, "--sha", head, "--out", out, env=env)
@@ -344,7 +347,7 @@ def test_reproduce_refuses_to_start_with_a_secret_in_its_environment(world, shor
 @pytest.mark.req("X-1")
 def test_reproduce_finds_a_closed_prs_head_after_its_branch_is_gone(world, short_tmp):
     head = world.change()
-    assert world.judge(world.run_job())["verdict"] == "ready-for-human"
+    assert world.judge(world.run_job())["gate_verdict"] == "ready-for-human"  # round 2: was ["verdict"]; the final one waits (FN-2)
     world.gate.git(world.remote, "update-ref", "refs/pull/7/head", head)
     world.gate.git(world.remote, "update-ref", "-d", "refs/heads/ai/1-change")
     # Nothing else in the remote holds that commit now but refs/pull. Through file:// a clone

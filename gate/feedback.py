@@ -174,7 +174,8 @@ def read_run_event(event: dict, feedback: dict, reports_dir: Path, actors: Any) 
     pr = context.get("pr")
     head_sha = context.get("head_sha")
     verdict = final.get("verdict")
-    if verdict == "ready-for-human":
+    # awaiting-review (section 8.5): the gate's own checks passed; the review's own comment starts its fix round.
+    if verdict in ("ready-for-human", "awaiting-review"):
         return "NOT_A_FAILURE", pr, head_sha, []
     if verdict == "needs-human":
         return "NEEDS_HUMAN", pr, head_sha, []
