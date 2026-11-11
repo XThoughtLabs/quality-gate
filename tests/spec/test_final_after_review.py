@@ -107,7 +107,8 @@ class Hub:
     def _post(self, req):
         refusal = self.on_post(req.json()) if self.on_post is not None else None
         if refusal is not None:
-            self.refused.append(req)
+            if not isinstance(refusal, Lost):   # a Lost answer: GitHub stored the post, only its answer is lost
+                self.refused.append(req)
             return refusal
         return 201, {"id": 1}
 
@@ -1196,3 +1197,140 @@ def test_fn9_a_correction_that_fails_twice_ends_the_run_with_exit_1_and_no_trace
     assert_no_traceback(res)
     assert TOKEN not in res.both
     assert res.rc == 1, res.describe()
+
+
+# ----------------------------------------------------------------------------- FN-9 amended: L67 to L69
+
+
+class Lost(RawResponse):
+    """The answer to a post that GitHub stored, cut on the way back: the post counts as posted."""
+
+
+CUT_201 = b"HTTP/1.0 201 Created\r\nContent-Type: application/json\r\nContent-Length: 100\r\n\r\n{"
+
+
+def refuse(kind):
+    return (500, {"message": "boom"}) if kind == "500" else RawResponse(GARBLED["bad-status-line"])
+
+
+def break_read(hub, broken):
+    if broken == "users-not-a-bot":
+        hub.users[CREATORS["reviewer"]["login"]] = dict(CREATORS["reviewer"], type="User")
+    else:
+        hub.broken.add(broken)
+
+
+def lose_success_answers(world, hub, times):
+    """The reviewer's failure comes as the first success post arrives (its own run replaced, L18); the answers of the
+    first `times` success posts are lost after GitHub stored them."""
+    seen = []
+
+    def as_posted(body):
+        if body.get("name") != "gate/final":
+            return None
+        seen.append(body)
+        if body.get("conclusion") == "success":
+            if len(seen) == 1:
+                world.add("failure")
+            if sum(b.get("conclusion") == "success" for b in seen) <= times:
+                return Lost(CUT_201)
+        return None
+
+    hub.on_post = as_posted
+    return seen
+
+
+@pytest.mark.req("FN-9")
+@pytest.mark.parametrize("path", ["archive", "finalize"])
+def test_fn9_a_success_post_whose_answer_is_lost_once_is_tried_again_and_then_followed(tmp_path, hub, path):
+    """L67 and L68: the success is posted again, and the re-read after it follows the newer failed review."""
+    world = Ready(tmp_path, hub)
+    seen = lose_success_answers(world, hub, times=1)
+    res = world.archive_post(world.archive_read()) if path == "archive" else world.finalize(world.first, "A")
+    hub.on_post = None
+    ran(res)
+    assert [b.get("conclusion") for b in seen] == ["success", "success", "failure"], seen
+    assert_newest_final(hub, "blocked", "REVIEW_FAILED", f"a success answer lost once ({path})")
+
+
+@pytest.mark.req("FN-9")
+@pytest.mark.parametrize("path", ["archive", "finalize"])
+def test_fn9_a_success_post_whose_answer_is_lost_twice_is_followed_by_the_newest_review_then_exit_1(tmp_path, hub, path):
+    """L67: GitHub stored both successes; the run cannot know it, so it reads the newest review again and follows it."""
+    world = Ready(tmp_path, hub)
+    seen = lose_success_answers(world, hub, times=2)
+    res = world.archive_post(world.archive_read()) if path == "archive" else world.finalize(world.first, "A")
+    hub.on_post = None
+    assert_no_traceback(res)
+    assert TOKEN not in res.both
+    assert res.rc == 1, res.describe()
+    assert [b.get("conclusion") for b in seen] == ["success", "success", "failure"], seen
+    assert_newest_final(hub, "blocked", "REVIEW_FAILED", f"a success answer lost twice ({path})")
+
+
+@pytest.mark.req("FN-9")
+@pytest.mark.parametrize("refusal", ["500", "bad-status-line"])
+def test_fn9_finalize_tries_its_decision_post_once_more(tmp_path, hub, refusal):
+    """L68: run A posted success; the reviewer's failure came; run B's blocked post is refused once."""
+    world = Ready(tmp_path, hub)
+    ran(world.finalize(world.first, "A"))
+    failed = world.add("failure")
+    hub.on_post = lambda body: refuse(refusal) if body.get("name") == "gate/final" and not hub.refused else None
+    res = world.finalize(failed, "B")
+    hub.on_post = None
+    ran(res)
+    assert len(hub.refused) == 1, "precondition: run B's first post was refused"
+    assert_newest_final(hub, "blocked", "REVIEW_FAILED", f"run B's decision post refused once ({refusal})")
+
+
+@pytest.mark.req("FN-9")
+def test_fn9_a_run_that_cannot_read_tries_its_in_progress_post_once_more(tmp_path, hub):
+    """L68: run A posted success; a newer review came; run B cannot read the reviewer's account and its in-progress post
+    is refused once."""
+    world = Ready(tmp_path, hub)
+    ran(world.finalize(world.first, "A"))
+    newer = world.add("failure")
+    hub.broken.add("users")
+    hub.on_post = lambda body: refuse("500") if body.get("name") == "gate/final" and not hub.refused else None
+    res = world.finalize(newer, "B")
+    hub.on_post = None
+    assert_no_traceback(res)
+    assert res.rc == 1, res.describe()
+    assert len(hub.refused) == 1, "precondition: run B's first post was refused"
+    assert_newest_final(hub, "waiting", "REVIEW_UNREADABLE", "run B's in-progress post refused once")
+
+
+@pytest.mark.req("FN-9", "FN-2")
+def test_fn9_the_archive_jobs_waiting_post_is_tried_once_more(tmp_path, hub):
+    """L68: the archive job's in-progress gate/final, with no review yet, is refused once."""
+    hub.runs[HEAD] = green_runs(SIX)
+    hub.on_post = lambda body: refuse("500") if body.get("name") == "gate/final" and not hub.refused else None
+    final, posted, _archive = archive_chain(tmp_path, hub)
+    hub.on_post = None
+    assert len(hub.refused) == 1, "precondition: the first gate/final post was refused"
+    assert_waiting(final, posted)
+
+
+@pytest.mark.req("FN-9", "FN-5", "FN-3")
+@pytest.mark.parametrize("broken", ["users", "statuses", "users-not-a-bot"])
+def test_fn9_a_status_on_a_sha_that_is_no_open_pr_head_posts_nothing_even_when_a_read_fails(tmp_path, hub, broken):
+    """L69: the head of an already merged PR gets no gate/final, so no later report reads its merge as a bypass."""
+    hub.pulls = [pull(state="closed")]
+    st = reviewed(hub)
+    break_read(hub, broken)
+    res, out = finalize(tmp_path, hub, status_event(st))
+    assert res.rc == 0, res.describe()
+    assert hub.writes() == [], hub.writes()
+    assert out["code"] == "NOT_A_PR_HEAD", out
+
+
+@pytest.mark.req("FN-9", "FN-3")
+@pytest.mark.parametrize("broken", ["users", "users-not-a-bot"])
+def test_fn9_an_event_whose_status_the_api_does_not_hold_posts_nothing_even_when_the_account_read_fails(tmp_path, hub, broken):
+    """L69: the event's status is checked against the API before the reviewer's account is read."""
+    st = reviewed(hub)
+    break_read(hub, broken)
+    res, out = finalize(tmp_path, hub, status_event(st, id=st["id"] + 1_000_000))
+    assert res.rc == 0, res.describe()
+    assert hub.writes() == [], hub.writes()
+    assert out["code"] == "IGNORED_EVENT", out
