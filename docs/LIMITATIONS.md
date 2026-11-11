@@ -103,6 +103,14 @@ What the gate does not do or does not prove, written down rather than dropped. E
 - **L70 (L-d), "only after the event's three fields" is not proved by a test.** No test combines an invalid event field with a failing read.
 - **L71 (L-e), small gaps.** CONTRACTS.md says finalize's `code` names a case where it posts nothing, but `READ_FAILED` now comes with a post; `cmd_finalize`'s docstring says "for the head of an open PR", which an unreadable run does not know; the test of two lost corrections covers finalize, not `post-final`; the retry runs at once, with no pause; `extras`' own read of the statuses (outside FN-9) does not catch `http.client`'s errors.
 
+### From the third narrow check (L67 to L69's repair)
+
+- **L72 (medium; open until the CEO decides), half of L67's rule is not proved by a test.** The follow-up after a `success` post that failed twice posts "its failure or in-progress post", but the only test uses a failed review: a code that follows only a failed review (the reviewer's mutant C8), or ignores a re-read that fails (C9), passes every test. The code at the reviewed head does both right. The repair is the lost-twice test over every kind of newer status and a failed re-read, and the two mutants.
+- **L73 (L-1), a stored success whose answer is not JSON.** `post_check` parses GitHub's answer; a 2xx answer that cannot be parsed raises `ValueError`, which the one-retry helper and L67's follow-up do not catch, so the run exits 1 and a stored `success` is neither tried again nor followed. Older than L67's repair; it needs a malformed answer from GitHub, and the ruleset's `independent-review` rule still blocks the merge.
+- **L74 (L-2), a retried waiting post can land last.** When the archive job's first in-progress post is refused or hangs, and finalize posts the reviewer's `success` meanwhile, the retry can make the in-progress run the newest: never green, it fails closed, and a rerun or a new review clears it (L53's end state, by a new path).
+- **L75 (L-3), the retry of a success has no re-read of its own.** When the first `success` post was stored and a newer `blocked` came in between, the retry makes `success` newest again until the after-read corrects it; if that correction is refused twice (L65), the `success` stays.
+- **L76 (L-4), texts.** A comment in `cmd_finalize` says the event's status is known before anything is posted, but a failed read of the statuses posts in progress; finalize's `pr` field is now filled before `IGNORED_EVENT`.
+
 ## Open until a real run
 
 These can only be seen on GitHub, in Part 3:
