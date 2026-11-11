@@ -351,14 +351,23 @@ def post_gate_final(repository: str, head_sha: str, status: Any, conclusion: Any
     text = reasons_text(reasons)
     if status == "in_progress" and verdict == AWAITING:
         title = f"gate/final: waiting for the independent review on {head_sha}"
-        post_check(repository, "gate/final", head_sha, None, f"{waiting_text(head_sha)}\n{text}", status="in_progress", title=title)
+        post_final_check(repository, head_sha, None, f"{waiting_text(head_sha)}\n{text}", status="in_progress", title=title)
         return [AWAITING]
     if status == "completed" and conclusion == "success" and verdict == READY:
         listed = [item for item in reasons if isinstance(item, dict)] if isinstance(reasons, list) else []
         return post_confirmed_success(repository, head_sha, listed, reviewer)
     shown = verdict if verdict in (BLOCKED, NEEDS_HUMAN, INCOMPLETE) else INCOMPLETE
-    post_check(repository, "gate/final", head_sha, "failure", f"Final verdict: {shown}\n{text}")
+    post_final_check(repository, head_sha, "failure", f"Final verdict: {shown}\n{text}")
     return [shown]
+
+
+def post_final_check(repository: str, head_sha: str, conclusion: str | None, summary: str, *, status: str = "completed", title: str | None = None) -> None:
+    """FN-9: a gate/final post that fails is tried once more, so that a lost post does not leave an older one newest."""
+    try:
+        post_check(repository, "gate/final", head_sha, conclusion, summary, status=status, title=title)
+    except NETWORK_FAILURES:
+        print("publish: a gate/final post failed; trying once more", file=sys.stderr)
+        post_check(repository, "gate/final", head_sha, conclusion, summary, status=status, title=title)
 
 
 def newest_review(repository: str, sha: str, reviewer: Any) -> tuple[str, str | None]:
@@ -373,15 +382,18 @@ def post_confirmed_success(repository: str, head_sha: str, reasons: list[dict], 
     state, code = newest_review(repository, head_sha, reviewer)
     if state != "success":
         return post_without_success(repository, head_sha, state, code, reasons)
-    post_check(repository, "gate/final", head_sha, "success", f"Final verdict: {READY}\n{reasons_text(reasons)}")
+    try:
+        post_final_check(repository, head_sha, "success", f"Final verdict: {READY}\n{reasons_text(reasons)}")
+    except NETWORK_FAILURES:
+        # FN-9 (L67): GitHub may have stored the success whose answer was lost, so the newest review is followed all
+        # the same; then the run fails.
+        state, code = newest_review(repository, head_sha, reviewer)
+        if state != "success":
+            post_without_success(repository, head_sha, state, code, reasons)
+        raise
     state, code = newest_review(repository, head_sha, reviewer)
     if state != "success":
-        try:
-            return [READY, *post_without_success(repository, head_sha, state, code, reasons)]
-        except NETWORK_FAILURES:
-            # FN-9: a lost correction would leave the success newest; it is tried once more, then the run fails.
-            print("publish: the post after the success failed; trying once more", file=sys.stderr)
-            return [READY, *post_without_success(repository, head_sha, state, code, reasons)]
+        return [READY, *post_without_success(repository, head_sha, state, code, reasons)]
     return [READY]
 
 
@@ -512,18 +524,8 @@ def cmd_finalize(args: argparse.Namespace) -> int:
     status_id = event.get("id")
     if not is_count(status_id):
         return stop("IGNORED_EVENT")
-    try:
-        reviewer = reviewer_account(config)
-        statuses = get_all(f"/repos/{repository}/commits/{sha}/statuses")
-    except READ_FAILURES:
-        return unreadable()
-    if reviewer is None:
-        return unreadable()
-    this = next((item for item in statuses if isinstance(item, dict) and item.get("id") == status_id), None)
-    if this is None or this.get("context") != REVIEW_CONTEXT:
-        return stop("IGNORED_EVENT")
-    # FN-9: whoever created the status that started this run, the decision rests on the newest review the API lists,
-    # and the decision checks that review's creator (FN-1, FN-5). So the last run to run decides for the newest review.
+    # FN-9 (L69): the PR head and the event's status are known before anything is posted. Only when the open PRs
+    # cannot be read is the head unknown, and waiting is then the side that never leaves an older success newest.
     try:
         pulls = get_all(f"/repos/{repository}/pulls?state=open")
     except READ_FAILURES:
@@ -543,6 +545,21 @@ def cmd_finalize(args: argparse.Namespace) -> int:
     if pull is None:
         return stop("NOT_A_PR_HEAD")
     outcome["pr"] = pull["number"]
+    try:
+        statuses = get_all(f"/repos/{repository}/commits/{sha}/statuses")
+    except READ_FAILURES:
+        return unreadable()
+    this = next((item for item in statuses if isinstance(item, dict) and item.get("id") == status_id), None)
+    if this is None or this.get("context") != REVIEW_CONTEXT:
+        return stop("IGNORED_EVENT")
+    # FN-9: whoever created the status that started this run, the decision rests on the newest review the API lists,
+    # and the decision checks that review's creator (FN-1, FN-5). So the last run to run decides for the newest review.
+    try:
+        reviewer = reviewer_account(config)
+    except READ_FAILURES:
+        return unreadable()
+    if reviewer is None:
+        return unreadable()
     gate_verdict, gate_reasons, archive_ok = stored_gate_result(Path(args.reports_dir), pull["number"], sha, read_json_or_none(args.actors))
     runs = read_or_none(lambda: get_all(f"/repos/{repository}/commits/{sha}/check-runs?filter=all", "check_runs"))
     decision = final_decision(
