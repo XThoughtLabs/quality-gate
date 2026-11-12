@@ -401,17 +401,25 @@ def post_final(hub, final):
 
 
 @pytest.mark.req("FN-10", "FN-1", "F-1")
-@pytest.mark.parametrize("gate_verdict,archive", [("blocked", "success"), (None, "success"), ("ready-for-human", "failure")],
-                         ids=["gate-verdict-blocked", "no-gate-verdict", "archive-failed"])
-def test_fn10_post_final_makes_the_decision_again_on_the_files_own_record(tmp_path, hub, gate_verdict, archive):
+@pytest.mark.parametrize("gate_verdict,archive,shown,code", [
+    ("blocked", "success", "blocked", None),
+    (None, "success", "incomplete", "NO_RECORD"),
+    ("ready-for-human", "failure", "incomplete", "EVIDENCE_NOT_STORED"),
+], ids=["gate-verdict-blocked", "no-gate-verdict", "archive-failed"])
+def test_fn10_post_final_makes_the_decision_again_on_the_files_own_record(tmp_path, hub, gate_verdict, archive, shown, code):
     """post-final's decision made again takes the gate's own verdict and the archive's state from final.json as the
     decision found them: a file whose final_check says success while its own record does not allow it never posts
     success, though every check run and the review on the head would."""
+    # Strengthened after the code, for the mutants FN10-inputs-verdict and FN10-inputs-archive (round 2b, step 5): the
+    # final verdict and its reason, not only a failure. It still fails on 76ab28b's code, where a success is posted.
     Ready(tmp_path, hub)
     ran(post_final(hub, final_file(tmp_path, gate_verdict=gate_verdict, archive=archive)))
     posted = hub.posted()
     assert posted and all(b.get("conclusion") != "success" for b in posted), posted
     assert (posted[-1]["status"], posted[-1].get("conclusion")) == ("completed", "failure"), posted
+    assert posted[-1]["output"]["summary"].startswith(f"Final verdict: {shown}"), posted[-1]["output"]
+    if code:
+        assert code in posted[-1]["output"]["summary"], posted[-1]["output"]
 
 
 @pytest.mark.req("FN-10", "FN-1", "F-3")
