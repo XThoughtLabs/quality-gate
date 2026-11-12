@@ -5,18 +5,20 @@ newest review, so a newer `gate/tests` with failure on the same SHA, which came 
 `gate/final` success and `ready-for-human`, in the archive job and in finalize alike. These tests change the check runs
 at named moments, never by time: between the decision's own read and the post, just after the success post, and at a
 success post that fails. Black box, through `python -P -m gate.<name>` against the GitHub stand-in of
-test_final_after_review, with one more seam: a test may change the check runs once a check-run read is answered.
+test_final_after_review, with more seams: a test may change the check runs once a check-run read is answered, or once
+a post is stored.
 
-In the archive job, `gate/archive` is the job's own (FN-8): the decision, and the decision made again, keep the archive
-job's own `gate/archive` as the decision found it (FN-10), so the API's `gate/archive` is an input of finalize only.
+In the archive job, `gate/archive` is the job's own (FN-8) in its first decision. In the decision made again it stands
+only while the API lists no newer `gate/archive` than the job's own post (FN-10, the review's F1): the stand-in lists
+every check run a job posts, with the id it answers, as GitHub does.
 """
 from __future__ import annotations
 
 import pytest
 
 from gatekit import assert_no_traceback
-from test_final_after_review import (CUT_201, HEAD, SEVEN, SIX, TOKEN, Hub, Lost, Ready, check_run, ran, status,
-                                     text_of)
+from test_final_after_review import (ACTIONS_APP, CUT_201, HEAD, SEVEN, SIX, TOKEN, Hub, Lost, Ready, _ids, check_run,
+                                     ran, status, text_of)
 
 PATHS = ["archive", "finalize"]
 FAILED = ["failure", "cancelled", "neutral", "skipped"]      # completed with anything but success (FN-1)
@@ -27,16 +29,40 @@ NAMES = {"archive": SIX, "finalize": SEVEN}                  # the mandatory che
 
 class Hub10(Hub):
     """The stand-in of FN-9, with a seam on the check runs: after_runs_read is called with the read's number once its
-    answer is fixed, before it is sent."""
+    answer is fixed, before it is sent. Like GitHub, it lists every check run a job posts (with the id its answer
+    gives), unless lists_posts is False (a list that does not show the post yet); after_post is called with the
+    stored run. A check-run read without filter=all is refused (the review's F3: the gate reads every run, not only
+    the newest completed ones)."""
 
     def __init__(self, stub):
         super().__init__(stub)
         self.run_reads = 0
         self.after_runs_read = None
+        self.lists_posts = True
+        self.after_post = None
+        self.answer_without_id = set()    # names of the check runs whose post is answered without an id
+
+    def _post(self, req):
+        body = req.json()
+        refusal = self.on_post(body) if self.on_post is not None else None
+        if refusal is not None and not isinstance(refusal, Lost):
+            self.refused.append(req)
+            return refusal
+        run = {"id": next(_ids), "name": body.get("name"), "head_sha": body.get("head_sha"), "status": body.get("status"),
+               "conclusion": body.get("conclusion"), "app": {"id": ACTIONS_APP, "slug": "github-actions"}}
+        if self.lists_posts:
+            self.runs.setdefault(body.get("head_sha"), []).append(run)
+        if self.after_post is not None:
+            self.after_post(run)
+        if refusal is not None:         # a Lost answer: GitHub stored the post, only its answer is lost
+            return refusal
+        return 201, ({} if body.get("name") in self.answer_without_id else {"id": run["id"]})
 
     def _runs(self, req):
         if "runs" in self.broken:
             return 500, {"message": "boom"}
+        if req.q("filter") != "all":
+            return 422, {"message": "the stand-in answers check-run reads with filter=all only"}
         sha = req.path.split("/commits/", 1)[1].split("/", 1)[0]
         runs = list(self.runs.get(sha, [])) if (req.q("page") or "1") == "1" else []
         self.run_reads += 1
@@ -334,10 +360,12 @@ def test_fn10_control_a_rerun_of_finalize_after_a_newer_failed_check_ends_blocke
 
 @pytest.mark.req("FN-10", "FN-9")
 @pytest.mark.parametrize("path", PATHS)
-def test_fn10_control_a_review_and_a_check_that_change_together_follow_the_decisions_order(tmp_path, hub, path):
-    """A control (FN-9 already followed the review): just after the success post both the review (the reviewer's
-    pending) and gate/tests (failure) change. The decision's order holds, a review that is not the reviewer's success
-    decides first, never success."""
+def test_fn10_a_review_and_a_check_that_change_together_follow_the_decisions_order_and_claim_no_passed_checks(tmp_path, hub, path):
+    """Just after the success post both the review (the reviewer's pending) and gate/tests (failure) change. The
+    decision's order holds, a review that is not the reviewer's success decides first, never success; and the waiting
+    post does not say that the gate's checks passed, since a wait for the review does not look at them (the review's
+    F2). Changed in round 2b's repair R1: it was a control, test_fn10_control_a_review_and_a_check_that_change_
+    together_follow_the_decisions_order, without the summary's assertion."""
     world = Ready(tmp_path, hub)
     came = []
 
@@ -356,6 +384,8 @@ def test_fn10_control_a_review_and_a_check_that_change_together_follow_the_decis
     assert last["status"] == "in_progress" and last.get("conclusion") is None, hub.posted()
     assert last["output"]["title"] == f"gate/final: waiting for the independent review on {HEAD}", last["output"]
     assert "REVIEW_PENDING" in last["output"]["summary"], last["output"]
+    assert last["output"]["summary"].startswith(f"The final verdict waits for the independent review on {HEAD}."), last["output"]
+    assert "checks passed" not in last["output"]["summary"], last["output"]
 
 
 # ----------------------------------------------------------------------------- the decision made again: its inputs
@@ -435,16 +465,75 @@ def test_fn10_control_post_final_success_only_for_a_file_whose_final_check_and_v
 
 
 @pytest.mark.req("FN-10", "FN-8")
-def test_fn10_control_the_archive_jobs_own_gate_archive_stands_in_its_decision_made_again(tmp_path, hub):
-    """In the archive job, gate/archive is the job's own (FN-8), as the decision found it (FN-10): the job posted it just
-    before gate/final. A newer gate/archive of another run does not change this job's decision; that run posts its own
-    gate/final right after its gate/archive, in the same step (LIMITATIONS.md L77)."""
+def test_fn10_control_a_gate_archive_older_than_the_jobs_own_post_does_not_change_its_decision(tmp_path, hub):
+    """A failed gate/archive that comes after the decision's own read but before the job posts its own gate/archive is
+    older than that post: the job's own gate/archive is the newest, and the success stands. Changed in round 2b's repair
+    R1 (the review's F1): it was test_fn10_control_the_archive_jobs_own_gate_archive_stands_in_its_decision_made_again,
+    which asserted the same outcome as the gap ("another run's newer gate/archive does not change this job's decision")
+    with a stand-in that never listed the job's own post."""
     world = Ready(tmp_path, hub)
     change_between_read_and_post(world, hub, "gate/archive", "failure")
     ran(world.archive_post(world.archive_read()))
     hub.after_runs_read = None
     posted = hub.posted()
     assert [(b["status"], b.get("conclusion")) for b in posted] == [("completed", "success")], posted
+
+
+GATE_ARCHIVE_NEWER = ["failure", "in_progress"]
+
+
+@pytest.mark.req("FN-10", "FN-8", "FN-1")
+@pytest.mark.parametrize("when", ["before", "after"])
+@pytest.mark.parametrize("kind", GATE_ARCHIVE_NEWER)
+def test_fn10_f1_a_newer_gate_archive_than_the_archive_jobs_own_post_is_read_again(tmp_path, hub, kind, when):
+    """The review's F1: another run's gate/archive comes after the archive job's own gate/archive post, before its
+    success post (before) or just after it (after). The decision made again reads it as the newest gate/archive, so no
+    success stands over it."""
+    world = Ready(tmp_path, hub)
+    came = []
+
+    def stored(run):
+        trigger = "gate/archive" if when == "before" else "gate/final"
+        if run["name"] == trigger and not came and (when == "before" or run.get("conclusion") == "success"):
+            came.append(newer_run(hub, "gate/archive", kind))
+
+    hub.after_post = stored
+    ran(world.archive_post(world.archive_read()))
+    hub.after_post = None
+    assert came, f"precondition: the newer gate/archive came {when} the success post"
+    if when == "before":
+        assert all(b.get("conclusion") != "success" for b in hub.posted()), hub.posted()
+    assert_newest_follows(hub, kind, "gate/archive", f"a {kind} gate/archive {when} the success post, after the job's own")
+
+
+@pytest.mark.req("FN-10", "FN-8")
+@pytest.mark.parametrize("listed", ["older-green-listed", "none-listed"])
+def test_fn10_f1_control_a_list_that_does_not_show_the_jobs_own_post_yet_makes_no_false_red(tmp_path, hub, listed):
+    """The API does not list the job's own gate/archive post yet: its own value stands, so a slow list never turns a
+    ready head red (and never green over a newer one, by the test above)."""
+    world = Ready(tmp_path, hub)
+    if listed == "none-listed":
+        hub.runs[HEAD] = [run for run in hub.runs[HEAD] if run["name"] != "gate/archive"]
+    hub.lists_posts = False
+    ran(world.archive_post(world.archive_read()))
+    posted = hub.posted()
+    assert [(b["status"], b.get("conclusion")) for b in posted] == [("completed", "success")], posted
+
+
+@pytest.mark.req("FN-10", "FN-8")
+def test_fn10_f1_an_own_post_answered_without_an_id_leaves_the_apis_gate_archive_to_count(tmp_path, hub):
+    """GitHub's answer to the job's own gate/archive post gives no id, and the API lists no gate/archive: the job's own
+    value cannot be placed against the list, so the API's newest counts, and missing is incomplete, never success."""
+    world = Ready(tmp_path, hub)
+    hub.runs[HEAD] = [run for run in hub.runs[HEAD] if run["name"] != "gate/archive"]
+    hub.lists_posts = False
+    hub.answer_without_id.add("gate/archive")
+    ran(world.archive_post(world.archive_read()))
+    posted = hub.posted()
+    assert posted and all(b.get("conclusion") != "success" for b in posted), posted
+    last = posted[-1]
+    assert (last["status"], last.get("conclusion")) == ("completed", "failure"), posted
+    assert last["output"]["summary"].startswith("Final verdict: incomplete") and "MISSING_CHECK: gate/archive" in last["output"]["summary"], last["output"]
 
 
 @pytest.mark.req("FN-10", "FN-1")
