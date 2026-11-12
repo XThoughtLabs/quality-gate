@@ -356,3 +356,84 @@ def test_fn10_control_a_review_and_a_check_that_change_together_follow_the_decis
     assert last["status"] == "in_progress" and last.get("conclusion") is None, hub.posted()
     assert last["output"]["title"] == f"gate/final: waiting for the independent review on {HEAD}", last["output"]
     assert "REVIEW_PENDING" in last["output"]["summary"], last["output"]
+
+
+# ----------------------------------------------------------------------------- the decision made again: its inputs
+
+
+@pytest.mark.req("FN-10", "FN-1")
+@pytest.mark.parametrize("path", PATHS)
+def test_fn10_a_the_customers_schedule_gives_no_success_at_all(tmp_path, hub, path):
+    """The customer's schedule (a newer failed gate/tests while the review is read again before the post), asserted
+    more strictly than the customer's own test: the decision made again reads the statuses and then the check runs, so
+    the failure is seen before the post and no success is posted at all."""
+    world = Ready(tmp_path, hub)
+
+    def after_status_read(number):
+        if number == 2:   # read 1 is the decision's own; read 2 is the read again before the post
+            newer_run(hub, "gate/tests", "failure")
+
+    hub.after_read = after_status_read
+    ran(run_path(world, path))
+    hub.after_read = None
+    assert all(b.get("conclusion") != "success" for b in hub.posted()), hub.posted()
+    assert_newest_follows(hub, "failure", "gate/tests", f"the customer's schedule, strictly ({path})")
+
+
+def final_file(tmp_path, *, verdict="ready-for-human", check=("completed", "success"), gate_verdict="ready-for-human",
+               archive="success"):
+    from gatekit import write_json
+    from test_final_after_review import CREATORS
+
+    content = {"verdict": verdict, "reasons": [], "gate_reasons": [],
+               "final_check": {"status": check[0], "conclusion": check[1]},
+               "conclusions": {"gate/archive": archive, "gate/final": check[1]},
+               "reviewer": {"login": CREATORS["reviewer"]["login"], "id": CREATORS["reviewer"]["id"]}}
+    if gate_verdict is not None:
+        content["gate_verdict"] = gate_verdict
+    return write_json(tmp_path / "final.json", content)
+
+
+def post_final(hub, final):
+    from gatekit import run_gate
+
+    return run_gate("publish", "post-final", "--final", final, "--head-sha", HEAD, env=hub.env())
+
+
+@pytest.mark.req("FN-10", "FN-1", "F-1")
+@pytest.mark.parametrize("gate_verdict,archive", [("blocked", "success"), (None, "success"), ("ready-for-human", "failure")],
+                         ids=["gate-verdict-blocked", "no-gate-verdict", "archive-failed"])
+def test_fn10_post_final_makes_the_decision_again_on_the_files_own_record(tmp_path, hub, gate_verdict, archive):
+    """post-final's decision made again takes the gate's own verdict and the archive's state from final.json as the
+    decision found them: a file whose final_check says success while its own record does not allow it never posts
+    success, though every check run and the review on the head would."""
+    Ready(tmp_path, hub)
+    ran(post_final(hub, final_file(tmp_path, gate_verdict=gate_verdict, archive=archive)))
+    posted = hub.posted()
+    assert posted and all(b.get("conclusion") != "success" for b in posted), posted
+    assert (posted[-1]["status"], posted[-1].get("conclusion")) == ("completed", "failure"), posted
+
+
+@pytest.mark.req("FN-10", "FN-1", "F-3")
+@pytest.mark.parametrize("verdict,check", [("blocked", ("completed", "success")), ("ready-for-human", ("in_progress", "success"))],
+                         ids=["success-but-blocked", "success-but-in-progress"])
+def test_fn10_control_post_final_success_only_for_a_file_whose_final_check_and_verdict_agree(tmp_path, hub, verdict, check):
+    """The file's own consistency (mutant FIN-post-success): its record, every check run and the review would allow a
+    success, so only final_check and verdict keep it away."""
+    Ready(tmp_path, hub)
+    ran(post_final(hub, final_file(tmp_path, verdict=verdict, check=check)))
+    posted = hub.posted()
+    assert posted and all(b.get("conclusion") != "success" for b in posted), posted
+
+
+@pytest.mark.req("FN-10", "FN-8")
+def test_fn10_control_the_archive_jobs_own_gate_archive_stands_in_its_decision_made_again(tmp_path, hub):
+    """In the archive job, gate/archive is the job's own (FN-8), as the decision found it (FN-10): the job posted it just
+    before gate/final. A newer gate/archive of another run does not change this job's decision; that run posts its own
+    gate/final right after its gate/archive, in the same step (LIMITATIONS.md L77)."""
+    world = Ready(tmp_path, hub)
+    change_between_read_and_post(world, hub, "gate/archive", "failure")
+    ran(world.archive_post(world.archive_read()))
+    hub.after_runs_read = None
+    posted = hub.posted()
+    assert [(b["status"], b.get("conclusion")) for b in posted] == [("completed", "success")], posted
