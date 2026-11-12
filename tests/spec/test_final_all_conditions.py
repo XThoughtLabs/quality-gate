@@ -576,3 +576,73 @@ def test_fn10_f1_control_a_newer_gate_archive_of_another_app_does_not_count_agai
     assert came, "precondition: another app's gate/archive came after the job's own post"
     posted = hub.posted()
     assert [(b["status"], b.get("conclusion")) for b in posted] == [("completed", "success")], posted
+
+
+# ----------------------------------------------------------------------------- R2-L1: the direction of F1's id comparison
+# The narrow check's R2-L1 (HQ's decision of 2026-11-12: repair it by tests): every F1 test above lists an earlier green
+# gate/archive, so an id comparison turned the wrong way passed them all. These worlds list none, or only an older
+# failed one, so that only "newer than the job's own post" gives the right outcome (adapted from its probes P9 and P1).
+
+
+def without_listed_gate_archive(hub):
+    hub.runs[HEAD] = [run for run in hub.runs[HEAD] if run["name"] != "gate/archive"]
+
+
+@pytest.mark.req("FN-10", "FN-8", "FN-1")
+@pytest.mark.parametrize("when", ["before", "after"])
+@pytest.mark.parametrize("kind", GATE_ARCHIVE_NEWER)
+def test_fn10_f1_a_newer_gate_archive_on_a_head_with_no_earlier_one_is_read_again(tmp_path, hub, kind, when):
+    """Two overlapping first runs on one head (F1, R2-L1): no earlier gate/archive is listed; the other run's gate/archive
+    comes after this job's own post, before its success post or just after it. Only a run newer than the job's own post
+    may set the job's own value aside, and this one is: no success stands over it."""
+    world = Ready(tmp_path, hub)
+    without_listed_gate_archive(hub)
+    came = []
+
+    def stored(run):
+        trigger = "gate/archive" if when == "before" else "gate/final"
+        if run["name"] == trigger and not came and (when == "before" or run.get("conclusion") == "success"):
+            came.append(newer_run(hub, "gate/archive", kind))
+
+    hub.after_post = stored
+    ran(world.archive_post(world.archive_read()))
+    hub.after_post = None
+    assert came, f"precondition: the other run's gate/archive came {when} the success post"
+    if when == "before":
+        assert all(b.get("conclusion") != "success" for b in hub.posted()), hub.posted()
+    assert_newest_follows(hub, kind, "gate/archive", f"a {kind} gate/archive {when} the success post, none earlier")
+
+
+@pytest.mark.req("FN-10", "FN-8")
+def test_fn10_f1_control_a_slow_list_with_only_an_older_failed_gate_archive_makes_no_false_red(tmp_path, hub):
+    """The list does not show the job's own gate/archive post yet and shows only an older failed one (an earlier run's):
+    that run is older than the job's own post, so the job's own value stands and the success is posted (R2-L1)."""
+    world = Ready(tmp_path, hub)
+    without_listed_gate_archive(hub)
+    hub.runs[HEAD].append(check_run("gate/archive", conclusion="failure"))   # an earlier run's, older than the own post
+    hub.lists_posts = False
+    ran(world.archive_post(world.archive_read()))
+    posted = hub.posted()
+    assert [(b["status"], b.get("conclusion")) for b in posted] == [("completed", "success")], posted
+
+
+@pytest.mark.req("FN-10", "FN-8", "FN-1")
+def test_fn10_f1_a_slow_list_with_an_older_failed_gate_archive_gives_no_success_over_a_newer_failed_one(tmp_path, hub):
+    """The same slow list, and another run's failed gate/archive comes after the job's own post: that one is newer, so
+    no success is posted over it (R2-L1)."""
+    world = Ready(tmp_path, hub)
+    without_listed_gate_archive(hub)
+    hub.runs[HEAD].append(check_run("gate/archive", conclusion="failure"))
+    hub.lists_posts = False
+    came = []
+
+    def stored(run):
+        if run["name"] == "gate/archive" and not came:
+            came.append(newer_run(hub, "gate/archive", "failure"))
+
+    hub.after_post = stored
+    ran(world.archive_post(world.archive_read()))
+    hub.after_post = None
+    assert came, "precondition: the other run's gate/archive came after the job's own post"
+    assert all(b.get("conclusion") != "success" for b in hub.posted()), hub.posted()
+    assert_newest_follows(hub, "failure", "gate/archive", "a slow list, an older failed and a newer failed gate/archive")
