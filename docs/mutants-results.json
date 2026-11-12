@@ -2819,5 +2819,333 @@
     "killed_by": "FAILED tests/spec/test_final_after_review.py::test_fn9_control_a_success_post_whose_answer_is_lost_once_is_tried_again_while_the_review_allows_it[archive]",
     "run_at": "5705ffe",
     "confirmed_alone": true
+  },
+  {
+    "id": "FIN-not-ready-stays",
+    "rule": "FN-2 a verdict that is not ready made ready by a review",
+    "outcome": "killed",
+    "killed_by": "FAILED tests/unit/test_unit_final_decision.py::test_a_gate_verdict_that_is_not_ready_stays_in_the_archive_job[success-blocked]",
+    "run_at": "07face0",
+    "confirmed_alone": true
+  },
+  {
+    "id": "FIN-archive-ok",
+    "rule": "FN-1 an archive that is not complete",
+    "outcome": "killed",
+    "killed_by": "FAILED tests/unit/test_unit_final_decision.py::test_a_ready_gate_verdict_with_an_archive_that_is_not_complete_is_never_success",
+    "run_at": "07face0",
+    "confirmed_alone": true
+  },
+  {
+    "id": "FIN-review-failed",
+    "rule": "FN-4 a failed review not blocked",
+    "outcome": "killed",
+    "killed_by": "FAILED tests/unit/test_unit_final_decision.py::test_a_failed_review_is_blocked_review_failed[failure-archive]",
+    "run_at": "07face0",
+    "confirmed_alone": true
+  },
+  {
+    "id": "FIN-check-failed",
+    "rule": "FN-1 a failed check on the head",
+    "outcome": "killed",
+    "killed_by": "FAILED tests/unit/test_unit_final_decision.py::test_one_mandatory_check_failed_on_the_head_is_blocked[gate/env]",
+    "run_at": "07face0",
+    "confirmed_alone": true
+  },
+  {
+    "id": "FIN-check-missing",
+    "rule": "FN-1 a missing check on the head",
+    "outcome": "killed",
+    "killed_by": "FAILED tests/unit/test_unit_final_decision.py::test_one_mandatory_check_missing_on_the_head_is_incomplete[gate/env]",
+    "run_at": "07face0",
+    "confirmed_alone": true
+  },
+  {
+    "id": "FIN-check-completed",
+    "rule": "FN-4 a check in progress named failed",
+    "outcome": "killed",
+    "killed_by": "FAILED tests/unit/test_unit_final_decision.py::test_a_mandatory_check_not_yet_completed_on_the_head_waits_never_passes[in_progress-archive]",
+    "run_at": "07face0",
+    "confirmed_alone": true
+  },
+  {
+    "id": "FIN-post-waiting",
+    "rule": "FN-2 waiting posted as failure",
+    "outcome": "killed",
+    "killed_by": "FAILED tests/spec/test_final_after_review.py::test_fn2_a_ready_run_with_no_review_leaves_gate_final_in_progress_never_success",
+    "run_at": "07face0",
+    "confirmed_alone": true
+  },
+  {
+    "id": "FIN-post-success",
+    "rule": "FN-1 success posted from an inconsistent file",
+    "outcome": "killed",
+    "killed_by": "FAILED tests/spec/test_final_all_conditions.py::test_fn10_control_post_final_success_only_for_a_file_whose_final_check_and_verdict_agree[success-but-blocked]",
+    "run_at": "07face0",
+    "confirmed_alone": true
+  },
+  {
+    "id": "FIN-post-no-check",
+    "rule": "FN-1 a file without final_check posts its old conclusion",
+    "outcome": "killed",
+    "killed_by": "FAILED tests/spec/test_final_all_conditions.py::test_fn10_control_a_file_without_final_check_never_posts_success_even_with_a_complete_record",
+    "run_at": "0b6721b",
+    "confirmed_alone": true
+  },
+  {
+    "id": "FN9-before-read",
+    "rule": "FN-9 no re-read before the success post",
+    "outcome": "killed",
+    "killed_by": "FAILED tests/spec/test_final_after_review.py::test_fn9_b_a_review_that_changes_between_the_archive_jobs_read_and_its_post_is_not_overtaken[failure]",
+    "run_at": "07face0",
+    "confirmed_alone": true
+  },
+  {
+    "id": "FN9-after-read",
+    "rule": "FN-9 no re-read after the success post",
+    "outcome": "killed",
+    "killed_by": "FAILED tests/spec/test_final_after_review.py::test_fn9_a_review_that_changes_right_after_a_success_post_is_followed_by_its_decision[failure-archive]",
+    "run_at": "07face0",
+    "confirmed_alone": true
+  },
+  {
+    "id": "FN9-before-state",
+    "rule": "FN-9 only a failed review stops the success before the post",
+    "outcome": "killed",
+    "killed_by": "FAILED tests/spec/test_final_after_review.py::test_fn9_b_a_review_that_changes_between_the_archive_jobs_read_and_its_post_is_not_overtaken[pending]",
+    "run_at": "07face0",
+    "confirmed_alone": true
+  },
+  {
+    "id": "FN9-after-state",
+    "rule": "FN-9 only a failed review follows the success after the post",
+    "outcome": "killed",
+    "killed_by": "FAILED tests/spec/test_final_after_review.py::test_fn9_a_review_that_changes_right_after_a_success_post_is_followed_by_its_decision[pending-archive]",
+    "run_at": "07face0",
+    "confirmed_alone": true
+  },
+  {
+    "id": "FN9-reread-unreadable",
+    "rule": "FN-9 an unreadable re-read named missing",
+    "outcome": "killed",
+    "killed_by": "FAILED tests/spec/test_final_after_review.py::test_fn9_a_re_read_that_fails_is_never_success[before-archive]",
+    "run_at": "07face0",
+    "confirmed_alone": true
+  },
+  {
+    "id": "FN9-success-unchecked",
+    "rule": "FN-9 a success posted without the re-read",
+    "outcome": "killed",
+    "killed_by": "FAILED tests/spec/test_final_after_review.py::test_fn9_b_a_review_that_changes_between_the_archive_jobs_read_and_its_post_is_not_overtaken[failure]",
+    "run_at": "07face0",
+    "confirmed_alone": true
+  },
+  {
+    "id": "FN9-post-final-reviewer",
+    "rule": "FN-9 post-final re-reads without the reviewer",
+    "outcome": "killed",
+    "killed_by": "FAILED tests/spec/test_final_after_review.py::test_fn8_a_successful_review_already_on_the_head_gives_ready_for_human_from_the_archive_job",
+    "run_at": "07face0",
+    "confirmed_alone": true
+  },
+  {
+    "id": "FN9-pending",
+    "rule": "FN-9 a pending review posts nothing in finalize",
+    "outcome": "killed",
+    "killed_by": "FAILED tests/unit/test_unit_final_decision.py::test_a_pending_review_in_finalize_waits_as_in_the_archive_job",
+    "run_at": "07face0",
+    "confirmed_alone": true
+  },
+  {
+    "id": "FN9-failed-reason",
+    "rule": "FN-4 a failed review without REVIEW_FAILED",
+    "outcome": "killed",
+    "killed_by": "FAILED tests/unit/test_unit_final_decision.py::test_a_failed_review_is_blocked_review_failed[failure-archive]",
+    "run_at": "07face0",
+    "confirmed_alone": true
+  },
+  {
+    "id": "FN9-before-unreadable-only",
+    "rule": "FN-9 success posted before the after-read corrects it",
+    "outcome": "killed",
+    "killed_by": "FAILED tests/spec/test_final_after_review.py::test_fn9_b_a_review_that_changes_between_the_archive_jobs_read_and_its_post_is_not_overtaken[failure]",
+    "run_at": "07face0",
+    "confirmed_alone": true
+  },
+  {
+    "id": "FN9-decide-on-event",
+    "rule": "FN-9 finalize decides on the status that started it",
+    "outcome": "killed",
+    "killed_by": "FAILED tests/spec/test_final_after_review.py::test_fn4_a_newer_review_by_another_creator_keeps_gate_final_in_progress",
+    "run_at": "07face0",
+    "confirmed_alone": true
+  },
+  {
+    "id": "FN9-lost-success-followed",
+    "rule": "FN-9 a lost success answer not followed (L67)",
+    "outcome": "killed",
+    "killed_by": "FAILED tests/spec/test_final_after_review.py::test_fn9_a_success_post_whose_answer_is_lost_twice_is_followed_by_the_newest_review_then_exit_1[failure-archive]",
+    "run_at": "07face0",
+    "confirmed_alone": true
+  },
+  {
+    "id": "FN9-lost-follow-failed-only",
+    "rule": "FN-9 a lost success followed only for a failed review (L72, C8)",
+    "outcome": "killed",
+    "killed_by": "FAILED tests/spec/test_final_after_review.py::test_fn9_a_success_post_whose_answer_is_lost_twice_is_followed_by_the_newest_review_then_exit_1[pending-archive]",
+    "run_at": "07face0",
+    "confirmed_alone": true
+  },
+  {
+    "id": "FN9-lost-follow-unreadable",
+    "rule": "FN-9 a lost success not followed after a failed re-read (L72, C9)",
+    "outcome": "killed",
+    "killed_by": "FAILED tests/spec/test_final_after_review.py::test_fn9_a_success_post_whose_answer_is_lost_twice_is_followed_by_the_newest_review_then_exit_1[re-read-fails-archive]",
+    "run_at": "07face0",
+    "confirmed_alone": true
+  },
+  {
+    "id": "FN9-retry-reread",
+    "rule": "FN-9 a success tried again without a re-read (L75)",
+    "outcome": "killed",
+    "killed_by": "FAILED tests/spec/test_final_after_review.py::test_fn9_a_success_post_whose_answer_is_lost_is_not_tried_again_once_the_newest_review_no_longer_allows_it[failure-archive]",
+    "run_at": "07face0",
+    "confirmed_alone": true
+  },
+  {
+    "id": "FN9-success-not-retried",
+    "rule": "FN-9 a success never tried again (L68, L75)",
+    "outcome": "killed",
+    "killed_by": "FAILED tests/spec/test_final_after_review.py::test_fn9_control_a_success_post_whose_answer_is_lost_once_is_tried_again_while_the_review_allows_it[archive]",
+    "run_at": "07face0",
+    "confirmed_alone": true
+  },
+  {
+    "id": "FN10-before-review-only",
+    "rule": "FN-10 only the review stops the success before the post",
+    "outcome": "killed",
+    "killed_by": "FAILED tests/spec/test_final_all_conditions.py::test_fn10_b_a_newer_mandatory_run_not_completed_between_the_read_and_the_post_is_never_success[in_progress-archive]",
+    "run_at": "07face0",
+    "confirmed_alone": true
+  },
+  {
+    "id": "FN10-after-review-only",
+    "rule": "FN-10 only the review followed after the success post",
+    "outcome": "killed",
+    "killed_by": "FAILED tests/spec/test_final_all_conditions.py::test_fn10_c_a_newer_failed_or_unfinished_mandatory_run_just_after_the_success_post_is_followed[failure-archive]",
+    "run_at": "07face0",
+    "confirmed_alone": true
+  },
+  {
+    "id": "FN10-retry-review-only",
+    "rule": "FN-10 only the review read again before a second try",
+    "outcome": "killed",
+    "killed_by": "FAILED tests/spec/test_final_all_conditions.py::test_fn10_e_a_newer_mandatory_run_at_a_failed_success_post_is_followed_instead_of_a_second_try[lost-failure-archive]",
+    "run_at": "07face0",
+    "confirmed_alone": true
+  },
+  {
+    "id": "FN10-lost-review-only",
+    "rule": "FN-10 only the review followed after a success lost twice",
+    "outcome": "killed",
+    "killed_by": "FAILED tests/spec/test_final_all_conditions.py::test_fn10_e_a_success_lost_twice_is_followed_by_a_newer_mandatory_run_then_exit_1[failure-archive]",
+    "run_at": "07face0",
+    "confirmed_alone": true
+  },
+  {
+    "id": "FN10-reread-order",
+    "rule": "FN-10 the check runs read before the statuses",
+    "outcome": "killed",
+    "killed_by": "FAILED tests/spec/test_final_all_conditions.py::test_fn10_a_the_customers_schedule_gives_no_success_at_all[archive]",
+    "run_at": "07face0",
+    "confirmed_alone": true
+  },
+  {
+    "id": "FN10-inputs-verdict",
+    "rule": "FN-10 post-final's decision made again without final.json's gate verdict",
+    "outcome": "killed",
+    "killed_by": "FAILED tests/spec/test_final_all_conditions.py::test_fn10_post_final_makes_the_decision_again_on_the_files_own_record[gate-verdict-blocked]",
+    "run_at": "07face0",
+    "confirmed_alone": true
+  },
+  {
+    "id": "FN10-inputs-archive",
+    "rule": "FN-10 post-final's decision made again without final.json's archive state",
+    "outcome": "killed",
+    "killed_by": "FAILED tests/spec/test_final_all_conditions.py::test_fn10_post_final_makes_the_decision_again_on_the_files_own_record[archive-failed]",
+    "run_at": "07face0",
+    "confirmed_alone": true
+  },
+  {
+    "id": "FN10-own-checks",
+    "rule": "FN-10 the archive job's own gate/archive not kept as found",
+    "outcome": "killed",
+    "killed_by": "FAILED tests/spec/test_final_all_conditions.py::test_fn10_control_the_archive_jobs_own_gate_archive_stands_in_its_decision_made_again",
+    "run_at": "07face0",
+    "confirmed_alone": true
+  },
+  {
+    "id": "FN10-post-final-inputs",
+    "rule": "FN-10 post-final makes the decision again without its record",
+    "outcome": "killed",
+    "killed_by": "FAILED tests/spec/test_final_all_conditions.py::test_fn10_b_a_newer_mandatory_run_not_completed_between_the_read_and_the_post_is_never_success[in_progress-archive]",
+    "run_at": "07face0",
+    "confirmed_alone": true
+  },
+  {
+    "id": "FN10-finalize-inputs",
+    "rule": "FN-10 finalize makes the decision again without its record",
+    "outcome": "killed",
+    "killed_by": "FAILED tests/spec/test_final_all_conditions.py::test_fn10_b_a_newer_mandatory_run_not_completed_between_the_read_and_the_post_is_never_success[in_progress-finalize]",
+    "run_at": "07face0",
+    "confirmed_alone": true
+  },
+  {
+    "id": "FN10-title",
+    "rule": "FN-10 a wait for a check titled as a wait for the review",
+    "outcome": "killed",
+    "killed_by": "FAILED tests/spec/test_final_all_conditions.py::test_fn10_b_a_newer_mandatory_run_not_completed_between_the_read_and_the_post_is_never_success[in_progress-archive]",
+    "run_at": "07face0",
+    "confirmed_alone": true
+  },
+  {
+    "id": "FN10-not-completed-failure",
+    "rule": "FN-10 a run not completed is a completed failure",
+    "outcome": "killed",
+    "killed_by": "FAILED tests/unit/test_unit_final_decision.py::test_a_mandatory_check_not_yet_completed_on_the_head_waits_never_passes[in_progress-archive]",
+    "run_at": "07face0",
+    "confirmed_alone": true
+  },
+  {
+    "id": "FN10-not-completed-ready",
+    "rule": "FN-10 a run not completed counts as passed",
+    "outcome": "killed",
+    "killed_by": "FAILED tests/unit/test_unit_final_decision.py::test_a_mandatory_check_not_yet_completed_on_the_head_waits_never_passes[in_progress-archive]",
+    "run_at": "07face0",
+    "confirmed_alone": true
+  },
+  {
+    "id": "FN10-not-completed-missing",
+    "rule": "FN-10 a run not completed read as missing",
+    "outcome": "killed",
+    "killed_by": "FAILED tests/unit/test_unit_final_decision.py::test_a_mandatory_check_not_yet_completed_on_the_head_waits_never_passes[in_progress-archive]",
+    "run_at": "07face0",
+    "confirmed_alone": true
+  },
+  {
+    "id": "FN10-running-first",
+    "rule": "FN-10 a run not completed decides before a failed check",
+    "outcome": "killed",
+    "killed_by": "FAILED tests/unit/test_unit_final_decision.py::test_a_failed_or_missing_check_decides_before_one_not_completed[failed]",
+    "run_at": "07face0",
+    "confirmed_alone": true
+  },
+  {
+    "id": "FN10-running-reason",
+    "rule": "FN-10 a wait for a check without its reason",
+    "outcome": "killed",
+    "killed_by": "FAILED tests/unit/test_unit_final_decision.py::test_a_mandatory_check_not_yet_completed_on_the_head_waits_never_passes[in_progress-archive]",
+    "run_at": "07face0",
+    "confirmed_alone": true
   }
 ]
