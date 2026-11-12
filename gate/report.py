@@ -41,8 +41,11 @@ READY = "ready-for-human"
 BLOCKED = "blocked"
 NEEDS_HUMAN = "needs-human"
 INCOMPLETE = "incomplete"
-# The final verdict while gate/final waits for the independent review (FN-2). Never a pass.
+# The final verdict while gate/final waits for the independent review (FN-2), or for a mandatory check that is not
+# completed (FN-10). Never a pass.
 AWAITING = "awaiting-review"
+# FN-10: the reason of a gate/final that waits for a mandatory check run that is queued or in progress.
+CHECK_NOT_COMPLETED = "CHECK_NOT_COMPLETED"
 GATE_VERDICTS = (READY, BLOCKED, NEEDS_HUMAN, INCOMPLETE)
 
 # The GitHub Actions app on github.com: the integration the ruleset requires for the gate's checks (FN-1).
@@ -163,7 +166,8 @@ def final_decision(
     mode is "archive" or "finalize"; since FN-9 both decide alike, and a pending review waits in both, so "post" is
     always true. The check runs and the statuses are the head's, as the API lists them, or None when they could not
     be read. Returns whether to post, the check's status and conclusion, the final verdict and the reasons. Nothing
-    here is ever success unless every fact FN-1 names is there; a success is posted only through FN-9's re-read.
+    here is ever success unless every fact FN-1 names is there; a success is posted only through FN-10's decision made
+    again (gate.publish.decide_again), which calls this function again.
     """
     state, review_code = review_of(statuses, reviewer)
     reasons = [item for item in gate_reasons if isinstance(item, dict)] if isinstance(gate_reasons, list) else []
@@ -197,13 +201,19 @@ def final_decision(
             reasons.append({"code": "CHECKS_UNREADABLE", "detail": f"the check runs on {head_sha} could not be read"})
             return result("completed", INCOMPLETE)
         failed = [name for name in FINAL_INPUTS if found.get(name) not in (None, "success", "not-completed")]
-        missing = [name for name in FINAL_INPUTS if found.get(name) in (None, "not-completed")]
+        missing = [name for name in FINAL_INPUTS if found.get(name) is None]
+        running = [name for name in FINAL_INPUTS if found.get(name) == "not-completed"]
         reasons += [{"code": "FAILED_CHECK", "detail": f"{name} did not succeed on {head_sha}"} for name in failed]
         reasons += [{"code": "MISSING_CHECK", "detail": f"{name} has no completed check run on {head_sha}"} for name in missing]
+        reasons += [{"code": CHECK_NOT_COMPLETED, "detail": f"{name} is not completed on {head_sha}"} for name in running]
         if failed:
             return result("completed", BLOCKED)
         if missing:
             return result("completed", INCOMPLETE)
+        if running:
+            # FN-10: a mandatory check run that is queued or in progress waits, at every decision, so that the decision
+            # made again around a success is the same decision.
+            return result("in_progress", AWAITING)
         return result("completed", READY)
     reasons.append(review_reason(str(review_code), head_sha))
     return result("in_progress", AWAITING)
