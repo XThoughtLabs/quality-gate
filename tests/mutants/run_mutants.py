@@ -422,8 +422,10 @@ MUTANTS: list[tuple[str, str, str, str, str]] = [
     ('FN10-reread-order', 'gate/publish.py', '    statuses = read_or_none(lambda: get_all(f"/repos/{repository}/commits/{head_sha}/statuses"))\n    runs = read_or_none(lambda: get_all(f"/repos/{repository}/commits/{head_sha}/check-runs?filter=all", "check_runs"))\n', '    runs = read_or_none(lambda: get_all(f"/repos/{repository}/commits/{head_sha}/check-runs?filter=all", "check_runs"))\n    statuses = read_or_none(lambda: get_all(f"/repos/{repository}/commits/{head_sha}/statuses"))\n', 'FN-10 the check runs read before the statuses'),
     ('FN10-inputs-verdict', 'gate/publish.py', '        "gate_verdict": final.get("gate_verdict"),\n', '        "gate_verdict": READY,\n', "FN-10 post-final's decision made again without final.json's gate verdict"),
     ('FN10-inputs-archive', 'gate/publish.py', '        "archive_ok": archive == "success",\n', '        "archive_ok": True,\n', "FN-10 post-final's decision made again without final.json's archive state"),
-    ('FN10-own-checks', 'gate/publish.py', '        "own_checks": {"gate/archive": str(archive)},\n', '        "own_checks": None,\n', "FN-10 the archive job's own gate/archive not kept as found"),
-    ('FN10-post-final-inputs', 'gate/publish.py', 'reasons, inputs=archive_inputs(final))', 'reasons, inputs=None)', 'FN-10 post-final makes the decision again without its record'),
+    # FN10-own-checks: turned round in round 2b's repair R1 (the review's F4): dropping the job's own gate/archive now
+    # makes a slow list a false red, which the control of a list that does not show the job's own post yet kills.
+    ('FN10-own-checks', 'gate/publish.py', '        "own_checks": {"gate/archive": str(archive)},\n', '        "own_checks": None,\n', "FN-10 the archive job's own gate/archive dropped: a slow list gives a false red"),
+    ('FN10-post-final-inputs', 'gate/publish.py', 'reasons, inputs=archive_inputs(final, archive_id))', 'reasons, inputs=None)', 'FN-10 post-final makes the decision again without its record'),
     ('FN10-finalize-inputs', 'gate/publish.py', 'decision["reasons"], inputs=inputs)', 'decision["reasons"], inputs=None)', 'FN-10 finalize makes the decision again without its record'),
     ('FN10-title', 'gate/publish.py', '        if waits_for_checks(reasons):\n', '        if False:\n', 'FN-10 a wait for a check titled as a wait for the review'),
     ('FN10-not-completed-failure', 'gate/report.py', '            return result("in_progress", AWAITING)\n', '            return result("completed", INCOMPLETE)\n', 'FN-10 a run not completed is a completed failure'),
@@ -431,6 +433,14 @@ MUTANTS: list[tuple[str, str, str, str, str]] = [
     ('FN10-not-completed-missing', 'gate/report.py', 'missing = [name for name in FINAL_INPUTS if found.get(name) is None]', 'missing = [name for name in FINAL_INPUTS if found.get(name) in (None, "not-completed")]', 'FN-10 a run not completed read as missing'),
     ('FN10-running-first', 'gate/report.py', '        if failed:\n            return result("completed", BLOCKED)\n', '        if running:\n            return result("in_progress", AWAITING)\n        if failed:\n            return result("completed", BLOCKED)\n', 'FN-10 a run not completed decides before a failed check'),
     ('FN10-running-reason', 'gate/report.py', '        reasons += [{"code": CHECK_NOT_COMPLETED, "detail": f"{name} is not completed on {head_sha}"} for name in running]\n', '', 'FN-10 a wait for a check without its reason'),
+    # Round 2b's repair R1: the review's F1 to F3.
+    ('FN10-own-override', 'gate/publish.py', '            del own[name]\n', '            pass\n', "FN-10 the archive job's own gate/archive stands over a newer one (F1)"),
+    ('FN10-own-unknown-stands', 'gate/publish.py', '        if not is_count(mine) or (', '        if is_count(mine) and (', "FN-10 the job's own gate/archive stands without its post's id (F1)"),
+    ('FN10-own-id-lost', 'gate/publish.py', 'inputs=archive_inputs(final, archive_id))', 'inputs=archive_inputs(final))', "FN-10 post-final forgets its own gate/archive post's id (F1)"),
+    ('FN10-post-check-id', 'gate/publish.py', '    return answer["id"] if isinstance(answer, dict) and is_count(answer.get("id")) else None\n', '    return None\n', "FN-10 a post's id never taken from GitHub's answer (F1)"),
+    ('FN10-newer-app', 'gate/publish.py', '        and app.get("id") == ACTIONS_APP_ID\n', '', "FN-10 another app's newer gate/archive drops the job's own (F1)"),
+    ('FN10-reread-filter', 'gate/publish.py', 'check-runs?filter=all", "check_runs"))\n    own = dict(', 'check-runs", "check_runs"))\n    own = dict(', 'FN-10 the decision made again reads only the newest completed check runs (F3)'),
+    ('FN10-review-wait-text', 'gate/publish.py', '            lead = review_wait_text(head_sha)\n', '            lead = waiting_text(head_sha)\n', 'FN-10 a wait for the review says that the checks passed (F2)'),
 ]
 
 

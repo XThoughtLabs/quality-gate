@@ -24,7 +24,7 @@ from typing import Any
 
 from gate.feedback import MARKER as REVIEW_MARKER
 from gate.feedback import REVIEW_CONTEXT
-from gate.report import AWAITING, BLOCKED, CHECK_NOT_COMPLETED, INCOMPLETE, NEEDS_HUMAN, READY, final_decision, is_count, review_reason
+from gate.report import ACTIONS_APP_ID, AWAITING, BLOCKED, CHECK_NOT_COMPLETED, INCOMPLETE, NEEDS_HUMAN, READY, final_decision, is_count, review_reason
 from gate.common import (
     EXIT_OK,
     EXIT_RULE_FAILED,
@@ -312,8 +312,9 @@ def cmd_extras(args: argparse.Namespace) -> int:
     return EXIT_OK
 
 
-def post_check(repository: str, name: str, head_sha: str, conclusion: str | None, summary: str, *, status: str = "completed", title: str | None = None) -> None:
-    """Create a new check run. A run in progress has no conclusion; a completed one always has one."""
+def post_check(repository: str, name: str, head_sha: str, conclusion: str | None, summary: str, *, status: str = "completed", title: str | None = None) -> int | None:
+    """Create a new check run. A run in progress has no conclusion; a completed one always has one. Returns the id
+    GitHub's answer gives the new run, or None when the answer gives none."""
     body: dict[str, Any] = {
         "name": name,
         "head_sha": head_sha,
@@ -322,7 +323,8 @@ def post_check(repository: str, name: str, head_sha: str, conclusion: str | None
     }
     if status == "completed":
         body["conclusion"] = conclusion
-    call("POST", f"/repos/{repository}/check-runs", body)
+    answer = call("POST", f"/repos/{repository}/check-runs", body)
+    return answer["id"] if isinstance(answer, dict) and is_count(answer.get("id")) else None
 
 
 def reasons_text(reasons: Any) -> str:
@@ -332,6 +334,12 @@ def reasons_text(reasons: Any) -> str:
 
 def waiting_text(head_sha: str) -> str:
     return f"The gate's checks passed. The final verdict waits for the independent review on {head_sha}."
+
+
+def review_wait_text(head_sha: str) -> str:
+    """The lead of a gate/final that waits for the review. It says nothing of the check runs: a wait for the review does
+    not look at them (round 2b, the review's F2)."""
+    return f"The final verdict waits for the independent review on {head_sha}."
 
 
 def cmd_post_checks(args: argparse.Namespace) -> int:
@@ -363,7 +371,7 @@ def post_gate_final(repository: str, head_sha: str, status: Any, conclusion: Any
             lead = f"A mandatory check is not completed on {head_sha}. The final verdict waits for it."
         else:
             title = f"gate/final: waiting for the independent review on {head_sha}"
-            lead = waiting_text(head_sha)
+            lead = review_wait_text(head_sha)
         post_final_check(repository, head_sha, None, f"{lead}\n{text}", status="in_progress", title=title)
         return [AWAITING]
     if status == "completed" and conclusion == "success" and verdict == READY:
@@ -391,6 +399,14 @@ def decide_again(repository: str, head_sha: str, inputs: Any) -> dict:
     given = inputs if isinstance(inputs, dict) else {}
     statuses = read_or_none(lambda: get_all(f"/repos/{repository}/commits/{head_sha}/statuses"))
     runs = read_or_none(lambda: get_all(f"/repos/{repository}/commits/{head_sha}/check-runs?filter=all", "check_runs"))
+    own = dict(given.get("own_checks") or {})
+    own_ids = given.get("own_ids") if isinstance(given.get("own_ids"), dict) else {}
+    for name in list(own):
+        # FN-10 (the review's F1): the job's own check stands only while the API lists no newer run of it than the
+        # job's own post; without that post's id the API's newest counts.
+        mine = own_ids.get(name)
+        if not is_count(mine) or (isinstance(runs, list) and any(is_newer_run(run, name, head_sha, mine) for run in runs)):
+            del own[name]
     return final_decision(
         mode=str(given.get("mode") or "finalize"),
         head_sha=head_sha,
@@ -400,7 +416,20 @@ def decide_again(repository: str, head_sha: str, inputs: Any) -> dict:
         check_runs=runs if isinstance(runs, list) else None,
         statuses=statuses if isinstance(statuses, list) else None,
         reviewer=given.get("reviewer"),
-        own_checks=given.get("own_checks"),
+        own_checks=own,
+    )
+
+
+def is_newer_run(run: Any, name: str, head_sha: str, own_id: int) -> bool:
+    """A check run of `name` on the head, of the GitHub Actions app (the runs FN-1 counts), posted after the job's own."""
+    app = run.get("app") if isinstance(run, dict) and isinstance(run.get("app"), dict) else {}
+    return (
+        isinstance(run, dict)
+        and run.get("name") == name
+        and run.get("head_sha") == head_sha
+        and app.get("id") == ACTIONS_APP_ID
+        and is_count(run.get("id"))
+        and run["id"] > own_id
     )
 
 
@@ -446,8 +475,9 @@ def post_confirmed_success(repository: str, head_sha: str, inputs: Any) -> list[
     return [READY]
 
 
-def archive_inputs(final: dict) -> dict:
-    """FN-10: the archive job's decision as final.json records it, for the decision made again in post-final."""
+def archive_inputs(final: dict, archive_id: int | None = None) -> dict:
+    """FN-10: the archive job's decision as final.json records it, for the decision made again in post-final, with the
+    id of the job's own gate/archive post (the review's F1)."""
     conclusions = final.get("conclusions") if isinstance(final.get("conclusions"), dict) else {}
     archive = conclusions.get("gate/archive")
     reviewer = final.get("reviewer")
@@ -457,6 +487,7 @@ def archive_inputs(final: dict) -> dict:
         "gate_reasons": final.get("gate_reasons"),
         "archive_ok": archive == "success",
         "own_checks": {"gate/archive": str(archive)},
+        "own_ids": {"gate/archive": archive_id},
         "reviewer": reviewer if isinstance(reviewer, dict) else None,
     }
 
@@ -465,13 +496,13 @@ def cmd_post_final(args: argparse.Namespace) -> int:
     repository = os.environ["GITHUB_REPOSITORY"]
     final = read_json(args.final)
     reasons = final.get("reasons") if isinstance(final.get("reasons"), list) else []
-    post_check(repository, "gate/archive", args.head_sha, final["conclusions"]["gate/archive"], f"Final verdict: {final.get('verdict')}\n{reasons_text(reasons)}")
+    archive_id = post_check(repository, "gate/archive", args.head_sha, final["conclusions"]["gate/archive"], f"Final verdict: {final.get('verdict')}\n{reasons_text(reasons)}")
     check = final.get("final_check")
     if not isinstance(check, dict):
         # FN-1: a final verdict that does not say how gate/final stands is never success.
         check = {}
         reasons = [*reasons, {"code": "NO_FINAL_CHECK", "detail": "the final verdict file holds no readable final_check"}]
-    posted = post_gate_final(repository, args.head_sha, check.get("status"), check.get("conclusion"), final.get("verdict"), reasons, inputs=archive_inputs(final))
+    posted = post_gate_final(repository, args.head_sha, check.get("status"), check.get("conclusion"), final.get("verdict"), reasons, inputs=archive_inputs(final, archive_id))
     print(f"post-final: gate/final posted on {args.head_sha}: {', '.join(posted)}")
     return EXIT_OK
 
