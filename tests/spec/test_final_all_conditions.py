@@ -445,3 +445,23 @@ def test_fn10_control_the_archive_jobs_own_gate_archive_stands_in_its_decision_m
     hub.after_runs_read = None
     posted = hub.posted()
     assert [(b["status"], b.get("conclusion")) for b in posted] == [("completed", "success")], posted
+
+
+@pytest.mark.req("FN-10", "FN-1")
+def test_fn10_control_a_file_without_final_check_never_posts_success_even_with_a_complete_record(tmp_path, hub):
+    """A final.json with no final_check posts completed failure with NO_FINAL_CHECK (section 8.5, the commands), even
+    when its record, every check run and the review would allow a success, so that the decision made again cannot stand
+    in for the missing final_check (mutant FIN-post-no-check, which the older test's file without a record no longer
+    kills under FN-10)."""
+    from gatekit import write_json
+    from test_final_after_review import CREATORS
+
+    Ready(tmp_path, hub)
+    final = write_json(tmp_path / "final.json", {
+        "verdict": "ready-for-human", "reasons": [], "gate_verdict": "ready-for-human", "gate_reasons": [],
+        "conclusions": {"gate/archive": "success", "gate/final": "success"},
+        "reviewer": {"login": CREATORS["reviewer"]["login"], "id": CREATORS["reviewer"]["id"]}})
+    ran(post_final(hub, final))
+    posted = hub.posted()
+    assert [(b["status"], b.get("conclusion")) for b in posted] == [("completed", "failure")], posted
+    assert "NO_FINAL_CHECK" in posted[0]["output"]["summary"], posted[0]["output"]
