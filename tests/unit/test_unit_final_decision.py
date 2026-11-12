@@ -159,21 +159,63 @@ def test_unreadable_check_runs_are_incomplete():
 @pytest.mark.parametrize("bad", [
     run("gate/tests", app=999, run_id=50),
     run("gate/tests", head=OTHER, run_id=50),
-    run("gate/tests", status="in_progress", conclusion=None, run_id=50),
     run("gate/tests", conclusion="neutral", run_id=50),
-], ids=["another-app", "another-commit", "in-progress", "neutral"])
+], ids=["another-app", "another-commit", "neutral"])
 def test_only_a_completed_success_of_the_actions_app_on_the_head_counts(bad):
+    # Changed by FN-10 (round 2b): the case "in-progress" asserted a completed failure; a run not completed now waits,
+    # in the test below.
     runs = [run(n, run_id=i + 1) for i, n in enumerate(SEVEN) if n != "gate/tests"] + [bad]
     d = decide(**world(check_runs=runs))
     assert d["conclusion"] == "failure"
 
 
+@pytest.mark.req("FN-10")
+@pytest.mark.parametrize("mode", ["archive", "finalize"])
 @pytest.mark.parametrize("status", ["in_progress", "queued"])
-def test_a_mandatory_check_not_yet_completed_on_the_head_counts_as_missing_never_as_passed(status):
-    runs = [run(n, run_id=i + 1) for i, n in enumerate(SEVEN) if n != "gate/tests"]
+def test_a_mandatory_check_not_yet_completed_on_the_head_waits_never_passes(mode, status):
+    # Changed by FN-10 (round 2b, the CEO's decision of 2026-11-12): such a run counted as missing (completed failure,
+    # incomplete, MISSING_CHECK). Now gate/final waits, so that the decision made again around a success is the same
+    # decision. Was test_a_mandatory_check_not_yet_completed_on_the_head_counts_as_missing_never_as_passed.
+    names = SEVEN if mode == "finalize" else SIX
+    runs = [run(n, run_id=i + 1) for i, n in enumerate(names) if n != "gate/tests"]
     runs.append(run("gate/tests", status=status, conclusion=None, run_id=50))
+    d = decide(**world(mode, check_runs=runs))
+    assert (d["post"], d["status"], d["conclusion"], d["verdict"]) == (True, "in_progress", None, "awaiting-review")
+    assert codes(d) == ["CHECK_NOT_COMPLETED"]
+    assert d["reasons"][0]["detail"] == f"gate/tests is not completed on {HEAD}"
+
+
+@pytest.mark.req("FN-10")
+@pytest.mark.parametrize("other,verdict,code", [
+    ("failure", "blocked", "FAILED_CHECK"),
+    ("missing", "incomplete", "MISSING_CHECK"),
+], ids=["failed", "missing"])
+def test_a_failed_or_missing_check_decides_before_one_not_completed(other, verdict, code):
+    runs = [run(n, run_id=i + 1) for i, n in enumerate(SEVEN) if n not in ("gate/tests", "gate/env")]
+    runs.append(run("gate/tests", status="in_progress", conclusion=None, run_id=50))
+    if other == "failure":
+        runs.append(run("gate/env", "failure", run_id=51))
     d = decide(**world(check_runs=runs))
-    assert (d["conclusion"], d["verdict"]) == ("failure", "incomplete") and "MISSING_CHECK" in codes(d)
+    assert (d["status"], d["conclusion"], d["verdict"]) == ("completed", "failure", verdict)
+    assert code in codes(d) and "CHECK_NOT_COMPLETED" in codes(d)
+
+
+@pytest.mark.req("FN-10", "FN-9")
+def test_control_a_review_that_is_no_success_decides_before_a_check_not_completed():
+    runs = [run(n, run_id=i + 1) for i, n in enumerate(SEVEN) if n != "gate/tests"]
+    runs.append(run("gate/tests", status="queued", conclusion=None, run_id=50))
+    d = decide(**world(check_runs=runs, statuses=[review("pending")]))
+    assert (d["status"], d["verdict"]) == ("in_progress", "awaiting-review")
+    assert codes(d) == ["REVIEW_PENDING"]
+    d = decide(**world(check_runs=runs, statuses=[review("failure")]))
+    assert (d["status"], d["conclusion"], d["verdict"]) == ("completed", "failure", "blocked")
+
+
+@pytest.mark.req("FN-10")
+def test_control_a_newer_completed_success_after_a_run_not_completed_is_ready():
+    runs = [run(n, run_id=i + 1) for i, n in enumerate(SEVEN) if n != "gate/tests"]
+    runs += [run("gate/tests", status="in_progress", conclusion=None, run_id=50), run("gate/tests", run_id=51)]
+    assert decide(**world(check_runs=runs))["verdict"] == "ready-for-human"
 
 
 def test_the_newest_run_of_a_name_counts_by_its_id():

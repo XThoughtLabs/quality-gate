@@ -382,13 +382,15 @@ def test_fn1_unreadable_check_runs_are_never_success(tmp_path, hub):
 
 
 @pytest.mark.req("FN-1")
-@pytest.mark.parametrize("bad", ["another-app", "another-commit", "in-progress", "neutral", "skipped"])
+@pytest.mark.parametrize("bad", ["another-app", "another-commit", "neutral", "skipped"])
 def test_fn1_only_a_completed_success_of_the_actions_app_on_the_head_counts(tmp_path, hub, bad):
+    # Changed by FN-10 (round 2b, the CEO's decision of 2026-11-12): the case "in-progress" asserted a completed
+    # failure; FN-10 makes a mandatory run not completed wait (gate/final in progress, CHECK_NOT_COMPLETED). That case
+    # is now test_fn10_a_mandatory_run_not_completed_at_the_decisions_own_read_waits_for_the_checks.
     runs = [check_run(n) for n in SIX if n != "gate/tests"]
     runs.append({
         "another-app": lambda: check_run("gate/tests", app=999),
         "another-commit": lambda: check_run("gate/tests", head=OTHER),
-        "in-progress": lambda: check_run("gate/tests", state="in_progress"),
         "neutral": lambda: check_run("gate/tests", "neutral"),
         "skipped": lambda: check_run("gate/tests", "skipped"),
     }[bad]())
