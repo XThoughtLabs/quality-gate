@@ -554,3 +554,25 @@ def test_fn10_control_a_file_without_final_check_never_posts_success_even_with_a
     posted = hub.posted()
     assert [(b["status"], b.get("conclusion")) for b in posted] == [("completed", "failure")], posted
     assert "NO_FINAL_CHECK" in posted[0]["output"]["summary"], posted[0]["output"]
+
+
+@pytest.mark.req("FN-10", "FN-8", "FN-1")
+def test_fn10_f1_control_a_newer_gate_archive_of_another_app_does_not_count_against_the_jobs_own(tmp_path, hub):
+    """Only runs of the GitHub Actions app count (FN-1): a newer gate/archive of another app after the job's own post,
+    while the list does not show that post yet, leaves the job's own value standing (no false red)."""
+    world = Ready(tmp_path, hub)
+    hub.runs[HEAD] = [run for run in hub.runs[HEAD] if run["name"] != "gate/archive"]
+    hub.lists_posts = False
+    came = []
+
+    def stored(run):
+        if run["name"] == "gate/archive" and not came:
+            came.append(check_run("gate/archive", conclusion="failure", app=999))
+            hub.runs[HEAD].append(came[-1])
+
+    hub.after_post = stored
+    ran(world.archive_post(world.archive_read()))
+    hub.after_post = None
+    assert came, "precondition: another app's gate/archive came after the job's own post"
+    posted = hub.posted()
+    assert [(b["status"], b.get("conclusion")) for b in posted] == [("completed", "success")], posted
