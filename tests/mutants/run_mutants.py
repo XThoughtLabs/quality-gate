@@ -441,6 +441,9 @@ MUTANTS: list[tuple[str, str, str, str, str]] = [
     ('FN10-newer-app', 'gate/publish.py', '        and app.get("id") == ACTIONS_APP_ID\n', '', "FN-10 another app's newer gate/archive drops the job's own (F1)"),
     ('FN10-reread-filter', 'gate/publish.py', 'check-runs?filter=all", "check_runs"))\n    own = dict(', 'check-runs", "check_runs"))\n    own = dict(', 'FN-10 the decision made again reads only the newest completed check runs (F3)'),
     ('FN10-review-wait-text', 'gate/publish.py', '            lead = review_wait_text(head_sha)\n', '            lead = waiting_text(head_sha)\n', 'FN-10 a wait for the review says that the checks passed (F2)'),
+    # The narrow check's R2-L1 (HQ's decision: repaired by tests): the direction of F1's id comparison.
+    ('FN10-own-newer-lt', 'gate/publish.py', '        and run["id"] > own_id\n', '        and run["id"] < own_id\n', "FN-10 an older gate/archive sets the job's own aside, a newer one does not (R2-L1)"),
+    ('FN10-own-newer-ne', 'gate/publish.py', '        and run["id"] > own_id\n', '        and run["id"] != own_id\n', "FN-10 any other gate/archive, older too, sets the job's own aside (R2-L1)"),
 ]
 
 

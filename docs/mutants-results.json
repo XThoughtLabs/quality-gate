@@ -3283,5 +3283,21 @@
     "killed_by": "FAILED tests/spec/test_final_all_conditions.py::test_fn10_a_review_and_a_check_that_change_together_follow_the_decisions_order_and_claim_no_passed_checks[archive]",
     "run_at": "4eee339",
     "confirmed_alone": true
+  },
+  {
+    "id": "FN10-own-newer-lt",
+    "rule": "FN-10 an older gate/archive sets the job's own aside, a newer one does not (R2-L1)",
+    "outcome": "killed",
+    "killed_by": "FAILED tests/spec/test_final_all_conditions.py::test_fn10_f1_a_newer_gate_archive_on_a_head_with_no_earlier_one_is_read_again[failure-before]",
+    "run_at": "39d0818",
+    "confirmed_alone": true
+  },
+  {
+    "id": "FN10-own-newer-ne",
+    "rule": "FN-10 any other gate/archive, older too, sets the job's own aside (R2-L1)",
+    "outcome": "killed",
+    "killed_by": "FAILED tests/spec/test_final_all_conditions.py::test_fn10_f1_control_a_slow_list_with_only_an_older_failed_gate_archive_makes_no_false_red",
+    "run_at": "39d0818",
+    "confirmed_alone": true
   }
 ]
