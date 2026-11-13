@@ -34,6 +34,8 @@ The launcher reads the machine through these module-level functions only. Tests 
 
 ### 2.1 `launcher.toml`
 
+The pilot's example (DEV-06). Stage A adds keys (LR-53, LR-55); the generic form, with placeholders, is `launcher.example.toml` (LR-63).
+
 ```toml
 [launcher]
 key_file = 'C:\xtl-gate-executor\xtl-gate-executor.pem'
@@ -51,7 +53,7 @@ gate_url = "https://github.com/XThoughtLabs/quality-gate.git"
 
 ### 2.2 The app file
 
-The app file is JSON, written by the CEO's setup script:
+The app file is JSON, written by the CEO's setup script. The values below are the pilot's example (DEV-06); the setup script of stage A (`setup/setup_apps.py`) writes the same keys for its own app and users.
 
 ```json
 {"app_id": 123, "installation_id": 456, "slug": "xtl-gate-executor",
@@ -273,3 +275,129 @@ Where these differ from the rules above, these win.
 - **A10, A8 against LR-44.** `REMOTE_UNREADABLE` is for `ls-remote` of the run's own branch (LR-24). For the `reports` branch, LR-44's `REPORTS_UNREADABLE` stands.
 - **A11, A6.** LR-1 still covers missing or ill-typed settings. A6 only adds that a key file which does not exist exits 2 too.
 - **A12, LR-50.** `scrub` removes every PEM block first, before it replaces the listed secrets. A block whose BEGIN or END line is also a listed secret is still removed whole.
+
+## 12. Amendment Stage A, 2026-11-13: the launcher counts the model's messages and stops by itself
+
+Task HQ-TASK-M1-A, for stage A of the WorkFlow API work. The customer's unit:
+
+> «Сообщение модели, а не фрагмент потока, является единицей учёта. Субагенты исполнителю запрещены; неожиданно появившиеся сообщения не исключаются из счёта.»
+>
+> (translation) "A model message, not a stream fragment, is the unit. Subagents are forbidden to the executor; messages that appear anyway are not left out of the count."
+
+Where these rules differ from the rules above, these win. LR-51 to LR-66 are new; the rules they amend are named in each.
+
+### 12.1 The stream and the unit
+
+- **LR-51 The stream (amends LR-26).** The model's command is `claude_command` followed by `-p --max-turns <L> --allowedTools <comma-separated list> --settings <run>/claude-settings.json --output-format stream-json --verbose`, where `L` is the attempt's effective limit (LR-53).
+  - `--max-turns` is a second layer only. The bound is the launcher's own count of messages (LR-52) and its stop (LR-57).
+  - The launcher reads the model's standard output line by line while the model runs. Each line is one event.
+- **LR-52 The unit.** A model message is an event whose `type` is `assistant`.
+  - Its id is `message.id` when that is a non-empty string of at most 256 characters. Any other value, or none, means the event has no id.
+  - An event with an id that the attempt has already counted is a fragment of that message and is not counted again.
+  - An event without an id is a message of its own. Its generated id is `gen-<ordinal>`.
+  - A message whose event has a non-null `parent_tool_use_id` (a subagent's) counts like any other, and its ledger record says `"subagent": true`.
+  - No event of another type counts: not `user`, not `system` (an `api_retry` included), not `result`, not a type the launcher does not know.
+  - The count belongs to the attempt. The attempt's ordinals run 1, 2, 3 and so on in the order the messages appear.
+
+### 12.2 Limits, the task and the ledger
+
+- **LR-53 Limits.** `launcher.toml`'s `[launcher]` table must hold three new keys, each a positive integer (not a boolean). A missing or ill-typed one exits 2 (LR-1):
+  - `max_messages_attempt`: the most messages one attempt may have;
+  - `max_messages_task`: the most messages all attempts of one task may have together, retries, fix rounds and continuations included;
+  - `max_runs_task`: the most attempts one task may have.
+
+  Stage A's values are 80, 240 and 3. The effective limit `L` of an attempt is the smallest of:
+  - `max_messages_attempt`;
+  - `[limits] max_turns` of `quality.toml` on the integration branch, as LR-20 reads it;
+  - `--max-messages M`, when given;
+  - the task's remaining messages (LR-56).
+
+  `task`, `spec` and `fix` take an optional `--max-messages M`. `M` must be a positive integer, by LR-1's pattern for `--issue`; anything else exits 2. It can only lower `L`. Nothing raises a limit above the configuration.
+- **LR-54 The task.** Every attempt belongs to one task, by the command:
+  - `task --issue N`: the task `issue-N`;
+  - `fix --pr N`: the task `issue-K`, where `K` is the number in the PR's `head.ref`, `ai/<K>-…`, the branch LR-22 gave the first run. A fix round is a retry of its issue's task. A PR whose `head.ref` does not have that form stops the run with `NOT_A_FIX_TARGET`, after the other checks of LR-42;
+  - `spec --slug S`: the task `spec-S`.
+
+  The limits of LR-53 and LR-56 apply to every role. The ledger records the role (`task`, `fix` or `spec`).
+- **LR-55 The ledger.** `[launcher] ledger_file` is a new required key: a full drive path, as for `deny_read_paths`. Otherwise exit 2.
+  - The ledger is a file of JSON lines, one object per line. Each line ends with a newline, and the file only ever grows: the launcher appends and never rewrites. Its folder is created when it is missing.
+  - The launcher holds an exclusive lock on the file `<ledger_file>.lock` while it reads or appends to the ledger, so two launchers never interleave a read and a reservation. A lock that cannot be had within about 10 seconds stops the run with `LEDGER_FAILED`.
+  - Every record is written, flushed and synced to disk (`fsync`) before the launcher acts on it. A record that cannot be written stops the run with `LEDGER_FAILED`: before the model, nothing starts; during the model, the stop of LR-58 begins.
+  - A ledger the launcher cannot read stops the run with `LEDGER_FAILED`. That includes a line that is not a JSON object of a known record with its fields, a last line without its newline, a second reservation of one attempt id, and a record for an attempt that was never reserved. The launcher never repairs the ledger: the operator does.
+  - The records hold no secret and no prompt text:
+    - `{"record": "attempt_reserved", "task", "attempt", "role", "time", "limit", "max_messages_task", "max_runs_task", "messages_before", "runs_before"}`, written before the model starts. `limit` is `L`; `messages_before` and `runs_before` are the task's totals before this attempt; `time` is the clock read in UTC, `YYYY-MM-DDTHH:MM:SSZ`;
+    - `{"record": "message", "attempt", "message_id", "generated", "ordinal", "time", "over_limit", "subagent"}`, one for each newly counted message;
+    - `{"record": "attempt_finished", "attempt", "messages", "outcome", "result", "exit_code", "time"}`, written when the model has ended. `result` holds the `result` event's fields named by `MODEL_FIELDS` (`num_turns`, `is_error`, `subtype`, `total_cost_usd`, `duration_ms`), or is `null` when no `result` event came; `exit_code` is the model's exit code, or `null` when the model never ran.
+  - The attempt id is the run id of LR-17.
+  - The ledger file and its lock file are added to the model's deny rules (LR-27): `Read`, `Grep`, `Glob`, `Edit` and `Write` of each, in the form of `claude_path`.
+- **LR-56 Task totals.** Before an attempt is reserved, the launcher reads the ledger and sums the task's attempts.
+  - A finished attempt is charged the larger of its `attempt_finished.messages` and the number of its `message` records.
+  - An attempt with `attempt_reserved` and no `attempt_finished` is charged its `limit`, whatever its `message` records say. When they show more messages than the limit (messages counted during a stop), it is charged that larger number.
+  - The task's runs are its reserved attempts.
+  - When the task's messages are used up (`messages_before >= max_messages_task`) or its runs reach `max_runs_task`, the run stops with the new code `BUDGET_EXHAUSTED` (exit 1), before reserving or starting the model.
+  - For `task` and `spec` the task is known from the command, so this check also runs right after the preflight, before any network use, clone or token. For `fix` the task is known only after the PR has been read (LR-54).
+  - The check that counts is the one made under the ledger's lock, together with the reservation, just before the model starts and after LR-30's check.
+  - A reserved attempt is never given back: an attempt that stopped early, failed or was interrupted keeps its charge and its run.
+
+### 12.3 The stop
+
+- **LR-57 The stop at the limit.** At most `L` messages complete in an attempt with limit `L`.
+  - When the `L`-th message has been counted, the launcher collects the `tool_use` ids of that message's events: of its first event, and of every later fragment with the same id. When every collected id has a `tool_result` in a `user` event, the stop begins. This is checked after each event, from the `L`-th message's first event on. When the `L`-th message has no `tool_use`, the stop begins at once.
+  - When a message is counted beyond `L`, the stop begins at once.
+  - The stop sequence is LR-58's. While it runs, the launcher keeps reading: every further message that appears before the model's process has ended, or that it wrote before it ended, is counted. Its record says `"over_limit": true`, and the log and the report name the number.
+  - An attempt whose count reached `L` ends with the new code `MESSAGE_LIMIT`, however the model then ends. As with `TIMEOUT` (LR-31), nothing is pushed.
+- **LR-58 Ending the model's processes (amendment A13: HQ's answer to the stop-and-ask on M-6, 2026-11-13).** The first wording of this rule sent a CTRL_BREAK and then the existing `taskkill /T` kill. A probe on the laptop showed that a child started with a hidden window (`CREATE_NO_WINDOW`, as Node starts its children with `windowsHide`) does not get the CTRL_BREAK, the model exits on it, and `taskkill /T` then finds no tree: the child stays alive. HQ's answer is this rule.
+  - **Windows: a job object.**
+    - The model starts suspended: `CREATE_SUSPENDED` together with `CREATE_NEW_PROCESS_GROUP`.
+    - It is assigned to a new job object whose limits are `JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE`, with neither `JOB_OBJECT_LIMIT_BREAKAWAY_OK` nor `JOB_OBJECT_LIMIT_SILENT_BREAKAWAY_OK`. The model's whole tree then dies with the launcher, and no descendant can leave the job.
+    - Only then is it resumed, so the model runs inside the job from its first instruction.
+    - If creating the job, assigning or resuming fails, the suspended process is terminated, nothing is started, and the run stops with the new code `JOB_SETUP_FAILED`. The reserved run is not given back.
+  - **The stop sequence**, the same for `MESSAGE_LIMIT`, `TIMEOUT` and `STREAM_UNREADABLE`:
+    1. a CTRL_BREAK to the model's process group;
+    2. the grace period: **10 seconds**, fixed; the launcher keeps reading the stream (LR-57);
+    3. `TerminateJobObject` on the model's job;
+    4. a check that the job has 0 active processes, read again for at most 5 seconds while processes are still exiting.
+
+    If any process is left, the run stops with the new code `PROCESS_SURVIVED`, the log names the number, and nothing is pushed. `PROCESS_SURVIVED` takes the place of the stop's own code. A CTRL_BREAK that cannot be sent (no console) is logged, and the sequence goes on.
+  - **After a model that ended by itself**, the launcher also calls `TerminateJobObject`, for children left behind, and makes the same check. A child that was still running is logged and ended; one that survives that gives `PROCESS_SURVIVED`.
+  - **POSIX: the process group.** The model starts as the leader of a new session and process group. The stop sends SIGINT to the group, waits the same grace period, sends SIGKILL to the group, and checks for at most 5 seconds that no process of the group is left; otherwise `PROCESS_SURVIVED`. **Known limitation:** a descendant that leaves the group (`setsid`) is not reached and can survive. Stage A's live runs are on Windows; on Linux only the stand-ins run.
+  - **LR-31 (`TIMEOUT`)** ends through this sequence too, in place of its first wording, "killed with its children".
+- **LR-59 Subagents.** `Agent` and `Task` join the rules LR-27 always denies, after `WebSearch`. The count does not depend on it: a subagent's message that appears anyway is counted (LR-52).
+- **LR-60 A broken stream.**
+  - A line that is empty or only whitespace is skipped.
+  - A line that is not a JSON object (bad UTF-8, bad JSON, or JSON that is not an object) does not count. The log records it scrubbed (LR-50) and cut to 200 characters.
+  - The stream cannot be read at all, and the stop of LR-58 begins with the new code `STREAM_UNREADABLE` (fail closed, nothing pushed), when:
+    - reading the model's output fails;
+    - a line is longer than 32 MiB;
+    - the attempt has had more than 10 lines that are not JSON objects.
+  - A stream that ends without a `result` event is recorded so: `"result": null` in `attempt_finished`, and `model stream: no result event` in the log. A model that then exits 0 stops the run with `STREAM_UNREADABLE`, because its count cannot be shown to be whole; one that exits otherwise gives `MODEL_FAILED` (LR-32).
+- **LR-61 The timeout stays.** `timeout_minutes` (LR-20) is a separate bound, never a substitute for the message limit. Its clock starts when the model is resumed. At the deadline, LR-58's sequence ends the model with `TIMEOUT`. An attempt therefore lasts at most `timeout_minutes`, plus the 10-second grace, plus at most 5 seconds of the check. To keep a run within 60 minutes with its ending included, `timeout_minutes` must be at most 59.
+- **LR-62 What the log adds (amends LR-49).**
+  - LR-49's model fields and its `result` text come from the stream's `result` event.
+  - The log also records:
+    - the effective limit and its parts;
+    - the task and its totals;
+    - each counted message's ordinal, generated or not, `over_limit` and `subagent`, never its content;
+    - each `api_retry` event's `error` category, scrubbed and cut to 200 characters;
+    - each step of the stop;
+    - the job's result.
+  - The outcome of the model's part is one of: `DONE` (it ended by itself, with exit 0 and a `result` event, below its limit), `MESSAGE_LIMIT`, `TIMEOUT`, `MODEL_FAILED`, `STREAM_UNREADABLE`, `PROCESS_SURVIVED`, `JOB_SETUP_FAILED`, `LEDGER_FAILED`, `INTERRUPTED` or `ERROR`.
+
+### 12.4 Configuration, seams and codes
+
+- **LR-63 Explicit configuration.** Nothing bound to one laptop or to the pilot is a default of the code: users, folders, the folders that must not open, app names and repositories come from `launcher.toml` and the app file. The gate's URL keeps its default, the public quality-gate repository (LR-2). `launcher.example.toml` shows every key with placeholders. `README.md` and `INSTRUCTION-CEO.md` are generic, and the pilot's values remain only where marked as the pilot's example.
+- **LR-64 New seams (extends section 1.1).** On Windows the launcher drives the job object through these module-level functions only, and tests may replace exactly these:
+
+  | Function | Does |
+  |---|---|
+  | `job_open()` | creates the job object with LR-58's limits and returns its handle; raises `OSError` on failure |
+  | `job_add(job, process)` | assigns the suspended `subprocess.Popen` to the job; raises `OSError` on failure |
+  | `resume_process(pid)` | resumes every thread of the suspended process; raises `OSError` on failure |
+  | `job_end(job)` | calls `TerminateJobObject`, then returns the job's active process count, read again for at most 5 seconds until it is 0 |
+  | `job_close(job)` | closes the job's handle |
+
+- **LR-65 New codes** (A8 continued), each exit 1: `BUDGET_EXHAUSTED` (LR-56), `MESSAGE_LIMIT` (LR-57), `JOB_SETUP_FAILED` and `PROCESS_SURVIVED` (LR-58), `STREAM_UNREADABLE` (LR-60) and `LEDGER_FAILED` (LR-55).
+- **LR-66 Known limitations of this amendment.**
+  - The model runs as the same Windows user as the launcher (DEV-06). Claude's deny rules keep its file tools away from the ledger (LR-55), but a script the model runs could still change the ledger between attempts. The attempt's own count lives in the launcher's memory and cannot be changed that way.
+  - On POSIX, a descendant that leaves the process group survives the stop (LR-58).
+  - Claude Code's documentation does not say whether one message can arrive as several `assistant` events with one `message.id`. LR-52 counts correctly either way, but when the `L`-th message's first event has no `tool_use` and a later fragment does, the stop has already begun, and that tool may not run (nothing is pushed: LR-57).
