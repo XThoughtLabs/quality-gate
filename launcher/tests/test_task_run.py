@@ -199,8 +199,9 @@ def test_lr25_lr28_model_runs_in_the_venv(task_run):
 def test_lr26_model_command_line_and_working_folder(task_run):
     m = task_run.model
     cmd = task_run.world.config["claude_command"]
+    # LR-51 (amendment Stage A) replaced LR-26's `--output-format json` with the stream.
     expected_tail = ["-p", "--max-turns", str(W.MAX_TURNS), "--allowedTools", W.TASK_TOOLS,
-                     "--settings", None, "--output-format", "json"]
+                     "--settings", None, "--output-format", "stream-json", "--verbose"]
     argv = m["argv"]
     # argv[0] is the script the interpreter ran; the rest follows claude_command.
     assert W.same_path(argv[0], cmd[1])

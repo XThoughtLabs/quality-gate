@@ -35,6 +35,8 @@ FAKE_CLAUDE = TESTS_DIR / "fake_claude.py"
 GATE_URL = str(LAUNCHER_DIR.parent)
 GATE_PIN = "fdc99189d797e0df35baaf64233cb6e657628e31"
 UNKNOWN_SHA = "0123456789abcdef0123456789abcdef01234567"
+# The names below (repository, apps, users, folders) are the pilot's example (DEV-06), kept as this
+# test world's synthetic values; the launcher's code holds none of them (LR-63).
 REPOSITORY = "XThoughtLabs/gate-practice-app"
 OWNER, REPO_NAME = REPOSITORY.split("/")
 SLUG = "xtl-gate-executor"
@@ -785,7 +787,13 @@ class World:
             "api_url": self.api.url,
             "repo_url": str(self.remote),
             "gate_url": GATE_URL,
+            # Stage A (LR-53, LR-55): stage A's limits and a ledger of this world's own.
+            "ledger_file": str(root / "state" / "ledger.jsonl"),
+            "max_messages_attempt": 80,
+            "max_messages_task": 240,
+            "max_runs_task": 3,
         }
+        self.ledger_file = Path(self.config["ledger_file"])
         self.seams.folders[norm(self.absent_folder)] = "absent"
         self.write_files()
         self.base_env(monkeypatch)
@@ -918,6 +926,19 @@ class World:
                          run_dirs=sorted(set(self._run_dirs()) - before_dirs), logs=logs,
                          world=self, model_error=model_error, refs_before=refs_before,
                          refs_after=self.remote_refs())
+
+    # ---- the ledger (LR-55) -------------------------------------------------------
+    def ledger_records(self) -> list[dict]:
+        if not self.ledger_file.exists():
+            return []
+        text = self.ledger_file.read_bytes().decode("utf-8")
+        return [json.loads(line) for line in text.split("\n") if line.strip()]
+
+    def seed_ledger(self, records: list[dict], raw: bytes | None = None) -> None:
+        self.ledger_file.parent.mkdir(parents=True, exist_ok=True)
+        data = raw if raw is not None else b"".join(
+            json.dumps(r, sort_keys=True).encode("utf-8") + b"\n" for r in records)
+        self.ledger_file.write_bytes(data)
 
     def _run_dirs(self):
         if not self.runs_dir.exists():

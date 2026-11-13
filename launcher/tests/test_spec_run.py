@@ -88,7 +88,8 @@ def test_lr26_spec_allowed_tools(spec_run):
     argv = spec_run.model["argv"]
     assert argv[argv.index("--allowedTools") + 1] == W.SPEC_TOOLS
     assert argv[argv.index("--max-turns") + 1] == str(W.MAX_TURNS)
-    assert argv[-2:] == ["--output-format", "json"]
+    # LR-51 (amendment Stage A) replaced LR-26's `--output-format json` with the stream.
+    assert argv[-3:] == ["--output-format", "stream-json", "--verbose"]
     assert W.same_path(argv[argv.index("--settings") + 1], spec_run.run_dir / "claude-settings.json")
 
 
