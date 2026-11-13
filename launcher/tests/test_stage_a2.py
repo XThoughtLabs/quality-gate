@@ -258,7 +258,8 @@ def test_lr70_a_hook_the_model_wrote_does_not_run(world, check, tmp_path):
 
 
 @pytest.mark.lr(70)
-def test_lr70_every_git_command_ignores_the_global_config_and_hooks(world, check):
+@pytest.mark.lr(80)
+def test_lr70_every_git_command_ignores_the_global_config_and_hooks(world, check, launcher):
     res = spec(world, [msg("m1")])
     check.success(res)
     gits = [e for e in res.events if e.get("argv") and os.path.basename(e["argv"][0]).lower() in ("git", "git.exe")]
@@ -266,23 +267,24 @@ def test_lr70_every_git_command_ignores_the_global_config_and_hooks(world, check
     for event in gits:
         assert W.effective_env(event).get("GIT_CONFIG_GLOBAL") == os.devnull, event["argv"]
         hooks = [a for a in event["argv"] if a.startswith("core.hooksPath=")]
-        assert hooks and W.same_path(hooks[0].split("=", 1)[1], res.run_dir / "no-hooks"), event["argv"]
+        # LR-80 (amendment Stage A3) replaced LR-70's <run>/no-hooks by the launcher's own read-only hooks folder.
+        assert hooks and W.same_path(hooks[0].split("=", 1)[1], launcher.hooks_folder()), event["argv"]
 
 
 @pytest.mark.lr(70)
+@pytest.mark.lr(81)
 def test_lr70_the_users_global_git_config_is_not_read(world, check, tmp_path, monkeypatch):
-    marker = tmp_path / "global-hook-ran"
-    hooks = tmp_path / "planted-hooks"
-    hooks.mkdir()
-    (hooks / "pre-push").write_text(f"#!/bin/sh\necho ran > '{marker.as_posix()}'\nexit 0\n", encoding="utf-8",
-                                    newline="\n")
+    # S6: a setting that the command line's -c does not override; the push would go elsewhere if it acted.
     home = tmp_path / "home"
-    home.mkdir()
-    (home / ".gitconfig").write_text(f"[core]\n\thooksPath = {hooks.as_posix()}\n", encoding="utf-8")
-    monkeypatch.setenv("HOME", str(home))
+    (home / ".config" / "git").mkdir(parents=True)
+    repo_url = world.config["repo_url"].replace("\\", "\\\\")
+    planted = f'[url "C:/xtl-nowhere/"]\n\tinsteadOf = {repo_url}\n[push]\n\tfollowTags = true\n'
+    for config in (home / ".gitconfig", home / ".config" / "git" / "config"):
+        config.write_text(planted, encoding="utf-8")
+    for name in ("HOME", "USERPROFILE", "XDG_CONFIG_HOME"):
+        monkeypatch.setenv(name, str(home) if name != "XDG_CONFIG_HOME" else str(home / ".config"))
     res = spec(world, [msg("m1")])
-    check.success(res)
-    assert not marker.exists(), "the user's global git configuration acted on the launcher's push"
+    check.success(res)  # with the planted url.insteadOf read, the push would fail
 
 
 # ---------------------------------------------------------------- LR-71: reading the stream to its end

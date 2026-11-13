@@ -77,5 +77,21 @@ fake `quality.toml` or for the stop's 10-second grace.
   image name, inside the job. **Run the launcher in a session of the executor's user with nothing else of that user
   running** (no browser, no vendor agent): any other new process of that user stops the attempt. Real isolation,
   a separate Windows user per run or a sandbox, is stage B's.
+- Since stage A3 (LR-79 to LR-88): after the model, every git step runs in a new bare repository the launcher makes
+  with a random name, which fetches the branch head's SHA from the clone as data; the checks and the push run there,
+  so no replace ref, graft, `commondir`, hook or setting of the clone acts on them. Every git command uses the hooks
+  folder `git-hooks` beside the launcher, which must be read-only for the executor's user and hold only its
+  `README.md` (copy it with the launcher), and an allow-list environment; the Windows folders come from the system.
+  Processes are listed without opening them; one whose owner cannot be learned is judged by its parent. The search
+  runs once more just before the push, and the preflight refuses to start while another process of the executor's
+  user runs (`PROCESS_AT_START`): **start the launcher with `runas /user:<executor user>` from your own session**, not
+  in a signed-in session of the executor's user, whose shell processes would stop every start. When `claude_image` is
+  not set, it is the file name `claude_command[0]` resolves to; on Windows it must end in `.exe`, otherwise the
+  preflight stops with `CLAUDE_IMAGE`: set `claude_image` then. What remains, besides the limits above: a second
+  Ctrl+C while the stream is read to its end can leave a short count marked complete; a process that takes away its
+  owner's rights is caught only through its parent, so a COM server the model registers that hides itself at once
+  is not; processes inside WSL or a virtual machine are not seen; the launcher and the model share one Windows user,
+  so the new repository and the searches defend by time, not by permissions (real isolation is stage B's); the merge
+  policy on GitHub, not the launcher, is the final guard.
 - The 80 / 240 / 3 limits live in `launcher.toml`; the launcher does not hold the customer's ceilings in its
   code (the dispatcher will, from the approved queue). `timeout_minutes` above 59 is refused (LR-76).

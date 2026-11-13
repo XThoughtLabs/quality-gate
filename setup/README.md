@@ -40,7 +40,8 @@ off and subscribe to no events.
 It discards the client secret and the webhook secret, never prints a key or a secret, and writes no
 temporary copy of a key. A key file is created with its own permissions from its first moment (an explicit
 security descriptor), never with its folder's inherited access; the folder of the reviewer's and the
-controller's keys must give no access to Users, Authenticated Users, Everyone or the executor's user. GitHub's
+controller's keys must give access only to the operator, SYSTEM and Administrators (so not to Users,
+Authenticated Users, Everyone, INTERACTIVE, Local account or the executor's user). GitHub's
 one-time manifest code is exchanged by the script itself over HTTPS, never passed on a command line.
 
 ## Running it

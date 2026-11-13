@@ -446,12 +446,17 @@ class Windows:
 OPEN_TO_ALL = {"S-1-5-32-545": "Users", "S-1-5-11": "Authenticated Users", "S-1-1-0": "Everyone"}
 
 
+FOLDER_TRUSTED = ("S-1-5-18", "S-1-5-32-544")  # S10: SYSTEM and Administrators, besides the operator
+
+
 def check_key_folder(win: Windows, folder: Path, executor_sid: str | None) -> None:
-    """R7: the folder of the reviewer's or the controller's key gives no access to all users or to the executor."""
+    """R7, S10: the folder of the reviewer's or the controller's key gives access only to the operator, SYSTEM and
+    Administrators: never to all users, INTERACTIVE, local accounts or the executor."""
+    operator_sid = win.current_sid()
     _, rules = win.acl_of(folder)
     for sid, _rights, kind, _inherited in rules:
-        if kind == "Allow" and (sid in OPEN_TO_ALL or (executor_sid and sid == executor_sid)):
-            who = OPEN_TO_ALL.get(sid, "the executor's user")
+        if kind == "Allow" and sid != operator_sid and sid not in FOLDER_TRUSTED:
+            who = OPEN_TO_ALL.get(sid, "the executor's user" if executor_sid and sid == executor_sid else sid)
             raise Stop(f"The key's folder {folder} gives access to {who}. Choose a folder only your user can open.")
 
 

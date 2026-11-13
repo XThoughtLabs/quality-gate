@@ -20,6 +20,10 @@ Stage A (LR-51 to LR-66): the launcher reads the model's stream-json output, cou
 by message.id, keeps an append-only ledger of attempts, refuses a task whose budget is used up,
 and stops the model by itself at the attempt's limit, ending its whole process tree (on Windows,
 a job object).
+
+Stages A2 and A3 (LR-67 to LR-88): it searches for processes of its user outside the model's job (listed without
+opening them), and after the model it runs every git step in a new repository of its own, which takes the
+branch's head from the clone as data, with an allow-list environment and a read-only hooks folder.
 """
 
 from __future__ import annotations
@@ -105,7 +109,14 @@ STOP_MESSAGES = {
     "SECOND_MODEL": "A second Claude Code appeared while the model ran. Nothing was pushed.",
     "GIT_CONFIG_CHANGED": "The model changed the clone's git configuration or its .git folder. Nothing was pushed.",
     "TIMEOUT_TOO_LONG": f"quality.toml's timeout_minutes is above {MAX_TIMEOUT_MINUTES}. Nothing was started.",
+    "GIT_REPO_UNSAFE": "The launcher's own repository holds what could change what git shows. Nothing was pushed.",
+    "PROCESS_BEFORE_PUSH": "A process of this user appeared before the push and was ended. Nothing was pushed.",
 }
+HOOKS_README = "README.md"  # LR-80: the only file the launcher's hooks folder may hold
+NO_GRAFTS = "no-grafts"  # LR-80: GIT_GRAFT_FILE names this file in the hooks folder, which never exists
+GIT_SAFE = ("-c", "gc.auto=0", "-c", "maintenance.auto=false")  # LR-80: no git process outlives its command
+POSIX_TRUSTED = ("/usr/", "/bin/", "/sbin/", "/opt/")  # LR-81
+FOLDERID_PROGRAM_FILES = ("{905E63B6-C1BF-494E-B29C-65B732D3D21A}", "{7C5A40EF-A0FB-4BFC-874A-C0F2E0B9FA8E}")
 
 
 class Stop(Exception):
@@ -193,6 +204,70 @@ def can_write(path: str | Path) -> bool:
             return True
     except OSError:
         return False
+
+
+def can_create(folder: str | Path) -> bool:
+    """LR-80, LR-87: whether the current user can create a file in the folder (made and removed at once)."""
+    probe = Path(folder) / f".xtl-probe-{secrets.token_hex(8)}"
+    try:
+        descriptor = os.open(probe, os.O_CREAT | os.O_EXCL | os.O_WRONLY)
+    except OSError:
+        return False
+    os.close(descriptor)
+    with contextlib.suppress(OSError):
+        os.unlink(probe)
+    return True
+
+
+def hooks_folder() -> Path:
+    """LR-80, LR-87: the launcher's own hooks folder, beside xtl_launcher.py; it holds only its README."""
+    return HERE / "git-hooks"
+
+
+def system_folders() -> dict:
+    """LR-81, LR-87: the Windows folders, from the system, never from the environment."""
+    if os.name != "nt":
+        return {"windows": "C:\\Windows", "system32": "C:\\Windows\\System32", "syswow64": "C:\\Windows\\SysWOW64",
+                "program_files": ["C:\\Program Files", "C:\\Program Files (x86)"]}
+    import ctypes
+    from ctypes import wintypes
+
+    k32 = ctypes.WinDLL("kernel32", use_last_error=True)
+
+    def folder(name: str) -> str | None:
+        function = getattr(k32, name)
+        function.argtypes, function.restype = [wintypes.LPWSTR, wintypes.UINT], wintypes.UINT
+        buffer = ctypes.create_unicode_buffer(1024)
+        size = function(buffer, 1024)
+        return buffer.value if 0 < size < 1024 else None
+
+    class Guid(ctypes.Structure):
+        _fields_ = [("Data1", wintypes.DWORD), ("Data2", wintypes.WORD), ("Data3", wintypes.WORD),
+                    ("Data4", ctypes.c_ubyte * 8)]
+
+    shell32, ole32 = ctypes.WinDLL("shell32"), ctypes.WinDLL("ole32")
+    shell32.SHGetKnownFolderPath.argtypes = [ctypes.POINTER(Guid), wintypes.DWORD, wintypes.HANDLE,
+                                             ctypes.POINTER(ctypes.c_wchar_p)]
+    shell32.SHGetKnownFolderPath.restype = ctypes.c_long
+    ole32.CLSIDFromString.argtypes = [wintypes.LPCWSTR, ctypes.POINTER(Guid)]
+    ole32.CoTaskMemFree.argtypes = [ctypes.c_void_p]
+
+    def known(text: str) -> str | None:
+        guid, path = Guid(), ctypes.c_wchar_p()
+        if ole32.CLSIDFromString(text, ctypes.byref(guid)) != 0:
+            return None
+        if shell32.SHGetKnownFolderPath(ctypes.byref(guid), 0, None, ctypes.byref(path)) != 0:
+            return None
+        try:
+            return path.value
+        finally:
+            ole32.CoTaskMemFree(ctypes.cast(path, ctypes.c_void_p))
+
+    windows, system32 = folder("GetSystemWindowsDirectoryW"), folder("GetSystemDirectoryW")
+    if not windows or not system32:
+        raise OSError("the Windows folders cannot be read")
+    return {"windows": windows, "system32": system32, "syswow64": folder("GetSystemWow64DirectoryW"),
+            "program_files": [p for p in (known(g) for g in FOLDERID_PROGRAM_FILES) if p]}
 
 
 def folder_openable(path: str | Path) -> str:
@@ -381,9 +456,36 @@ def _proc():
                     ("dwServiceSpecificExitCode", wintypes.DWORD), ("dwCheckPoint", wintypes.DWORD),
                     ("dwWaitHint", wintypes.DWORD), ("dwProcessId", wintypes.DWORD), ("dwServiceFlags", wintypes.DWORD)]
 
+    class UnicodeString(ctypes.Structure):
+        _fields_ = [("Length", wintypes.USHORT), ("MaximumLength", wintypes.USHORT), ("Buffer", ctypes.c_void_p)]
+
+    class ProcessInfo(ctypes.Structure):  # SYSTEM_PROCESS_INFORMATION, up to SessionId (LR-82)
+        _fields_ = [("NextEntryOffset", wintypes.ULONG), ("NumberOfThreads", wintypes.ULONG),
+                    ("WorkingSetPrivateSize", ctypes.c_int64), ("HardFaultCount", wintypes.ULONG),
+                    ("NumberOfThreadsHighWatermark", wintypes.ULONG), ("CycleTime", ctypes.c_uint64),
+                    ("CreateTime", ctypes.c_int64), ("UserTime", ctypes.c_int64), ("KernelTime", ctypes.c_int64),
+                    ("ImageName", UnicodeString), ("BasePriority", wintypes.LONG),
+                    ("UniqueProcessId", ctypes.c_void_p), ("InheritedFromUniqueProcessId", ctypes.c_void_p),
+                    ("HandleCount", wintypes.ULONG), ("SessionId", wintypes.ULONG)]
+
     k32 = ctypes.WinDLL("kernel32", use_last_error=True)
     adv = ctypes.WinDLL("advapi32", use_last_error=True)
+    nt = ctypes.WinDLL("ntdll")
     signatures = {
+        (nt, "NtQuerySystemInformation"): ([ctypes.c_int, ctypes.c_void_p, wintypes.ULONG, ctypes.POINTER(wintypes.ULONG)],
+                                           ctypes.c_long),
+        (k32, "QueryInformationJobObject"): ([wintypes.HANDLE, ctypes.c_int, wintypes.LPVOID, wintypes.DWORD,
+                                              wintypes.LPVOID], wintypes.BOOL),
+        (adv, "GetSecurityInfo"): ([wintypes.HANDLE, ctypes.c_int, wintypes.DWORD, ctypes.POINTER(ctypes.c_void_p),
+                                    ctypes.c_void_p, ctypes.c_void_p, ctypes.c_void_p, ctypes.POINTER(ctypes.c_void_p)],
+                                   wintypes.DWORD),
+        (adv, "SetSecurityInfo"): ([wintypes.HANDLE, ctypes.c_int, wintypes.DWORD, ctypes.c_void_p, ctypes.c_void_p,
+                                    ctypes.c_void_p, ctypes.c_void_p], wintypes.DWORD),
+        (adv, "ConvertStringSecurityDescriptorToSecurityDescriptorW"): (
+            [wintypes.LPCWSTR, wintypes.DWORD, ctypes.POINTER(ctypes.c_void_p), ctypes.c_void_p], wintypes.BOOL),
+        (adv, "GetSecurityDescriptorDacl"): ([ctypes.c_void_p, ctypes.POINTER(wintypes.BOOL),
+                                              ctypes.POINTER(ctypes.c_void_p), ctypes.POINTER(wintypes.BOOL)],
+                                             wintypes.BOOL),
         (k32, "CreateToolhelp32Snapshot"): ([wintypes.DWORD, wintypes.DWORD], wintypes.HANDLE),
         (k32, "Process32FirstW"): ([wintypes.HANDLE, ctypes.POINTER(Entry)], wintypes.BOOL),
         (k32, "Process32NextW"): ([wintypes.HANDLE, ctypes.POINTER(Entry)], wintypes.BOOL),
@@ -410,7 +512,8 @@ def _proc():
     for (dll, name), (argtypes, restype) in signatures.items():
         function = getattr(dll, name)
         function.argtypes, function.restype = argtypes, restype
-    _PROC.update(ctypes=ctypes, wintypes=wintypes, k32=k32, adv=adv, Entry=Entry, ServiceStatus=ServiceStatus)
+    _PROC.update(ctypes=ctypes, wintypes=wintypes, k32=k32, adv=adv, nt=nt, Entry=Entry, ServiceStatus=ServiceStatus,
+                 ProcessInfo=ProcessInfo)
     return _PROC
 
 
@@ -470,63 +573,131 @@ def now_filetime() -> int:
     return (value.dwHighDateTime << 32) | value.dwLowDateTime
 
 
-def user_processes(job) -> list[dict]:
-    """The processes of the current user, as LR-77 describes them. Never their command lines."""
+def _system_processes() -> dict[int, dict]:
+    """LR-82: every process, from NtQuerySystemInformation(SystemProcessInformation), without opening any."""
     p = _proc()
-    ctypes, wintypes, k32 = p["ctypes"], p["wintypes"], p["k32"]
-    me = _token_sid(k32.GetCurrentProcess())
-    snapshot = k32.CreateToolhelp32Snapshot(0x2, 0)  # TH32CS_SNAPPROCESS
-    if not snapshot or snapshot == wintypes.HANDLE(-1).value:
-        raise _last_error()
-    entries: dict[int, tuple[int, str]] = {}
-    try:
-        entry = p["Entry"]()
-        entry.dwSize = ctypes.sizeof(entry)
-        more = k32.Process32FirstW(snapshot, ctypes.byref(entry))
-        while more:
-            entries[int(entry.th32ProcessID)] = (int(entry.th32ParentProcessID), entry.szExeFile)
-            more = k32.Process32NextW(snapshot, ctypes.byref(entry))
-    finally:
-        k32.CloseHandle(snapshot)
-    schedule = _schedule_pid()
+    ctypes, wintypes = p["ctypes"], p["wintypes"]
+    size = 1 << 20
+    while True:
+        buffer = ctypes.create_string_buffer(size)
+        needed = wintypes.ULONG()
+        status = p["nt"].NtQuerySystemInformation(5, buffer, size, ctypes.byref(needed)) & 0xFFFFFFFF
+        if status == 0xC0000004 and size < (1 << 28):  # STATUS_INFO_LENGTH_MISMATCH: a larger buffer
+            size = max(size * 2, needed.value + (1 << 16))
+            continue
+        if status != 0:
+            raise OSError(f"the process list cannot be read ({status:#x})")
+        break
+    found: dict[int, dict] = {}
+    base, offset = ctypes.addressof(buffer), 0
+    while True:
+        entry = p["ProcessInfo"].from_address(base + offset)
+        name = entry.ImageName
+        image = ctypes.wstring_at(name.Buffer, name.Length // 2) if name.Buffer else ""
+        found[int(entry.UniqueProcessId or 0)] = {"ppid": int(entry.InheritedFromUniqueProcessId or 0), "image": image,
+                                                   "session": int(entry.SessionId), "created": int(entry.CreateTime)}
+        if not entry.NextEntryOffset:
+            return found
+        offset += entry.NextEntryOffset
 
-    def details(pid: int):
-        handle = k32.OpenProcess(0x1000 | 0x0001, False, pid)  # QUERY_LIMITED_INFORMATION | TERMINATE
-        if not handle:
-            handle = k32.OpenProcess(0x1000, False, pid)
-        if not handle:
-            return None
+
+def _job_pids(job) -> set[int]:
+    """LR-82: the ids of the processes in the job, from the job's own list (no process is opened)."""
+    if job is None:
+        return set()
+    p = _proc()
+    ctypes = p["ctypes"]
+    count = 1024
+    while True:
+        class Listing(ctypes.Structure):
+            _fields_ = [("Assigned", ctypes.c_ulong), ("Listed", ctypes.c_ulong), ("Ids", ctypes.c_size_t * count)]
+
+        data = Listing()
+        if p["k32"].QueryInformationJobObject(job, 3, ctypes.byref(data), ctypes.sizeof(data), None):
+            return {int(data.Ids[i]) for i in range(data.Listed)}
+        if ctypes.get_last_error() == 234 and count < (1 << 16):  # ERROR_MORE_DATA
+            count *= 4
+            continue
+        raise ctypes.WinError(ctypes.get_last_error())
+
+
+def _process_facts(pid: int) -> tuple[str | None, str | None]:
+    """LR-82: (owner SID, image path) of a process: the owner from its token, else from its security descriptor
+    read with READ_CONTROL (the owner's own right), else None. The path only when the process can be opened."""
+    p = _proc()
+    ctypes, wintypes, k32, adv = p["ctypes"], p["wintypes"], p["k32"], p["adv"]
+    sid = path = None
+    handle = k32.OpenProcess(0x1000, False, pid)  # PROCESS_QUERY_LIMITED_INFORMATION
+    if handle:
         try:
-            times = [wintypes.FILETIME() for _ in range(4)]
-            created = None
-            if k32.GetProcessTimes(handle, *[ctypes.byref(t) for t in times]):
-                created = (times[0].dwHighDateTime << 32) | times[0].dwLowDateTime
+            sid = _token_sid(handle)
             buffer = ctypes.create_unicode_buffer(1024)
             size = wintypes.DWORD(1024)
-            path = buffer.value if k32.QueryFullProcessImageNameW(handle, 0, buffer, ctypes.byref(size)) else None
-            inside = wintypes.BOOL(False)
-            if job is not None:
-                k32.IsProcessInJob(handle, job, ctypes.byref(inside))
-            return _token_sid(handle), created, path, bool(inside.value)
+            if k32.QueryFullProcessImageNameW(handle, 0, buffer, ctypes.byref(size)):
+                path = buffer.value
         finally:
             k32.CloseHandle(handle)
+    if sid is not None:
+        return sid, path
+    handle = k32.OpenProcess(0x20000, False, pid)  # READ_CONTROL
+    if not handle:
+        return None, path
+    try:
+        owner, descriptor = ctypes.c_void_p(), ctypes.c_void_p()
+        if adv.GetSecurityInfo(handle, 6, 0x1, ctypes.byref(owner), None, None, None, ctypes.byref(descriptor)) != 0:
+            return None, path
+        try:
+            text = wintypes.LPWSTR()
+            if not owner.value or not adv.ConvertSidToStringSidW(owner.value, ctypes.byref(text)):
+                return None, path
+            try:
+                return text.value, path
+            finally:
+                k32.LocalFree(text)
+        finally:
+            k32.LocalFree(descriptor)
+    finally:
+        k32.CloseHandle(handle)
+
+
+def user_processes(job) -> list[dict]:
+    """LR-82, LR-87: the processes of the current user and those of unknown owner. Never their command lines."""
+    p = _proc()
+    me = _token_sid(p["k32"].GetCurrentProcess())
+    table = _system_processes()
+    inside = _job_pids(job)
+    schedule = _schedule_pid()
+    session = table.get(os.getpid(), {}).get("session")
+    facts: dict[int, tuple[str | None, str | None]] = {}
+
+    def fact(pid: int) -> tuple[str | None, str | None]:
+        if pid not in facts:
+            facts[pid] = _process_facts(pid)
+        return facts[pid]
+
+    def whose(sid: str | None) -> str:
+        return "self" if sid == me else "unknown" if sid is None else "other"
 
     found = []
-    for pid, (ppid, image) in entries.items():
+    for pid, entry in table.items():
         if pid in (0, 4):
             continue
-        facts = details(pid)
-        if facts is None or facts[0] != me:
-            continue
-        sid, created, path, inside = facts
-        parent = entries.get(ppid)
-        parent_facts = details(ppid) if parent else None
-        parent_image = parent[1] if parent else None
+        sid, path = fact(pid)
+        if whose(sid) == "other" and pid not in inside:
+            continue  # known to be another user's
+        ppid = entry["ppid"]
+        parent = table.get(ppid)
+        alive = parent is not None and ppid not in (0, pid) and parent["created"] <= entry["created"]
+        parent_sid, parent_path = fact(ppid) if alive else (None, None)
+        parent_image = parent["image"] if alive else None
         broker = ("wmi" if (parent_image or "").lower() == "wmiprvse.exe"
-                  else "schedule" if schedule is not None and ppid == schedule else None)
-        found.append({"pid": pid, "ppid": ppid, "image": image, "path": path, "parent_image": parent_image,
-                      "parent_path": parent_facts[2] if parent_facts else None, "created": created, "in_job": inside,
-                      "broker": broker})
+                  else "schedule" if alive and schedule is not None and ppid == schedule else None)
+        found.append({"pid": pid, "ppid": ppid, "image": entry["image"], "path": path, "parent_image": parent_image,
+                      "parent_path": parent_path, "created": entry["created"], "in_job": pid in inside,
+                      "broker": broker, "owner": "self" if sid == me or pid in inside else "unknown",
+                      "session": entry["session"], "same_session": entry["session"] == session,
+                      "parent_owner": whose(parent_sid) if alive else None, "parent_in_job": ppid in inside,
+                      "parent_alive": alive})
     return found
 
 
@@ -539,10 +710,36 @@ def job_count(job) -> int:
     return int(accounting.ActiveProcesses)
 
 
+def _grant_terminate(pid: int) -> None:
+    """LR-82: give the current user every right on a process it owns but cannot open (WRITE_DAC, the owner's)."""
+    p = _proc()
+    ctypes, wintypes, k32, adv = p["ctypes"], p["wintypes"], p["k32"], p["adv"]
+    me = _token_sid(k32.GetCurrentProcess())
+    handle = k32.OpenProcess(0x40000, False, pid)  # WRITE_DAC
+    if not handle or not me:
+        return
+    try:
+        descriptor = ctypes.c_void_p()
+        if not adv.ConvertStringSecurityDescriptorToSecurityDescriptorW(f"D:(A;;0x1fffff;;;{me})", 1,
+                                                                        ctypes.byref(descriptor), None):
+            return
+        try:
+            present, dacl, defaulted = wintypes.BOOL(), ctypes.c_void_p(), wintypes.BOOL()
+            if adv.GetSecurityDescriptorDacl(descriptor, ctypes.byref(present), ctypes.byref(dacl), ctypes.byref(defaulted)):
+                adv.SetSecurityInfo(handle, 6, 0x4, None, None, dacl, None)  # SE_KERNEL_OBJECT, the DACL
+        finally:
+            k32.LocalFree(descriptor)
+    finally:
+        k32.CloseHandle(handle)
+
+
 def end_process(pid: int) -> bool:
-    """End one process (TerminateProcess). False when it cannot."""
+    """End one process (TerminateProcess). False when it cannot (LR-82: after trying WRITE_DAC)."""
     p = _proc()
     handle = p["k32"].OpenProcess(0x0001, False, pid)  # PROCESS_TERMINATE
+    if not handle:
+        _grant_terminate(pid)
+        handle = p["k32"].OpenProcess(0x0001, False, pid)
     if not handle:
         return False
     try:
@@ -557,16 +754,23 @@ TERMINAL_IMAGE = "openconsole.exe"  # LR-67: Windows Terminal's console host
 
 
 def outside_processes(records: list[dict], since: int, exclude: set) -> list[dict]:
-    """LR-67's filter: the records that are foreign processes outside the job."""
-    root = os.environ.get("SystemRoot", "C:\\Windows").rstrip("\\/").lower()
-    program_files = os.environ.get("ProgramFiles", "C:\\Program Files").rstrip("\\/").lower()
-    allowed_folders = (root + "\\system32\\", root + "\\syswow64\\")
+    """LR-67's filter, with LR-82's rule for a process of unknown owner: the records that are foreign processes."""
+    folders = system_folders()  # LR-81: never from the environment
+    allowed_folders = tuple(str(f).rstrip("\\/").lower() + "\\" for f in (folders["system32"], folders["syswow64"]) if f)
+    terminal_folders = tuple(str(f).rstrip("\\/").lower() + "\\windowsapps\\microsoft.windowsterminal_"
+                             for f in folders["program_files"] if f)
     foreign = []
     for record in records:
         if record.get("in_job") or record.get("pid") in exclude:
             continue
         created = record.get("created")
         if isinstance(created, int) and created < since:  # an unreadable creation time does not excuse it
+            continue
+        if record.get("owner", "self") != "self":  # LR-82: an unknown owner is judged by its parent
+            if (record.get("ppid") in exclude or record.get("parent_in_job") or record.get("parent_owner") == "self"
+                    or not record.get("parent_alive") or record.get("broker") == "wmi"
+                    or (record.get("broker") == "schedule" and record.get("same_session"))):
+                foreign.append(record)
             continue
         if record.get("broker"):
             foreign.append(record)
@@ -575,11 +779,101 @@ def outside_processes(records: list[dict], since: int, exclude: set) -> list[dic
         path = str(record.get("path") or "").lower()
         if image in SESSION_IMAGES_SYSTEM and path.startswith(allowed_folders) and path.endswith("\\" + image):
             continue
-        if (image == TERMINAL_IMAGE and path.startswith(program_files + "\\windowsapps\\microsoft.windowsterminal_")
-                and path.endswith("\\" + image)):
+        if image == TERMINAL_IMAGE and terminal_folders and path.startswith(terminal_folders) and path.endswith("\\" + image):
             continue
         foreign.append(record)
     return foreign
+
+
+def launcher_chain(records: list[dict]) -> set[int]:
+    """LR-84: the launcher's process and its ancestors, by parent id, each created before its child."""
+    by_pid = {r.get("pid"): r for r in records}
+    chain, pid = set(), os.getpid()
+    while pid in by_pid and pid not in chain:
+        chain.add(pid)
+        record, parent = by_pid[pid], by_pid.get(by_pid[pid].get("ppid"))
+        if parent is None or not isinstance(parent.get("created"), int) or not isinstance(record.get("created"), int) \
+                or parent["created"] > record["created"]:
+            break
+        pid = parent.get("pid")
+    return chain
+
+
+def describe_process(record: dict) -> str:
+    """LR-67: a process by its id, its image file name and its creation time; never its command line."""
+    created = record.get("created")
+    when = "unknown"
+    if isinstance(created, int):
+        when = (datetime(1601, 1, 1, tzinfo=timezone.utc) + timedelta(microseconds=created // 10)).strftime(
+            "%Y-%m-%dT%H:%M:%S.%fZ")
+    return f"pid {record.get('pid')}, image {record.get('image')}, created {when}, owner {record.get('owner', 'self')}"
+
+
+def trusted_path() -> str:
+    """LR-81: the inherited PATH's folders inside the Windows folder or a Program Files folder (POSIX: /usr, ...)."""
+    if os.name == "nt":
+        folders = system_folders()
+        roots = tuple(os.path.normcase(os.path.abspath(f)).rstrip("\\/") + os.sep
+                      for f in (folders["windows"], *folders["program_files"]) if f)
+    else:
+        roots = POSIX_TRUSTED
+    kept: list[str] = []
+    for entry in os.environ.get("PATH", "").split(os.pathsep):
+        if not entry.strip():
+            continue
+        full = os.path.normcase(os.path.abspath(entry)).rstrip("\\/") + os.sep
+        if full.startswith(roots) and entry not in kept:
+            kept.append(entry)
+    return os.pathsep.join(kept)
+
+
+def git_env(extra: dict[str, str] | None = None) -> dict[str, str]:
+    """LR-80, LR-81: git's whole environment; nothing else of the launcher's own is passed on."""
+    env = {"PATH": trusted_path(), "GIT_TERMINAL_PROMPT": "0", "GCM_INTERACTIVE": "never", "GIT_CONFIG_NOSYSTEM": "1",
+           "GIT_CONFIG_GLOBAL": os.devnull, "GIT_NO_REPLACE_OBJECTS": "1",
+           "GIT_GRAFT_FILE": str(hooks_folder() / NO_GRAFTS), "GIT_ATTR_NOSYSTEM": "1"}
+    if os.name == "nt":
+        windows = system_folders()["windows"]
+        env.update({"SystemRoot": windows, "WINDIR": windows})
+    env.update(extra or {})
+    return env
+
+
+def git_program() -> str:
+    """LR-81: git, looked up in the trusted PATH alone."""
+    found = shutil.which("git", path=trusted_path())
+    if not found:
+        raise Stop("STEP_FAILED", "git was not found in a trusted folder of PATH.")
+    return found
+
+
+def git_base() -> list[str]:
+    """LR-80: every git command of the launcher starts so."""
+    return [git_program(), "-c", f"core.hooksPath={hooks_folder()}", *GIT_SAFE]
+
+
+def post_repo_problem(git_dir: Path, start: str, replace_refs: str) -> str | None:
+    """LR-80: what in the launcher's own repository could change what git shows; None when nothing."""
+    for name in ("info/grafts", "objects/info/alternates", "objects/info/http-alternates", "commondir"):
+        if (git_dir / name).exists():
+            return name
+    if replace_refs.strip():
+        return "refs/replace/"
+    shallow = git_dir / "shallow"
+    if shallow.exists():
+        try:
+            entries = shallow.read_text(encoding="ascii").split()
+        except (OSError, UnicodeDecodeError):
+            return "shallow"
+        if any(entry != start for entry in entries):
+            return "shallow"
+    return None
+
+
+def default_claude_image(command: str) -> str:
+    """LR-86: the file name shutil.which resolves Claude Code's command to (its plain name when it does not)."""
+    resolved = shutil.which(command)
+    return Path(resolved).name if resolved else Path(command).name
 
 
 # ---------------------------------------------------------------- pure functions named by the contract
@@ -712,7 +1006,7 @@ def load_config(path: Path) -> dict:
     ledger = section.get("ledger_file")  # LR-55
     if not isinstance(ledger, str) or not DRIVE_PATH.fullmatch(ledger):
         raise ConfigError("[launcher] ledger_file must be a full drive path")
-    image = section.get("claude_image", Path(section["claude_command"][0]).name)  # LR-68
+    image = section.get("claude_image", default_claude_image(section["claude_command"][0]))  # LR-68, LR-86
     if not isinstance(image, str) or not re.fullmatch(r"[^\\/:*?\"<>|\r\n]+", image):
         raise ConfigError("[launcher] claude_image must be a file name")
     if not Path(section["key_file"]).is_file():
@@ -1203,15 +1497,10 @@ class ModelRun:
     # -------- processes outside the job (LR-67, LR-68)
 
     def describe(self, record: dict) -> str:
-        created = record.get("created")
-        when = "unknown"
-        if isinstance(created, int):
-            when = (datetime(1601, 1, 1, tzinfo=timezone.utc) + timedelta(microseconds=created // 10)).strftime(
-                "%Y-%m-%dT%H:%M:%S.%fZ")
-        return f"pid {record.get('pid')}, image {record.get('image')}, created {when}"
+        return describe_process(record)
 
     def scan(self) -> None:
-        """LR-67, LR-68 while the model runs."""
+        """LR-67, LR-68 while the model runs, its grace and the wait for its exit included (LR-85)."""
         if os.name != "nt" or self.since is None:
             return
         self.last_scan = time.monotonic()
@@ -1223,13 +1512,15 @@ class ModelRun:
         model_pid = self.process.pid if self.process is not None else None
         for record in records:
             if (str(record.get("image") or "").lower() == self.claude_image and record.get("pid") != model_pid
+                    and (record.get("owner", "self") == "self" or record.get("in_job"))  # LR-82
                     and "SECOND_MODEL" not in self.reasons):
                 self.log.write(f"search: a second Claude Code: {self.describe(record)}")
                 self.complete = False
                 self.want_stop("SECOND_MODEL")
         for record in outside_processes(records, self.since, {os.getpid()}):
-            self.log.write(f"search: a process outside the job: {self.describe(record)}; it is ended")
-            end_process(record["pid"])
+            ended = end_process(record["pid"])
+            self.log.write(f"search: a process outside the job: {self.describe(record)}; "
+                           f"{'it is ended' if ended else 'it could not be ended'}")
             self.want_stop("PROCESS_OUTSIDE_JOB")
 
     def search_after_end(self) -> None:
@@ -1276,7 +1567,8 @@ class ModelRun:
             try:
                 job_add(self.job, self.process)
                 self.in_job = True
-                self.since = now_filetime()
+                # LR-67 from the model's resume; LR-84: from the start check, when it ran, so nothing slips between
+                self.since = self.launcher.watch_from or now_filetime()
                 resume_process(self.process.pid)
             except OSError:
                 self.log.write("model: the job object could not be set up; the suspended process is terminated")
@@ -1332,8 +1624,11 @@ class ModelRun:
             time.sleep(0.1)
 
     def wait_process(self, until: float) -> bool:
-        """Wait for the model's own process until the monotonic time `until`, in short steps (Ctrl+C stays live)."""
+        """Wait for the model's own process until the monotonic time `until`, in short steps (Ctrl+C stays live),
+        searching for processes outside the job at the same interval (LR-85)."""
         while time.monotonic() < until:
+            if time.monotonic() - self.last_scan >= SCAN_SECONDS:
+                self.scan()
             try:
                 self.process.wait(timeout=min(0.5, max(0.0, until - time.monotonic())))
                 return True
@@ -1371,7 +1666,7 @@ class ModelRun:
                 if self.stop_began is None and now >= deadline:
                     self.log.write(f"model: ran past {timeout_seconds // 60} minutes")
                     self.want_stop("TIMEOUT")
-                if self.stop_began is None and now - self.last_scan >= SCAN_SECONDS:
+                if now - self.last_scan >= SCAN_SECONDS:  # LR-85: during the grace too
                     self.scan()
                 if self.reasons and self.stop_began is None:
                     self.begin_stop()
@@ -1390,8 +1685,7 @@ class ModelRun:
                     self.open_stream = False
                 else:
                     self.handle(item)
-            if self.stop_began is None:
-                self.scan()  # the last look while the model's processes may still run
+            self.scan()  # the last look while the model's processes may still run (LR-85: also after a stop)
             if self.reasons and self.stop_began is None:
                 self.begin_stop()
             if self.stop_began is None and not self.wait_process(deadline):
@@ -1439,17 +1733,15 @@ class ModelRun:
 
 
 class Git:
-    def __init__(self, log: Log, repo: Path, hooks: Path) -> None:
+    def __init__(self, log: Log, repo: Path) -> None:
         self.log = log
         self.repo = repo
-        self.hooks = hooks  # LR-70: an empty folder, so that no hook runs
-        self.exe = shutil.which("git") or "git"
 
     def __call__(self, *args: str, what: str = "", env: dict[str, str] | None = None, check: bool = True,
                  code: str = "GIT_FAILED") -> subprocess.CompletedProcess:
         label = what or "git " + " ".join(args[:2])
-        result = run([self.exe, "-c", f"core.hooksPath={self.hooks}", "-C", str(self.repo), *args], self.log, label,
-                     env=env or plain_env())
+        # LR-80, LR-81: the launcher's hooks folder, no lingering git process, the allow-list environment
+        result = run([*git_base(), "-C", str(self.repo), *args], self.log, label, env=env or git_env())
         if check and result.returncode != 0:
             raise Stop(code, f"{label} failed.")
         return result
@@ -1480,7 +1772,9 @@ class Launcher:
         self.token = ""
         self.api = Api(self.api_url, self.log)
         self.ledger = Ledger(Path(config["ledger_file"]), self.log)
-        self.claude_image = str(config.get("claude_image", Path(config["claude_command"][0]).name)).lower()  # LR-68
+        self.claude_image = str(config.get("claude_image", default_claude_image(config["claude_command"][0]))).lower()
+        self.model_since: int | None = None  # LR-83: where LR-67's searches start, as a FILETIME
+        self.watch_from: int | None = None  # LR-84: the start check's reading
         self.task_id = {"task": f"issue-{getattr(args, 'issue', '')}",
                         "spec": f"spec-{getattr(args, 'slug', '')}"}.get(args.command, "")
 
@@ -1519,7 +1813,41 @@ class Launcher:
         for path in (Path(__file__).resolve(), self.config_path):
             if can_write(path):
                 raise Stop("SELF_WRITABLE", f"This user can change {path.name}. Its folder must be read-only for it.")
+        self.check_hooks_folder()
+        if os.name == "nt" and not self.claude_image.endswith(".exe"):  # LR-86
+            raise Stop("CLAUDE_IMAGE", f"Claude Code's image {self.claude_image} is not an .exe file name. "
+                                       "Set claude_image in launcher.toml.")
         self.check_folders()
+        self.check_start_processes()
+
+    def check_hooks_folder(self) -> None:
+        """LR-10 extended by LR-80: the hooks folder is a plain folder that holds only its README, and is read-only."""
+        hooks = hooks_folder()
+        try:
+            plain = not hooks.is_symlink() and not hooks.is_junction() and hooks.is_dir()
+            names = sorted(p.name for p in hooks.iterdir()) if plain else []
+        except OSError:
+            plain, names = False, []
+        if not plain or names != [HOOKS_README] or can_create(hooks):
+            raise Stop("SELF_WRITABLE", f"The launcher's git hooks folder {hooks.name} must be a read-only folder "
+                                        f"that holds only its {HOOKS_README}.")
+
+    def check_start_processes(self) -> None:
+        """LR-84: nothing of this user runs besides the launcher's own chain and Windows' own session processes."""
+        if os.name != "nt":
+            return
+        try:
+            records = user_processes(None)
+        except OSError:
+            raise Stop("PROCESS_AT_START", "The processes of this user could not be listed. Nothing was started.") from None
+        self.watch_from = now_filetime()  # LR-84: from here on, LR-67's searches look at every new process
+        mine = [r for r in records if r.get("owner", "self") == "self"]
+        found = outside_processes(mine, 0, launcher_chain(records))
+        for record in found:
+            self.log.write(f"start check: another process of this user: {describe_process(record)}")
+        if found:
+            raise Stop("PROCESS_AT_START", "Another process of this user is running. Close it, or end it, and start "
+                                           "again. Nothing was started.")
 
     def check_folders(self) -> None:
         for folder in self.config["must_not_open"]:
@@ -1577,14 +1905,11 @@ class Launcher:
         self.repo = self.run_dir / "repo"
         self.trusted = self.run_dir / "trusted"
         self.trusted.mkdir()
-        self.hooks = self.run_dir / "no-hooks"
-        self.hooks.mkdir()
-        self.git = Git(self.log, self.repo, self.hooks)
+        self.git = Git(self.log, self.repo)
         shallow = self.args.command == "spec"
         source = Path(self.repo_url).resolve().as_uri() if shallow and Path(self.repo_url).is_dir() else self.repo_url
         clone = ["clone", "--no-tags", *(["--depth", "1"] if shallow else []), source, str(self.repo)]
-        result = run([shutil.which("git") or "git", "-c", f"core.hooksPath={self.hooks}", *clone], self.log,
-                     "git clone", env=plain_env())
+        result = run([*git_base(), *clone], self.log, "git clone", env=git_env())  # LR-80, LR-81
         if result.returncode != 0:
             raise Stop("CLONE_FAILED", "The repository could not be cloned.")
         config = self.read_quality()
@@ -1610,11 +1935,11 @@ class Launcher:
             raise Stop("PIN_UNKNOWN", "judge.yml does not name quality-gate by exactly one full SHA.")
         self.pin = pins.pop()
         self.gate = self.run_dir / "gate"
-        result = run([shutil.which("git") or "git", "-c", f"core.hooksPath={self.hooks}", "clone", "--no-tags",
-                      self.gate_url, str(self.gate)], self.log, "git clone gate", env=plain_env())
+        result = run([*git_base(), "clone", "--no-tags", self.gate_url, str(self.gate)], self.log, "git clone gate",
+                     env=git_env())
         if result.returncode != 0:
             raise Stop("PIN_UNKNOWN", "quality-gate could not be cloned.")
-        gate_git = Git(self.log, self.gate, self.hooks)
+        gate_git = Git(self.log, self.gate)
         gate_git("checkout", "--detach", self.pin, code="PIN_UNKNOWN")
         if gate_git.out("rev-parse", "HEAD") != self.pin:
             raise Stop("PIN_UNKNOWN", "quality-gate's checkout is not at the pin.")
@@ -1628,8 +1953,8 @@ class Launcher:
             raise Stop("PIN_UNKNOWN", "quality.toml cannot be read on the default branch.") from None
 
     def gate_env(self) -> dict[str, str]:
-        env = plain_env()
-        env.update({"PYTHONPATH": str(self.gate), "GITHUB_REPOSITORY": self.repository, "GITHUB_API_URL": self.api_url})
+        # LR-81: the gate's commands run git too (hide-paths), so they get git's allow-list environment
+        env = git_env({"PYTHONPATH": str(self.gate), "GITHUB_REPOSITORY": self.repository, "GITHUB_API_URL": self.api_url})
         if self.token:
             env["GATE_TOKEN"] = self.token
         return env
@@ -1866,6 +2191,7 @@ class Launcher:
             outcome = "INTERRUPTED"
             raise
         finally:
+            self.model_since = attempt.since  # LR-83
             outcome = self.finish(attempt, outcome)
         if outcome == "TIMEOUT":
             raise Stop("TIMEOUT", f"The model ran past {self.timeout_minutes} minutes and was stopped.")
@@ -1929,32 +2255,47 @@ class Launcher:
             return None
 
     def after_model(self) -> None:
-        config = self.clone_config()  # LR-70: before any git command on the clone
+        config = self.clone_config()  # LR-70: a first check, before git reads anything of the clone
         if config is None or config != self.config_snapshot:
             raise Stop("GIT_CONFIG_CHANGED", STOP_MESSAGES["GIT_CONFIG_CHANGED"])
-        current = self.git("symbolic-ref", "--quiet", "--short", "HEAD", check=False).stdout.decode().strip()
-        ancestor = self.git("merge-base", "--is-ancestor", self.start, "HEAD", check=False).returncode == 0
-        if current != self.branch or not ancestor:
+        post = self.run_dir / f"post-{secrets.token_hex(16)}"  # LR-79: named now, after every process of the model
+        try:
+            post.mkdir()
+        except OSError:
+            raise Stop("GIT_FAILED", "The launcher's own repository could not be made.") from None
+        self.post = post
+        git = self.post_git = Git(self.log, post)
+        git("init", "--bare", "--quiet", "--template=", str(post), what="git init (the launcher's own repository)")
+        head_ref = sha = None
+        for line in git.out("ls-remote", "--symref", str(self.repo), "HEAD", what="git ls-remote (the clone)").splitlines():
+            if line.startswith("ref: ") and line.endswith("\tHEAD"):
+                head_ref = line[5:-5]
+            elif re.fullmatch(r"[0-9a-f]{40}\tHEAD", line):
+                sha = line[:40]
+        if head_ref != f"refs/heads/{self.branch}" or sha is None:  # LR-33
             raise Stop("BRANCH_MOVED", f"The model left the branch {self.branch}. Nothing was pushed.")
-        if self.git.out("status", "--porcelain", "--untracked-files=all"):
-            identity = {"GIT_AUTHOR_NAME": self.bot_name, "GIT_AUTHOR_EMAIL": self.bot_email,
-                        "GIT_COMMITTER_NAME": self.bot_name, "GIT_COMMITTER_EMAIL": self.bot_email}
-            self.git("add", "-A")
-            self.git("-c", f"user.name={self.bot_name}", "-c", f"user.email={self.bot_email}", "commit", "--quiet",
-                     "-m", LEFTOVER_MESSAGE, env={**plain_env(), **identity})
-            self.log.write("leftover changes committed by the launcher")
-        identities = self.git.out("log", "--format=%an%x1f%ae%x1f%cn%x1f%ce", f"{self.start}..HEAD")
+        git("-c", "fetch.fsckObjects=true", "fetch", "--quiet", "--no-tags", "--no-write-fetch-head",
+            "--no-recurse-submodules", "--update-shallow", str(self.repo), sha, what="git fetch (the clone's head)")
+        replaced = git.out("for-each-ref", "--format=%(refname)", "refs/replace/")
+        problem = post_repo_problem(post, self.start, replaced)  # LR-80
+        if problem:
+            self.log.write(f"the launcher's own repository holds {problem}")
+            raise Stop("GIT_REPO_UNSAFE", STOP_MESSAGES["GIT_REPO_UNSAFE"])
+        if git("merge-base", "--is-ancestor", self.start, sha, check=False).returncode != 0:  # LR-33
+            raise Stop("BRANCH_MOVED", f"The model left the branch {self.branch}. Nothing was pushed.")
+        tip = self.leftovers(git, post, sha)  # LR-34
+        identities = git.out("log", "--format=%an%x1f%ae%x1f%cn%x1f%ce", f"{self.start}..{tip}")
         expected = "\x1f".join([self.bot_name, self.bot_email, self.bot_name, self.bot_email])
         if any(line != expected for line in identities.splitlines() if line):
             raise Stop("IDENTITY", "A commit is not authored and committed as the app's bot. Nothing was pushed.")
-        commits = self.git.out("rev-list", "--reverse", f"{self.start}..HEAD").split()
+        commits = git.out("rev-list", "--reverse", f"{self.start}..{tip}").split()
         if not commits:
             raise Stop("NO_CHANGES", "The model made no commit. Nothing was pushed.")
         if self.args.command == "spec":
-            changed = self.git.out("diff", "--name-only", self.start, "HEAD").splitlines()
+            changed = git.out("diff", "--name-only", self.start, tip).splitlines()
             if any(not path.startswith("acceptance/") for path in changed if path):
                 raise Stop("SPEC_OUTSIDE_ACCEPTANCE", "The spec-test author changed a path outside acceptance/. Nothing was pushed.")
-        self.verified = self.git.out("rev-parse", "--verify", "HEAD^{commit}")  # LR-69: the commit the checks saw
+        self.verified = git.out("rev-parse", "--verify", f"{tip}^{{commit}}")  # LR-69: the commit the checks saw
         if not re.fullmatch(r"[0-9a-f]{40}", self.verified) or self.verified != commits[-1]:
             raise Stop("GIT_FAILED", "The verified commit could not be read.")
         self.log.write(f"verified commit {self.verified}")
@@ -1964,11 +2305,49 @@ class Launcher:
                 raise Stop("HEAD_MOVED", "The PR's head moved since the decision. Nothing was pushed.")
         self.commits = commits
 
+    def leftovers(self, git: Git, post: Path, sha: str) -> str:
+        """LR-34 in LR-79's repository: the clone's working tree read as data, committed as the bot when it differs."""
+        (post / "info").mkdir(exist_ok=True)
+        (post / "info" / "exclude").write_text(f"{PROPOSAL_FILE}\n", encoding="utf-8")
+        env = git_env({"GIT_INDEX_FILE": str(post / "launcher-index")})
+        tree_of = ["--git-dir", str(post), "--work-tree", str(self.repo)]
+        git(*tree_of, "read-tree", sha, env=env, what="git read-tree (leftovers)")
+        # A spec run's clone hides the denied paths with a sparse checkout (LR-23): there only new and changed files
+        # are leftovers, never the hidden paths' absence.
+        adding = ["--ignore-removal", "--", ":/"] if self.args.command == "spec" else ["-A"]
+        git(*tree_of, "add", *adding, env=env, what="git add (leftovers)")
+        tree = git(*tree_of, "write-tree", env=env, what="git write-tree (leftovers)").stdout.decode().strip()
+        if tree == git.out("rev-parse", f"{sha}^{{tree}}"):
+            return sha
+        identity = {"GIT_AUTHOR_NAME": self.bot_name, "GIT_AUTHOR_EMAIL": self.bot_email,
+                    "GIT_COMMITTER_NAME": self.bot_name, "GIT_COMMITTER_EMAIL": self.bot_email}
+        commit = git("commit-tree", tree, "-p", sha, "-m", LEFTOVER_MESSAGE, env=git_env(identity),
+                     what="git commit-tree (leftovers)").stdout.decode().strip()
+        self.log.write("leftover changes committed by the launcher")
+        return commit
+
+    def search_before_push(self) -> None:
+        """LR-83: one more search just before the push; a foreign process stops the run."""
+        if os.name != "nt" or self.model_since is None:
+            return
+        try:
+            found = outside_processes(user_processes(None), self.model_since, {os.getpid()})
+        except OSError:
+            self.log.write("search before the push: the user's processes could not be listed")
+            raise Stop("PROCESS_BEFORE_PUSH", STOP_MESSAGES["PROCESS_BEFORE_PUSH"]) from None
+        for record in found:
+            ended = end_process(record["pid"])
+            self.log.write(f"search before the push: a process: {describe_process(record)}; "
+                           f"{'it is ended' if ended else 'it could not be ended'}")
+        if found:
+            raise Stop("PROCESS_BEFORE_PUSH", STOP_MESSAGES["PROCESS_BEFORE_PUSH"])
+
     def push(self) -> None:
-        env = {**plain_env(), **git_auth_env(self.token, self.repo_url)}
-        # LR-69: the verified commit, by its SHA, to the explicit repo_url: never HEAD, never origin.
-        result = self.git("push", self.repo_url, f"{self.verified}:refs/heads/{self.branch}", env=env, check=False,
-                          what="git push")
+        self.search_before_push()  # LR-83
+        env = git_env(git_auth_env(self.token, self.repo_url))
+        # LR-69, LR-79: the verified commit, by its SHA, from the launcher's own repository, to the explicit repo_url.
+        result = self.post_git("push", self.repo_url, f"{self.verified}:refs/heads/{self.branch}", "--no-follow-tags",
+                               "--no-verify", env=env, check=False, what="git push")
         if result.returncode != 0:
             raise Stop("PUSH_FAILED", f"The push of {self.branch} was refused.")
         self.log.write(f"pushed {self.branch}: {' '.join(self.commits)}")

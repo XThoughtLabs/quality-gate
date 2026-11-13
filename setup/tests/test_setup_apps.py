@@ -655,6 +655,17 @@ def test_r7_a_key_folder_open_to_others_is_refused(tmp_path, sid):
     assert "folder" in stop_message(lambda: S.check_key_folder(win, folder, EXECUTOR))
 
 
+@pytest.mark.parametrize("sid", ["S-1-5-4", "S-1-5-113", "S-1-5-21-1111111111-2222222222-3333333333-1013"])
+def test_s10_a_key_folder_open_to_interactive_local_accounts_or_another_user_is_refused(tmp_path, sid):
+    """S10: only the operator, SYSTEM and Administrators may have access (INTERACTIVE and Local account include
+    the executor)."""
+    win = FakeWindows()
+    folder = tmp_path / "keys"
+    folder.mkdir()
+    win.acl[str(folder)] = {"protected": True, "rules": {OPERATOR: S.FULL_CONTROL, sid: READ}}
+    assert "folder" in stop_message(lambda: S.check_key_folder(win, folder, EXECUTOR))
+
+
 def test_r7_a_key_folder_of_the_operator_alone_passes(tmp_path):
     win = FakeWindows()
     folder = tmp_path / "keys"

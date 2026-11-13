@@ -435,6 +435,11 @@ class Seams:
             return [p for p in real(job) if p["pid"] in wanted]
 
         monkeypatch.setattr(module, "user_processes", listed_processes, raising=False)
+        # Stage A3 (LR-80, LR-87): the launcher's hooks folder is read-only for the executor in a real setup; the
+        # tests run as the person's own user, who can write it, so the seam says it cannot. raising=False: the code
+        # before stage A3 has no such seam.
+        self.creatable: set[str] = set()
+        monkeypatch.setattr(module, "can_create", lambda folder: norm(folder) in self.creatable, raising=False)
 
 
 # ---------------------------------------------------------------- observation

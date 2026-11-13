@@ -61,6 +61,7 @@ cmdkey /list | findstr /i github
    New-Item -ItemType Directory <key folder>\launcher
    $from = "<your clone of quality-gate>\launcher"
    Copy-Item "$from\xtl_launcher.py", "$from\LAUNCHER-CONTRACT.md" <key folder>\launcher\
+   Copy-Item "$from\git-hooks" <key folder>\launcher\ -Recurse
    Copy-Item "$from\launcher.example.toml" <key folder>\launcher\launcher.toml
    Copy-Item "<your clone of quality-gate>\locks\review.lock" <key folder>\launcher\
    ```
@@ -88,6 +89,8 @@ py -3.13 -m venv $HOME\xtl-launcher-venv
 The last line must print `PREFLIGHT OK`. If it prints `STOPPED <CODE>`, the message says what to fix.
 
 ## 7. Using it, as `<executor user>`
+
+Open the executor's terminal from your own session with `runas /user:<executor user> powershell`, and close every other program of `<executor user>` first. The launcher refuses to start while another process of that user runs (`PROCESS_AT_START`), so do not run it in a signed-in session of `<executor user>`, whose own shell processes would stop every start.
 
 | What | Command |
 |---|---|
