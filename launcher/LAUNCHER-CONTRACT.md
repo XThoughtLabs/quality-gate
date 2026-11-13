@@ -375,6 +375,7 @@ Where these rules differ from the rules above, these win. LR-51 to LR-66 are new
 - **LR-62 What the log adds (amends LR-49).**
   - LR-49's model fields and its `result` text come from the stream's `result` event.
   - The log also records:
+    - the model's process id, as `model pid <n>`;
     - the effective limit and its parts;
     - the task and its totals;
     - each counted message's ordinal, generated or not, `over_limit` and `subagent`, never its content;
