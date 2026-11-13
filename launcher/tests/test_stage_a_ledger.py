@@ -134,6 +134,19 @@ def test_lr54_a_fix_round_of_another_issue_is_not_charged(world, check):
 
 
 @pytest.mark.lr(54)
+def test_lr54_the_fix_task_is_the_branchs_issue_not_the_prs_number(world, check):
+    """PR 7's branch names issue 12: the round is charged to issue-12, not to issue-7."""
+    world.set_up_fix(comments=False)
+    with W.quiet_audit():
+        W.git("--git-dir", str(world.remote), "update-ref", "refs/heads/ai/12-fix-the-thing", world.facts.pr_head)
+    world.set_up_pr(head__ref="ai/12-fix-the-thing")
+    world.seed_ledger([reserved_record("issue-12", "old-1", 80, role="task"), finished_record("old-1", 240)])
+    res = world.run("fix", "--pr", str(W.PR_NUMBER), steps=[{"op": "commit", "path": "app/thing.py"}, msg("m1")])
+    check.stopped(res, "BUDGET_EXHAUSTED")
+    assert res.model is None
+
+
+@pytest.mark.lr(54)
 @pytest.mark.parametrize("ref", ["ai/thing", "ai/-7-thing", "ai/07-thing", "ai/7"])
 def test_lr54_a_fix_head_without_the_issue_number_is_refused(world, check, ref):
     world.set_up_fix(comments=False)

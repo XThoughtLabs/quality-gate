@@ -7,25 +7,36 @@ Run by the separate standard Windows user that holds the executor's key, never b
     python -I xtl_launcher.py [--config launcher.toml] spec --slug S
     python -I xtl_launcher.py [--config launcher.toml] fix --pr N
 
-The rules it meets are in LAUNCHER-CONTRACT.md beside it, numbered LR-1 to LR-50. In short:
+task, spec and fix also take --max-messages M, which can only lower the attempt's limit.
+
+The rules it meets are in LAUNCHER-CONTRACT.md beside it, numbered LR-1 to LR-66. In short:
 it refuses to run as the CEO's user, as an administrator, or beside a stored GitHub login; it
 mints a one-hour installation token for one repository and revokes it at the end; the model
 works in a fresh clone with no token and no network credential, and only commits; the launcher
 then checks the commits, pushes the branch as the app and opens the PR with the pinned gate's
 own code. It never merges, approves, labels or changes a setting.
+
+Stage A (LR-51 to LR-66): the launcher reads the model's stream-json output, counts its messages
+by message.id, keeps an append-only ledger of attempts, refuses a task whose budget is used up,
+and stops the model by itself at the attempt's limit, ending its whole process tree (on Windows,
+a job object).
 """
 
 from __future__ import annotations
 
 import argparse
 import base64
+import contextlib
 import json
 import os
+import queue
 import re
 import secrets
 import shutil
+import signal
 import subprocess
 import sys
+import threading
 import time
 import tomllib
 import urllib.error
@@ -61,13 +72,32 @@ TOOLS = {
 }
 TOOLS["fix"] = TOOLS["task"]
 ALWAYS_DENIED = ["Bash(git push:*)", "Bash(git remote:*)", "Bash(git config:*)", "Bash(git checkout:*)",
-                 "Bash(git switch:*)", "Bash(gh:*)", "Bash(curl:*)", "WebFetch", "WebSearch"]
+                 "Bash(git switch:*)", "Bash(gh:*)", "Bash(curl:*)", "WebFetch", "WebSearch",
+                 "Agent", "Task"]  # LR-59: no subagents
 FILE_TOOLS = ("Read", "Grep", "Glob", "Edit", "Write")
 PEM_BLOCK = re.compile(r"-----BEGIN [A-Z0-9 ]+-----.*?-----END [A-Z0-9 ]+-----", re.S)
 PEM_LINE = re.compile(r"-----(BEGIN|END) [A-Z0-9 ]*PRIVATE KEY-----")
 GITHUB_TOKEN_SHAPE = re.compile(r"gh[pousr]_[A-Za-z0-9]{20,}|github_pat_[A-Za-z0-9_]{20,}")
 MARKER = re.compile(r"<!-- gate-review sha=([0-9a-f]{40}) verdict=(pass|changes_requested) -->")
 MODEL_FIELDS = ("num_turns", "is_error", "subtype", "total_cost_usd", "duration_ms")
+LIMIT_KEYS = ("max_messages_attempt", "max_messages_task", "max_runs_task")  # LR-53
+GRACE_SECONDS = 10  # LR-58: CTRL_BREAK (or SIGINT), then this long, then the job (or the group) is ended
+END_CHECK_SECONDS = 5  # LR-58: how long the count of live processes is read again
+DRAIN_SECONDS = 5  # LR-57: how long lines written before the model ended are still read after it
+MAX_STREAM_LINE = 32 * 1024 * 1024  # LR-60
+MAX_BAD_LINES = 10  # LR-60
+MAX_MESSAGE_ID = 256  # LR-52
+CUT = 200  # LR-60, LR-62: logged pieces of the stream
+FIX_TASK = re.compile(r"ai/([1-9][0-9]{0,9})-")  # LR-54
+CREATE_SUSPENDED = 0x4
+JOB_KILL_ON_CLOSE = 0x2000  # JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE; no BREAKAWAY_OK, no SILENT_BREAKAWAY_OK
+STOP_MESSAGES = {
+    "MESSAGE_LIMIT": "The model reached its message limit and was stopped. Nothing was pushed.",
+    "STREAM_UNREADABLE": "The model's stream could not be read. Nothing was pushed.",
+    "PROCESS_SURVIVED": "A process of the model survived the stop. Nothing was pushed.",
+    "JOB_SETUP_FAILED": "The model's job object could not be set up. Nothing was started.",
+    "LEDGER_FAILED": "The ledger could not be written. Nothing was pushed.",
+}
 
 
 class Stop(Exception):
@@ -185,6 +215,140 @@ def folder_openable(path: str | Path) -> str:
     return "open"
 
 
+# ---------------------------------------------------------------- seams: the Windows job object (LR-58, LR-64)
+
+_WIN: dict = {}
+
+
+def _win():
+    """kernel32 with the signatures the job object needs, made once. Windows only."""
+    if _WIN:
+        return _WIN
+    import ctypes
+    from ctypes import wintypes
+
+    class Basic(ctypes.Structure):
+        _fields_ = [("PerProcessUserTimeLimit", ctypes.c_int64), ("PerJobUserTimeLimit", ctypes.c_int64),
+                    ("LimitFlags", wintypes.DWORD), ("MinimumWorkingSetSize", ctypes.c_size_t),
+                    ("MaximumWorkingSetSize", ctypes.c_size_t), ("ActiveProcessLimit", wintypes.DWORD),
+                    ("Affinity", ctypes.c_size_t), ("PriorityClass", wintypes.DWORD),
+                    ("SchedulingClass", wintypes.DWORD)]
+
+    class Extended(ctypes.Structure):
+        _fields_ = [("BasicLimitInformation", Basic), ("IoInfo", ctypes.c_uint64 * 6),
+                    ("ProcessMemoryLimit", ctypes.c_size_t), ("JobMemoryLimit", ctypes.c_size_t),
+                    ("PeakProcessMemoryUsed", ctypes.c_size_t), ("PeakJobMemoryUsed", ctypes.c_size_t)]
+
+    class Accounting(ctypes.Structure):
+        _fields_ = [("TotalUserTime", ctypes.c_int64), ("TotalKernelTime", ctypes.c_int64),
+                    ("ThisPeriodTotalUserTime", ctypes.c_int64), ("ThisPeriodTotalKernelTime", ctypes.c_int64),
+                    ("TotalPageFaultCount", wintypes.DWORD), ("TotalProcesses", wintypes.DWORD),
+                    ("ActiveProcesses", wintypes.DWORD), ("TotalTerminatedProcesses", wintypes.DWORD)]
+
+    class ThreadEntry(ctypes.Structure):
+        _fields_ = [("dwSize", wintypes.DWORD), ("cntUsage", wintypes.DWORD), ("th32ThreadID", wintypes.DWORD),
+                    ("th32OwnerProcessID", wintypes.DWORD), ("tpBasePri", wintypes.LONG),
+                    ("tpDeltaPri", wintypes.LONG), ("dwFlags", wintypes.DWORD)]
+
+    k32 = ctypes.WinDLL("kernel32", use_last_error=True)
+    signatures = {
+        "CreateJobObjectW": ([wintypes.LPVOID, wintypes.LPCWSTR], wintypes.HANDLE),
+        "SetInformationJobObject": ([wintypes.HANDLE, ctypes.c_int, wintypes.LPVOID, wintypes.DWORD], wintypes.BOOL),
+        "QueryInformationJobObject": ([wintypes.HANDLE, ctypes.c_int, wintypes.LPVOID, wintypes.DWORD,
+                                       wintypes.LPVOID], wintypes.BOOL),
+        "AssignProcessToJobObject": ([wintypes.HANDLE, wintypes.HANDLE], wintypes.BOOL),
+        "TerminateJobObject": ([wintypes.HANDLE, wintypes.UINT], wintypes.BOOL),
+        "CloseHandle": ([wintypes.HANDLE], wintypes.BOOL),
+        "CreateToolhelp32Snapshot": ([wintypes.DWORD, wintypes.DWORD], wintypes.HANDLE),
+        "Thread32First": ([wintypes.HANDLE, ctypes.POINTER(ThreadEntry)], wintypes.BOOL),
+        "Thread32Next": ([wintypes.HANDLE, ctypes.POINTER(ThreadEntry)], wintypes.BOOL),
+        "OpenThread": ([wintypes.DWORD, wintypes.BOOL, wintypes.DWORD], wintypes.HANDLE),
+        "ResumeThread": ([wintypes.HANDLE], wintypes.DWORD),
+    }
+    for name, (argtypes, restype) in signatures.items():
+        function = getattr(k32, name)
+        function.argtypes, function.restype = argtypes, restype
+    _WIN.update(ctypes=ctypes, k32=k32, Extended=Extended, Accounting=Accounting, ThreadEntry=ThreadEntry,
+                invalid=wintypes.HANDLE(-1).value)
+    return _WIN
+
+
+def _last_error() -> OSError:
+    w = _win()
+    return w["ctypes"].WinError(w["ctypes"].get_last_error())
+
+
+def job_open():
+    """A new job object whose only limit is KILL_ON_JOB_CLOSE: no breakaway of any kind."""
+    w = _win()
+    job = w["k32"].CreateJobObjectW(None, None)
+    if not job:
+        raise _last_error()
+    info = w["Extended"]()
+    info.BasicLimitInformation.LimitFlags = JOB_KILL_ON_CLOSE
+    if not w["k32"].SetInformationJobObject(job, 9, w["ctypes"].byref(info), w["ctypes"].sizeof(info)):
+        error = _last_error()
+        w["k32"].CloseHandle(job)
+        raise error
+    return job
+
+
+def job_add(job, process: subprocess.Popen) -> None:
+    """Put the (suspended) process into the job."""
+    if not _win()["k32"].AssignProcessToJobObject(job, int(process._handle)):
+        raise _last_error()
+
+
+def resume_process(pid: int) -> None:
+    """Resume every thread of a process started with CREATE_SUSPENDED."""
+    w = _win()
+    k32, ctypes = w["k32"], w["ctypes"]
+    snapshot = k32.CreateToolhelp32Snapshot(0x4, 0)  # TH32CS_SNAPTHREAD
+    if not snapshot or snapshot == w["invalid"]:
+        raise _last_error()
+    resumed = 0
+    try:
+        entry = w["ThreadEntry"]()
+        entry.dwSize = ctypes.sizeof(entry)
+        more = k32.Thread32First(snapshot, ctypes.byref(entry))
+        while more:
+            if entry.th32OwnerProcessID == pid:
+                thread = k32.OpenThread(0x2, False, entry.th32ThreadID)  # THREAD_SUSPEND_RESUME
+                if not thread:
+                    raise _last_error()
+                try:
+                    if k32.ResumeThread(thread) == 0xFFFFFFFF:
+                        raise _last_error()
+                    resumed += 1
+                finally:
+                    k32.CloseHandle(thread)
+            more = k32.Thread32Next(snapshot, ctypes.byref(entry))
+    finally:
+        k32.CloseHandle(snapshot)
+    if resumed == 0:
+        raise OSError("no thread of the model's process was found to resume")
+
+
+def job_end(job) -> int:
+    """TerminateJobObject, then the number of the job's processes still alive (read again for a while)."""
+    w = _win()
+    k32, ctypes = w["k32"], w["ctypes"]
+    k32.TerminateJobObject(job, 1)
+    deadline = time.monotonic() + END_CHECK_SECONDS
+    while True:
+        accounting = w["Accounting"]()
+        if not k32.QueryInformationJobObject(job, 1, ctypes.byref(accounting), ctypes.sizeof(accounting), None):
+            return 1  # the count cannot be read: fail closed
+        if accounting.ActiveProcesses == 0 or time.monotonic() >= deadline:
+            return int(accounting.ActiveProcesses)
+        time.sleep(0.1)
+
+
+def job_close(job) -> None:
+    """Close the job's handle; KILL_ON_JOB_CLOSE ends whatever is still in it."""
+    _win()["k32"].CloseHandle(job)
+
+
 # ---------------------------------------------------------------- pure functions named by the contract
 
 
@@ -201,7 +365,7 @@ def branch_slug(title: str) -> str:
 
 
 def claude_path(path: str) -> str:
-    """LR-27: C:\\Users\\Public becomes //c/Users/Public."""
+    """LR-27: C:\\Data\\Keys becomes //c/Data/Keys."""
     text = str(path).replace("\\", "/").rstrip("/")
     if re.fullmatch(r"[A-Za-z]:(/.*)?", text):
         text = text[0].lower() + text[2:]
@@ -308,6 +472,13 @@ def load_config(path: Path) -> dict:
     for key in ("api_url", "repo_url", "gate_url"):
         if key in section and not isinstance(section[key], str):
             raise ConfigError(f"[launcher] {key} must be a string")
+    for key in LIMIT_KEYS:  # LR-53
+        value = section.get(key)
+        if not isinstance(value, int) or isinstance(value, bool) or value < 1:
+            raise ConfigError(f"[launcher] {key} must be a positive integer")
+    ledger = section.get("ledger_file")  # LR-55
+    if not isinstance(ledger, str) or not DRIVE_PATH.fullmatch(ledger):
+        raise ConfigError("[launcher] ledger_file must be a full drive path")
     if not Path(section["key_file"]).is_file():
         raise ConfigError("the key file is missing")
     return section
@@ -379,6 +550,180 @@ class Log:
 
     def close(self) -> None:
         self.handle.close()
+
+
+# ---------------------------------------------------------------- the ledger (LR-55, LR-56)
+
+
+def _is_int(value: object, least: int) -> bool:
+    return isinstance(value, int) and not isinstance(value, bool) and value >= least
+
+
+def _is_text(value: object) -> bool:
+    return isinstance(value, str) and value != ""
+
+
+RECORD_FIELDS = {
+    "attempt_reserved": {
+        "task": _is_text, "attempt": _is_text, "role": lambda v: v in ("task", "fix", "spec"), "time": _is_text,
+        "limit": lambda v: _is_int(v, 1), "max_messages_task": lambda v: _is_int(v, 1),
+        "max_runs_task": lambda v: _is_int(v, 1), "messages_before": lambda v: _is_int(v, 0),
+        "runs_before": lambda v: _is_int(v, 0)},
+    "message": {
+        "attempt": _is_text, "message_id": _is_text, "generated": lambda v: isinstance(v, bool),
+        "ordinal": lambda v: _is_int(v, 1), "time": _is_text, "over_limit": lambda v: isinstance(v, bool),
+        "subagent": lambda v: isinstance(v, bool)},
+    "attempt_finished": {
+        "attempt": _is_text, "messages": lambda v: _is_int(v, 0), "outcome": _is_text,
+        "result": lambda v: v is None or isinstance(v, dict),
+        "exit_code": lambda v: v is None or (isinstance(v, int) and not isinstance(v, bool)), "time": _is_text},
+}
+
+
+class Ledger:
+    """An append-only JSON-lines file of attempts. Every read and append holds `<file>.lock`."""
+
+    def __init__(self, path: Path, log: Log) -> None:
+        self.path = path
+        self.lock_path = Path(str(path) + ".lock")
+        self.log = log
+
+    @contextlib.contextmanager
+    def locked(self):
+        try:
+            self.path.parent.mkdir(parents=True, exist_ok=True)
+            handle = open(self.lock_path, "a+b")
+        except OSError:
+            raise Stop("LEDGER_FAILED", "The ledger's folder or lock file cannot be written.") from None
+        try:
+            try:
+                if os.name == "nt":
+                    import msvcrt
+
+                    os.lseek(handle.fileno(), 0, 0)
+                    msvcrt.locking(handle.fileno(), msvcrt.LK_LOCK, 1)  # tries for about 10 seconds
+                else:
+                    import fcntl
+
+                    deadline = time.monotonic() + 10
+                    while True:
+                        try:
+                            fcntl.flock(handle.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)
+                            break
+                        except OSError:
+                            if time.monotonic() >= deadline:
+                                raise
+                            time.sleep(0.2)
+            except OSError:
+                raise Stop("LEDGER_FAILED", "The ledger is locked by another launcher.") from None
+            try:
+                yield
+            finally:
+                try:
+                    if os.name == "nt":
+                        import msvcrt
+
+                        os.lseek(handle.fileno(), 0, 0)
+                        msvcrt.locking(handle.fileno(), msvcrt.LK_UNLCK, 1)
+                    else:
+                        import fcntl
+
+                        fcntl.flock(handle.fileno(), fcntl.LOCK_UN)
+                except OSError:
+                    pass  # closing the handle releases the lock too
+        finally:
+            handle.close()
+
+    def read(self) -> list[dict]:
+        """Every record, checked; any fault stops the run (the launcher never repairs the ledger)."""
+        try:
+            data = self.path.read_bytes() if self.path.exists() else b""
+        except OSError:
+            raise Stop("LEDGER_FAILED", "The ledger cannot be read.") from None
+        if data and not data.endswith(b"\n"):
+            raise Stop("LEDGER_FAILED", "The ledger's last line is unfinished. The operator must repair it.")
+        records: list[dict] = []
+        reserved: set[str] = set()
+        finished: set[str] = set()
+        for number, line in enumerate(data.split(b"\n")[:-1], start=1):
+            try:
+                record = json.loads(line.decode("utf-8"))
+            except (UnicodeDecodeError, ValueError):
+                record = None
+            kind = record.get("record") if isinstance(record, dict) else None
+            fields = RECORD_FIELDS.get(kind) if isinstance(kind, str) else None
+            if (fields is None or set(record) != {"record", *fields}
+                    or not all(check(record[key]) for key, check in fields.items())):
+                raise Stop("LEDGER_FAILED", f"The ledger's line {number} is not a known record. The operator must repair it.")
+            attempt = record["attempt"]
+            if kind == "attempt_reserved":
+                if attempt in reserved:
+                    raise Stop("LEDGER_FAILED", f"The ledger's line {number} reserves an attempt twice.")
+                reserved.add(attempt)
+            elif attempt not in reserved or attempt in finished:
+                raise Stop("LEDGER_FAILED", f"The ledger's line {number} belongs to no open attempt.")
+            elif kind == "attempt_finished":
+                finished.add(attempt)
+            records.append(record)
+        return records
+
+    @staticmethod
+    def totals(records: list[dict], task: str) -> tuple[int, int]:
+        """LR-56: the task's messages (charged conservatively) and its runs."""
+        attempts = {r["attempt"]: r for r in records if r["record"] == "attempt_reserved" and r["task"] == task}
+        counted = {attempt: 0 for attempt in attempts}
+        finished: dict[str, int] = {}
+        for record in records:
+            if record["attempt"] in attempts:
+                if record["record"] == "message":
+                    counted[record["attempt"]] += 1
+                elif record["record"] == "attempt_finished":
+                    finished[record["attempt"]] = record["messages"]
+        used = 0
+        for attempt, reservation in attempts.items():
+            charge = finished[attempt] if attempt in finished else reservation["limit"]
+            used += max(charge, counted[attempt])
+        return used, len(attempts)
+
+    def check(self, task: str, max_messages: int, max_runs: int) -> tuple[int, int]:
+        with self.locked():
+            used, runs = self.totals(self.read(), task)
+        if used >= max_messages or runs >= max_runs:
+            self.log.write(f"task {task}: {used} of {max_messages} messages and {runs} of {max_runs} runs used")
+            raise Stop("BUDGET_EXHAUSTED", f"The task {task} has used up its messages or its runs. Nothing was started.")
+        return used, runs
+
+    def reserve(self, record: dict, parts: list[int]) -> dict:
+        """Check the task's budget and append its reservation, under one lock (LR-56)."""
+        with self.locked():
+            used, runs = self.totals(self.read(), record["task"])
+            if used >= record["max_messages_task"] or runs >= record["max_runs_task"]:
+                self.log.write(f"task {record['task']}: {used} messages and {runs} runs used")
+                raise Stop("BUDGET_EXHAUSTED",
+                           f"The task {record['task']} has used up its messages or its runs. Nothing was started.")
+            record = {**record, "limit": min([*parts, record["max_messages_task"] - used]),
+                      "messages_before": used, "runs_before": runs, "time": utc_now()}
+            self._append(record)
+        return record
+
+    def append(self, record: dict) -> None:
+        with self.locked():
+            self._append(record)
+
+    def _append(self, record: dict) -> None:
+        line = json.dumps(record, sort_keys=True, separators=(",", ":"), ensure_ascii=True) + "\n"
+        try:
+            with open(self.path, "a+b") as handle:
+                handle.seek(0, os.SEEK_END)
+                if handle.tell() > 0:
+                    handle.seek(-1, os.SEEK_END)
+                    if handle.read(1) != b"\n":
+                        raise Stop("LEDGER_FAILED", "The ledger's last line is unfinished. The operator must repair it.")
+                handle.write(line.encode("ascii"))
+                handle.flush()
+                os.fsync(handle.fileno())
+        except OSError:
+            raise Stop("LEDGER_FAILED", "The ledger cannot be written.") from None
 
 
 # ---------------------------------------------------------------- GitHub, through the API
@@ -465,15 +810,288 @@ def model_env(role: str, venv: Path | None) -> dict[str, str]:
     return env
 
 
-def kill_tree(process: subprocess.Popen) -> None:
-    if os.name == "nt":
-        subprocess.run([_system32("taskkill.exe"), "/T", "/F", "/PID", str(process.pid)], capture_output=True, check=False)
-    else:
-        process.kill()
+END_OF_STREAM, LINE_TOO_LONG, READ_FAILED = "end", "too-long", "read-failed"
+
+
+def read_stream(stream, lines: queue.Queue) -> None:
+    """The reader thread: one item per line of the model's output, then one of the three end markers."""
     try:
-        process.wait(timeout=30)
-    except subprocess.TimeoutExpired:
+        while True:
+            chunk = stream.readline(MAX_STREAM_LINE + 2)
+            if not chunk:
+                lines.put(END_OF_STREAM)
+                return
+            if len(chunk[:-1] if chunk.endswith(b"\n") else chunk) > MAX_STREAM_LINE:
+                lines.put(LINE_TOO_LONG)
+                return
+            lines.put(chunk)
+    except (OSError, ValueError):
+        lines.put(READ_FAILED)
+
+
+def write_prompt(stream, prompt: bytes) -> None:
+    """The writer thread: the prompt to the model's standard input, which is then closed."""
+    try:
+        stream.write(prompt)
+        stream.flush()
+    except (OSError, ValueError):
         pass
+    finally:
+        with contextlib.suppress(OSError, ValueError):
+            stream.close()
+
+
+class ModelRun:
+    """One attempt of the model (LR-51 to LR-62): start it in its job, read and count its stream, stop it."""
+
+    def __init__(self, launcher: "Launcher", argv: list[str], env: dict[str, str], prompt: bytes, limit: int,
+                 attempt: str) -> None:
+        self.launcher, self.log, self.ledger = launcher, launcher.log, launcher.ledger
+        self.argv, self.env, self.prompt, self.limit, self.attempt = argv, env, prompt, limit, attempt
+        self.count = 0
+        self.over = 0
+        self.seen: set[str] = set()
+        self.nth_id: str | None = None
+        self.reached = False
+        self.pending: set[str] = set()
+        self.results: set[str] = set()
+        self.bad_lines = 0
+        self.result: dict | None = None
+        self.reasons: list[str] = []
+        self.exit_code: int | None = None
+        self.process: subprocess.Popen | None = None
+        self.job = None
+        self.stop_began: float | None = None
+
+    # -------- the stream (LR-52, LR-57, LR-60)
+
+    def want_stop(self, code: str) -> None:
+        if code not in self.reasons:
+            self.reasons.append(code)
+
+    def handle(self, raw: bytes) -> None:
+        line = raw.rstrip(b"\r\n")
+        if not line.strip():
+            return
+        try:
+            event = json.loads(line.decode("utf-8"))
+        except (UnicodeDecodeError, ValueError):
+            event = None
+        if not isinstance(event, dict):
+            self.bad_lines += 1
+            text = scrub(line.decode("utf-8", "replace"), self.log.secrets)[:CUT]
+            self.log.write(f"model stream: a line that is not a JSON object: {text}")
+            if self.bad_lines > MAX_BAD_LINES:
+                self.log.write(f"model stream: more than {MAX_BAD_LINES} lines that are not JSON objects")
+                self.want_stop("STREAM_UNREADABLE")
+            return
+        kind = event.get("type")
+        message = event.get("message") if isinstance(event.get("message"), dict) else {}
+        content = message.get("content") if isinstance(message.get("content"), list) else []
+        if kind == "assistant":
+            self.assistant(event, message, content)
+        elif kind == "user":
+            for item in content:
+                if isinstance(item, dict) and item.get("type") == "tool_result" and isinstance(item.get("tool_use_id"), str):
+                    self.results.add(item["tool_use_id"])
+            self.check_limit()
+        elif kind == "result":
+            self.result = event
+        elif kind == "system" and event.get("subtype") == "api_retry":
+            error = scrub(str(event.get("error")), self.log.secrets)[:CUT]
+            self.log.write(f"model stream: api_retry, error {error}")
+
+    def assistant(self, event: dict, message: dict, content: list) -> None:
+        mid = message.get("id")
+        usable = isinstance(mid, str) and 0 < len(mid) <= MAX_MESSAGE_ID
+        tools = {item["id"] for item in content
+                 if isinstance(item, dict) and item.get("type") == "tool_use" and isinstance(item.get("id"), str)}
+        if usable and mid in self.seen:  # a fragment of a message already counted
+            if self.reached and mid == self.nth_id:
+                self.pending |= tools
+                self.check_limit()
+            return
+        self.count += 1
+        if usable:
+            self.seen.add(mid)
+        over = self.count > self.limit
+        subagent = event.get("parent_tool_use_id") is not None
+        self.over += over
+        record = {"record": "message", "attempt": self.attempt, "message_id": mid if usable else f"gen-{self.count}",
+                  "generated": not usable, "ordinal": self.count, "time": utc_now(), "over_limit": over,
+                  "subagent": subagent}
+        try:
+            self.ledger.append(record)
+        except Stop:
+            self.log.write("ledger: a message record could not be written")
+            self.want_stop("LEDGER_FAILED")
+        self.log.write(f"model message {self.count}: {'generated id' if not usable else 'id'}, "
+                       f"over_limit {over}, subagent {subagent}")
+        if self.count == self.limit:
+            self.reached, self.nth_id, self.pending = True, (mid if usable else None), set(tools)
+            self.check_limit()
+        elif over:
+            self.want_stop("MESSAGE_LIMIT")
+
+    def check_limit(self) -> None:
+        """LR-57: after the L-th message, stop once each of its tool uses has its result."""
+        if self.reached and "MESSAGE_LIMIT" not in self.reasons and self.pending <= self.results:
+            self.log.write(f"model reached its limit of {self.limit} messages")
+            self.want_stop("MESSAGE_LIMIT")
+
+    # -------- processes (LR-58)
+
+    def start(self) -> bool:
+        """Start the model in its job. False when the job could not be set up (JOB_SETUP_FAILED)."""
+        windows = os.name == "nt"
+        if windows:
+            try:
+                self.job = job_open()
+            except OSError:
+                self.log.write("model: the job object could not be created")
+                return False
+        flags = (subprocess.CREATE_NEW_PROCESS_GROUP | CREATE_SUSPENDED) if windows else 0
+        try:
+            self.process = subprocess.Popen(self.argv, cwd=self.launcher.repo, env=self.env, stdin=subprocess.PIPE,
+                                            stdout=subprocess.PIPE, stderr=subprocess.DEVNULL, creationflags=flags,
+                                            start_new_session=not windows)
+        except OSError:
+            raise Stop("MODEL_FAILED", "The model could not start.") from None
+        self.log.write(f"model pid {self.process.pid}")
+        if windows:
+            try:
+                job_add(self.job, self.process)
+                resume_process(self.process.pid)
+            except OSError:
+                self.log.write("model: the job object could not be set up; the suspended process is terminated")
+                with contextlib.suppress(OSError):
+                    self.process.kill()
+                with contextlib.suppress(subprocess.TimeoutExpired):
+                    self.process.wait(timeout=30)
+                self.exit_code = self.process.returncode
+                return False
+        return True
+
+    def begin_stop(self) -> None:
+        self.stop_began = time.monotonic()
+        self.log.write(f"stop: {', '.join(self.reasons)}; a break to the model's process group")
+        try:
+            if os.name == "nt":
+                self.process.send_signal(signal.CTRL_BREAK_EVENT)
+            else:
+                os.killpg(self.process.pid, signal.SIGINT)
+        except (OSError, ValueError):
+            self.log.write("stop: the break could not be sent")
+
+    def end_all(self) -> int:
+        """End every process of the model: the job (Windows) or the group (POSIX). Returns the survivors."""
+        if os.name == "nt":
+            return job_end(self.job)
+        with contextlib.suppress(ProcessLookupError, PermissionError):
+            os.killpg(self.process.pid, signal.SIGKILL)
+        deadline = time.monotonic() + END_CHECK_SECONDS
+        while True:
+            self.process.poll()
+            try:
+                os.killpg(self.process.pid, 0)
+            except ProcessLookupError:
+                return 0
+            except PermissionError:
+                pass
+            if time.monotonic() >= deadline:
+                return 1
+            time.sleep(0.1)
+
+    def wait_process(self, until: float) -> bool:
+        """Wait for the model's own process until the monotonic time `until`, in short steps (Ctrl+C stays live)."""
+        while time.monotonic() < until:
+            try:
+                self.process.wait(timeout=min(0.5, max(0.0, until - time.monotonic())))
+                return True
+            except subprocess.TimeoutExpired:
+                continue
+        return self.process.poll() is not None
+
+    def run(self, timeout_seconds: int) -> str:
+        """Run the attempt to its end and return its outcome (LR-62)."""
+        lines: queue.Queue = queue.Queue()
+        ended = False
+        try:
+            if not self.start():
+                return "JOB_SETUP_FAILED"
+            deadline = time.monotonic() + timeout_seconds
+            threading.Thread(target=write_prompt, args=(self.process.stdin, self.prompt), daemon=True).start()
+            threading.Thread(target=read_stream, args=(self.process.stdout, lines), daemon=True).start()
+            open_stream = True
+            while open_stream:
+                now = time.monotonic()
+                if self.stop_began is None and now >= deadline:
+                    self.log.write(f"model: ran past {timeout_seconds // 60} minutes")
+                    self.want_stop("TIMEOUT")
+                if self.reasons and self.stop_began is None:
+                    self.begin_stop()
+                until = deadline if self.stop_began is None else self.stop_began + GRACE_SECONDS
+                if self.stop_began is not None and now >= until:
+                    break
+                try:
+                    item = lines.get(timeout=min(0.5, max(0.01, until - now)))
+                except queue.Empty:
+                    continue
+                if item in (LINE_TOO_LONG, READ_FAILED):
+                    self.log.write(f"model stream: {'a line longer than 32 MiB' if item == LINE_TOO_LONG else 'the output could not be read'}")
+                    self.want_stop("STREAM_UNREADABLE")
+                    open_stream = False
+                elif item == END_OF_STREAM:
+                    open_stream = False
+                else:
+                    self.handle(item)
+            if self.reasons and self.stop_began is None:
+                self.begin_stop()
+            if self.stop_began is None and not self.wait_process(deadline):
+                self.log.write(f"model: ran past {timeout_seconds // 60} minutes")
+                self.want_stop("TIMEOUT")
+                self.begin_stop()
+            if self.stop_began is not None:
+                self.wait_process(self.stop_began + GRACE_SECONDS)
+            survivors = self.end_all()
+            ended = True
+            if survivors:
+                self.log.write(f"model: {survivors} processes survived the end of its job or group")
+                self.reasons.insert(0, "PROCESS_SURVIVED")
+            with contextlib.suppress(subprocess.TimeoutExpired):
+                self.process.wait(timeout=30)
+            self.exit_code = self.process.returncode
+            drain_until = time.monotonic() + DRAIN_SECONDS
+            while open_stream and time.monotonic() < drain_until:
+                try:
+                    item = lines.get(timeout=0.2)
+                except queue.Empty:
+                    continue
+                if item in (END_OF_STREAM, LINE_TOO_LONG, READ_FAILED):
+                    open_stream = False
+                else:
+                    self.handle(item)
+        finally:
+            if self.process is not None and not ended:
+                with contextlib.suppress(Exception):
+                    self.end_all()
+            if self.job is not None:
+                job_close(self.job)
+        return self.outcome()
+
+    def outcome(self) -> str:
+        for code in ("PROCESS_SURVIVED", "LEDGER_FAILED"):
+            if code in self.reasons:
+                return code
+        if self.count >= self.limit:
+            return "MESSAGE_LIMIT"
+        if self.reasons:  # TIMEOUT or STREAM_UNREADABLE, whichever came first
+            return self.reasons[0]
+        if self.exit_code != 0:
+            return "MODEL_FAILED"
+        if self.result is None:
+            return "STREAM_UNREADABLE"
+        return "DONE"
 
 
 class Git:
@@ -515,6 +1133,9 @@ class Launcher:
         self.log = Log(self.runs_dir / "logs" / f"{self.run_id}.log")
         self.token = ""
         self.api = Api(self.api_url, self.log)
+        self.ledger = Ledger(Path(config["ledger_file"]), self.log)
+        self.task_id = {"task": f"issue-{getattr(args, 'issue', '')}",
+                        "spec": f"spec-{getattr(args, 'slug', '')}"}.get(args.command, "")
 
     # -------- preflight (LR-3 to LR-11)
 
@@ -742,6 +1363,10 @@ class Launcher:
         self.branch = str(head.get("ref"))
         if not re.fullmatch(r"[0-9a-f]{40}", self.head_sha) or not re.fullmatch(r"[A-Za-z0-9._/-]+", self.branch):
             raise Stop("NOT_A_FIX_TARGET", "The PR's head is malformed.")
+        task = FIX_TASK.match(self.branch)  # LR-54: a fix round is a retry of its issue's task
+        if not task:
+            raise Stop("NOT_A_FIX_TARGET", "The PR's branch does not name its issue as ai/<N>-...")
+        self.task_id = f"issue-{task.group(1)}"
         self.note = self.decide(pr_number)
         self.git("fetch", "--no-tags", "origin", f"+refs/heads/{self.branch}:refs/remotes/origin/{self.branch}")
         self.git("checkout", "-B", self.branch, f"origin/{self.branch}")
@@ -853,6 +1478,8 @@ class Launcher:
             base = claude_path(path)
             for target in (base, base + "/**"):
                 deny += [f"{tool}({target})" for tool in FILE_TOOLS]
+        for path in (self.ledger.path, self.ledger.lock_path):  # LR-55
+            deny += [f"{tool}({claude_path(str(path))})" for tool in FILE_TOOLS]
         deny += ALWAYS_DENIED
         if self.args.command == "spec":
             deny += list((self.spec_settings.get("permissions") or {}).get("deny") or [])
@@ -869,40 +1496,71 @@ class Launcher:
                               note=getattr(self, "note", None))
         settings_path = self.run_dir / "claude-settings.json"
         settings_path.write_text(json.dumps(self.settings(), indent=2), encoding="utf-8")
-        argv = [*self.config["claude_command"], "-p", "--max-turns", str(self.max_turns), "--allowedTools",
-                ",".join(TOOLS[role]), "--settings", str(settings_path), "--output-format", "json"]
         self.check_folders()
-        self.log.write(f"model starts: max_turns {self.max_turns}, timeout {self.timeout_minutes} min")
-        flags = subprocess.CREATE_NEW_PROCESS_GROUP if os.name == "nt" else 0
+        reservation = self.reserve(role)
+        limit = reservation["limit"]
+        argv = [*self.config["claude_command"], "-p", "--max-turns", str(limit), "--allowedTools",
+                ",".join(TOOLS[role]), "--settings", str(settings_path), "--output-format", "stream-json", "--verbose"]
+        self.log.write(f"model starts: limit {limit}, timeout {self.timeout_minutes} min")
+        attempt = ModelRun(self, argv, model_env(role, venv), prompt.encode("utf-8"), limit, self.run_id)
+        outcome = "ERROR"
         try:
-            process = subprocess.Popen(argv, cwd=self.repo, env=model_env(role, venv), stdin=subprocess.PIPE,
-                                       stdout=subprocess.PIPE, stderr=subprocess.PIPE, creationflags=flags,
-                                       start_new_session=os.name != "nt")
-        except OSError:
-            raise Stop("MODEL_FAILED", "The model could not start.") from None
-        try:
-            stdout, _ = process.communicate(prompt.encode("utf-8"), timeout=self.timeout_minutes * 60)
-        except subprocess.TimeoutExpired:
-            kill_tree(process)
-            self.log.write("model: timed out and killed")
-            raise Stop("TIMEOUT", f"The model ran past {self.timeout_minutes} minutes and was stopped.") from None
-        self.log.write(f"model: exit {process.returncode}")
-        self.record_model_output(stdout)
-        if process.returncode != 0:
-            raise Stop("MODEL_FAILED", f"The model exited with {process.returncode}.")
+            outcome = attempt.run(self.timeout_minutes * 60)
+        except Stop as stop:
+            outcome = stop.code
+            raise
+        except KeyboardInterrupt:
+            outcome = "INTERRUPTED"
+            raise
+        finally:
+            outcome = self.finish(attempt, outcome)
+        if outcome == "TIMEOUT":
+            raise Stop("TIMEOUT", f"The model ran past {self.timeout_minutes} minutes and was stopped.")
+        if outcome == "MODEL_FAILED":
+            raise Stop("MODEL_FAILED", f"The model exited with {attempt.exit_code}.")
+        if outcome != "DONE":
+            raise Stop(outcome, STOP_MESSAGES.get(outcome, outcome))
 
-    def record_model_output(self, stdout: bytes) -> None:
+    def reserve(self, role: str) -> dict:
+        """LR-53, LR-56: the effective limit, and the attempt reserved in the ledger before the model starts."""
+        parts = [self.config["max_messages_attempt"], self.max_turns]
+        cli = getattr(self.args, "max_messages", None)
+        if cli is not None:
+            parts.append(cli)
+        record = {"record": "attempt_reserved", "task": self.task_id, "attempt": self.run_id, "role": role,
+                  "time": "", "limit": 0, "max_messages_task": self.config["max_messages_task"],
+                  "max_runs_task": self.config["max_runs_task"], "messages_before": 0, "runs_before": 0}
+        reservation = self.ledger.reserve(record, parts)
+        self.log.write(f"task {self.task_id}: {reservation['messages_before']} messages and "
+                       f"{reservation['runs_before']} runs before this attempt (of {reservation['max_messages_task']} "
+                       f"and {reservation['max_runs_task']})")
+        self.log.write(f"model limit {reservation['limit']}: max_messages_attempt {parts[0]}, quality.toml max_turns "
+                       f"{parts[1]}, --max-messages {cli if cli is not None else 'not given'}, task left "
+                       f"{reservation['max_messages_task'] - reservation['messages_before']}")
+        return reservation
+
+    def finish(self, attempt: "ModelRun", outcome: str) -> str:
+        """LR-55: attempt_finished, and LR-49/LR-62's lines from the result event."""
+        self.log.write(f"model: exit {attempt.exit_code}, outcome {outcome}, {attempt.count} messages, "
+                       f"{attempt.over} over the limit")
+        result = None
+        if attempt.result is not None:
+            result = {}
+            for field in MODEL_FIELDS:
+                value = attempt.result.get(field)
+                result[field] = scrub(value, self.log.secrets)[:CUT] if isinstance(value, str) else value
+                self.log.write(f"model {field}: {result[field]}")
+            self.log.write("model result: " + scrub(str(attempt.result.get("result") or ""), self.log.secrets)[:2000])
+        else:
+            self.log.write("model stream: no result event")
+        record = {"record": "attempt_finished", "attempt": self.run_id, "messages": attempt.count, "outcome": outcome,
+                  "result": result, "exit_code": attempt.exit_code, "time": utc_now()}
         try:
-            data = json.loads(stdout.decode("utf-8", "replace"))
-        except ValueError:
-            self.log.write("model output: not JSON")
-            return
-        if not isinstance(data, dict):
-            self.log.write("model output: not a JSON object")
-            return
-        for field in MODEL_FIELDS:
-            self.log.write(f"model {field}: {data.get(field)}")
-        self.log.write("model result: " + scrub(str(data.get("result") or ""), self.log.secrets)[:2000])
+            self.ledger.append(record)
+        except Stop:
+            self.log.write("ledger: attempt_finished could not be written; the attempt stays charged at its limit")
+            return "LEDGER_FAILED" if outcome == "DONE" else outcome
+        return outcome
 
     # -------- after the model (LR-33 to LR-41)
 
@@ -961,6 +1619,8 @@ class Launcher:
                               what="gate.publish post-proposal")
 
     def work(self) -> None:
+        if self.task_id:  # LR-56: task and spec know their task now, before any network use
+            self.ledger.check(self.task_id, self.config["max_messages_task"], self.config["max_runs_task"])
         self.prepare()
         self.mint_token()
         self.set_identity()
@@ -992,9 +1652,10 @@ def parse(argv: list[str] | None) -> argparse.Namespace:
     parser.add_argument("--config", default=str(DEFAULT_CONFIG))
     commands = parser.add_subparsers(dest="command", required=True)
     commands.add_parser("check")
-    commands.add_parser("task").add_argument("--issue", type=positive, required=True)
-    commands.add_parser("spec").add_argument("--slug", type=slug, required=True)
-    commands.add_parser("fix").add_argument("--pr", type=positive, required=True)
+    for name, flag, kind in (("task", "--issue", positive), ("spec", "--slug", slug), ("fix", "--pr", positive)):
+        command = commands.add_parser(name)
+        command.add_argument(flag, type=kind, required=True)
+        command.add_argument("--max-messages", type=positive, default=None)  # LR-53: can only lower the limit
     return parser.parse_args(argv)
 
 
@@ -1002,7 +1663,8 @@ def main(argv: list[str] | None = None) -> int:
     try:
         args = parse(argv)
     except SystemExit:
-        print("CONFIG: usage: xtl_launcher [--config FILE] check | task --issue N | spec --slug S | fix --pr N", flush=True)
+        print("CONFIG: usage: xtl_launcher [--config FILE] check | task --issue N | spec --slug S | fix --pr N"
+              " [--max-messages M]", flush=True)
         return 2
     try:
         config_path = Path(args.config)

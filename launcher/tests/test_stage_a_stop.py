@@ -91,6 +91,19 @@ def test_lr57_a_model_that_never_stops_by_itself(world, check):
 
 
 @pytest.mark.lr(57)
+def test_lr57_a_message_beyond_the_limit_stops_while_results_are_awaited(world, check, tmp_path):
+    """The L-th message's tool result never comes, but another message does: the stop begins at once."""
+    late = tmp_path / "late"
+    steps = [msg("a1"), msg("a2", tools=["t2"]), msg("a3"), {"op": "pause", "seconds": 8},
+             {"op": "marker", "file": str(late)}, STAY]
+    res = spec(world, steps, "--max-messages", "2")
+    check.post_model_stop(res, "MESSAGE_LIMIT")
+    assert not late.exists(), "the stop waited for a result although a message beyond the limit came"
+    _, messages, finished = one_attempt(world, res)
+    assert finished["messages"] == 3 and over_flags(messages) == [False, False, True]
+
+
+@pytest.mark.lr(57)
 def test_lr57_reaching_the_limit_is_message_limit_however_the_model_ends(world, check):
     res = spec(world, [msg("a1"), msg("a2")], "--max-messages", "2")
     check.post_model_stop(res, "MESSAGE_LIMIT")
@@ -192,6 +205,7 @@ def test_lr58_the_model_is_suspended_until_it_is_in_the_job(world, check, launch
     real_add = launcher.job_add
 
     def watching_add(job, process):
+        time.sleep(2.0)  # a model that was not suspended would have written its record by now
         seen["model_ran_before_assign"] = world.model_out.exists()
         seen["calls"] = seen.get("calls", 0) + 1
         return real_add(job, process)
