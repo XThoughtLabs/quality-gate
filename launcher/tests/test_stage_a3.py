@@ -451,6 +451,20 @@ def test_lr85_a_process_started_during_the_grace_is_caught_in_the_grace(world, c
 
 @pytest.mark.lr(85)
 @windows_only
+def test_lr85_a_short_process_that_lives_only_inside_the_grace_is_caught(world, check, tmp_path):
+    """A PING of about 3 seconds, started during the 10-second grace, has ended before the grace does: only a search
+    inside the grace sees it (mutant P41)."""
+    pids_file = tmp_path / "grace-short.pids"
+    res = spec(world, [{"op": "ignore_break"}, {"op": "burst", "count": 3, "prefix": "b"},
+                       {"op": "pause", "seconds": 1}, {"op": "wmi_spawn", "pids": str(pids_file), "count": 4},
+                       {"op": "pause", "seconds": 30}], "--max-messages", "2")
+    pid = int(pids_file.read_text(encoding="utf-8").split()[0])
+    check.post_model_stop(res, "PROCESS_OUTSIDE_JOB")
+    assert str(pid) in res.log_text
+
+
+@pytest.mark.lr(85)
+@windows_only
 def test_lr85_a_process_started_after_the_stream_ends_is_caught_in_the_wait(world, check, tmp_path):
     # The base interpreter: a virtual environment's launcher would keep a copy of the output open, so the stream
     # would not end before the model's process does.

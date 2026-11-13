@@ -53,9 +53,9 @@ last (with `num_turns`), unless a step says otherwise. Stream steps:
 
 Stage A2 (LR-67 to LR-72):
 
-  {"op": "wmi_spawn", "pids": F}                    have WMI (Win32_Process.Create) start a PING that
-                     runs 30 s: not a descendant, so outside the job; its pid
-                     goes to F and to the list in FAKE_CLAUDE_FOREIGN
+  {"op": "wmi_spawn", "pids": F, "count": N}        have WMI (Win32_Process.Create) start a PING that
+                     runs about N s (30 by default): not a descendant, so outside the job;
+                     its pid goes to F and to the list in FAKE_CLAUDE_FOREIGN
   {"op": "spawn_listed", "argv": [...], "pids": F}  start a child (in the job) and list its pid the same way
   {"op": "gitfile"}                                 move .git aside and leave a .git file pointing to it
   {"op": "deep_assistant", "depth": N}              an assistant event whose tool input is nested N deep
@@ -168,10 +168,10 @@ def list_foreign(pid, pids_path=None):
                 fh.write(f"{pid}\n")
 
 
-def wmi_spawn(pids_path):
+def wmi_spawn(pids_path, count=30):
     command = "(Invoke-CimMethod -ClassName Win32_Process -MethodName Create -Arguments @{CommandLine=$env:XTL_CMD}).ProcessId"
     env = dict(os.environ, XTL_CMD=os.path.join(os.environ.get("SystemRoot", "C:\\Windows"), "System32",
-                                                "PING.EXE") + " -n 30 127.0.0.1")
+                                                "PING.EXE") + f" -n {int(count)} 127.0.0.1")
     out = subprocess.run(["powershell", "-NoProfile", "-NonInteractive", "-Command", command], capture_output=True,
                          text=True, env=env, check=True).stdout.strip()
     list_foreign(int(out), pids_path)
@@ -447,7 +447,7 @@ def main():
             elif op == "no_result":
                 write_result = False
             elif op == "wmi_spawn":
-                wmi_spawn(step["pids"])
+                wmi_spawn(step["pids"], step.get("count", 30))
             elif op == "spawn_listed":
                 child = subprocess.Popen(step["argv"])
                 list_foreign(child.pid, step["pids"])
