@@ -1,0 +1,32 @@
+# The setup script's configuration. Copy it as setup.toml beside setup_apps.py (or pass --config)
+# and replace every <...>. Keep it outside every repository once it holds your real names.
+#
+# A role's permissions are fixed by the script and cannot be set here; a key this file does not show
+# is refused. Leave out the table of a role you do not set up.
+
+[setup]
+owner = "<GitHub account that owns the apps and the repository; gh must be signed in as it>"
+repository = "<the one repository the apps are installed on, without its owner>"
+# Optional: the address the apps' pages link to. By default, the repository's own page.
+# homepage = "https://github.com/<owner>/<repository>"
+
+[executor]
+# contents: write, pull_requests: write; issues: write only with issues = true.
+app_name = "<executor app name, lower case, for example xtl-stage-a-executor>"
+windows_user = "<the separate standard Windows user that runs the executor>"
+# A folder outside every user profile, every repository and OneDrive. The key and the app file go here,
+# readable only by windows_user.
+key_folder = '<drive>:\<folder outside every user profile>'
+issues = false
+
+[reviewer]
+# contents: read, pull_requests: write, statuses: write.
+app_name = "<reviewer app name, for example xtl-stage-a-reviewer>"
+# A new .pem file outside every repository and OneDrive, readable only by your own Windows user.
+key_file = '<drive>:\<your key folder>\<reviewer app name>.pem'
+
+[controller]
+# contents: write, checks: write, pull_requests: read, statuses: read; issues: read only with issues = true.
+app_name = "<controller app name, for example xtl-stage-a-controller>"
+key_file = '<drive>:\<your key folder>\<controller app name>.pem'
+issues = false
