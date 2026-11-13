@@ -412,13 +412,47 @@ class Windows:
         except PermissionError:
             return False
 
+    def create_with_acl(self, path: Path, sddl: str) -> None:
+        """Create the file new (CREATE_NEW), with exactly the access the SDDL gives, never its folder's (A2, R7)."""
+        import ctypes
+        from ctypes import wintypes
 
-def _create_empty(path: Path) -> None:
-    flags = os.O_WRONLY | os.O_CREAT | os.O_EXCL | getattr(os, "O_BINARY", 0) | getattr(os, "O_NOINHERIT", 0)
-    try:
-        os.close(os.open(path, flags, 0o600))
-    except OSError:
-        raise Stop(f"Could not create {path}. Nothing is overwritten.") from None
+        class SecurityAttributes(ctypes.Structure):
+            _fields_ = [("nLength", wintypes.DWORD), ("lpSecurityDescriptor", wintypes.LPVOID),
+                        ("bInheritHandle", wintypes.BOOL)]
+
+        adv = ctypes.WinDLL("advapi32", use_last_error=True)
+        k32 = ctypes.WinDLL("kernel32", use_last_error=True)
+        adv.ConvertStringSecurityDescriptorToSecurityDescriptorW.argtypes = [
+            wintypes.LPCWSTR, wintypes.DWORD, ctypes.POINTER(wintypes.LPVOID), ctypes.POINTER(wintypes.ULONG)]
+        k32.CreateFileW.argtypes = [wintypes.LPCWSTR, wintypes.DWORD, wintypes.DWORD, ctypes.POINTER(SecurityAttributes),
+                                    wintypes.DWORD, wintypes.DWORD, wintypes.HANDLE]
+        k32.CreateFileW.restype = wintypes.HANDLE
+        k32.CloseHandle.argtypes = [wintypes.HANDLE]
+        k32.LocalFree.argtypes = [wintypes.HLOCAL]
+        descriptor = wintypes.LPVOID()
+        if not adv.ConvertStringSecurityDescriptorToSecurityDescriptorW(sddl, 1, ctypes.byref(descriptor), None):
+            raise Stop("Could not build the key file's permissions.")
+        try:
+            attributes = SecurityAttributes(ctypes.sizeof(SecurityAttributes), descriptor, False)
+            handle = k32.CreateFileW(str(path), 0x40000000, 0, ctypes.byref(attributes), 1, 0x80, None)  # CREATE_NEW
+            if not handle or handle == wintypes.HANDLE(-1).value:
+                raise Stop(f"Could not create {path}. Nothing is overwritten.")
+            k32.CloseHandle(handle)
+        finally:
+            k32.LocalFree(descriptor)
+
+
+OPEN_TO_ALL = {"S-1-5-32-545": "Users", "S-1-5-11": "Authenticated Users", "S-1-1-0": "Everyone"}
+
+
+def check_key_folder(win: Windows, folder: Path, executor_sid: str | None) -> None:
+    """R7: the folder of the reviewer's or the controller's key gives no access to all users or to the executor."""
+    _, rules = win.acl_of(folder)
+    for sid, _rights, kind, _inherited in rules:
+        if kind == "Allow" and (sid in OPEN_TO_ALL or (executor_sid and sid == executor_sid)):
+            who = OPEN_TO_ALL.get(sid, "the executor's user")
+            raise Stop(f"The key's folder {folder} gives access to {who}. Choose a folder only your user can open.")
 
 
 def _write_all(path: Path, data: bytes) -> None:
@@ -458,10 +492,8 @@ def check_executor_only(win: Windows, path: Path, executor_sid: str) -> None:
 def write_operator_key(win: Windows, path: Path, pem: bytes, executor_sid: str | None = None) -> None:
     """Create the file empty, limit it to the operator's user, and only then write the key into it."""
     operator_sid = win.current_sid()
-    _create_empty(path)
+    win.create_with_acl(path, f"D:P(A;;FA;;;{operator_sid})")  # never with its folder's inherited access (R7)
     try:
-        if not win.icacls(path, "/inheritance:r", "/grant:r", f"*{operator_sid}:(F)"):
-            raise Stop(f"icacls could not limit {path.name} to your user.")
         check_operator_only(win, path, operator_sid, executor_sid)
         _write_all(path, pem)
         check_operator_only(win, path, operator_sid, executor_sid)
@@ -476,10 +508,8 @@ def write_operator_key(win: Windows, path: Path, pem: bytes, executor_sid: str |
 def write_for_executor(win: Windows, path: Path, data: bytes, executor_sid: str) -> None:
     """Create the file empty, give it to the executor's user to read and to us to write, write it, then drop our access."""
     operator_sid = win.current_sid()
-    _create_empty(path)
+    win.create_with_acl(path, f"D:P(A;;FA;;;{operator_sid})(A;;FR;;;{executor_sid})")  # never inherited access (R7)
     try:
-        if not win.icacls(path, "/inheritance:r", "/grant:r", f"*{operator_sid}:(M)", f"*{executor_sid}:(R)"):
-            raise Stop(f"icacls could not limit {path.name}.")
         protected, rules = win.acl_of(path)
         if not protected or sorted(rule[0] for rule in rules) != sorted([operator_sid, executor_sid]):
             raise Stop(f"{path.name} holds other permissions than expected before it is written.")
@@ -512,7 +542,7 @@ def check_executor_user(win: Windows, name: str, operator_sid: str) -> str:
     return sid
 
 
-def check_key_places(config: dict, roles: list[str]) -> None:
+def check_key_places(config: dict, roles: list[str], win: Windows, executor_sid: str | None) -> None:
     """Before anything is created: every key path is free, its folder exists, and no folder is in a repository."""
     for role in roles:
         entry = config["roles"][role]
@@ -535,6 +565,7 @@ def check_key_places(config: dict, roles: list[str]) -> None:
                 raise Stop(f"{path.parent} does not exist. Create the folder first, then run again.")
             if inside_a_repository(path.parent):
                 raise Stop(f"{path.parent} is inside a git repository. Choose a folder outside every repository.")
+            check_key_folder(win, path.parent, executor_sid)
 
 
 # ---------------------------------------------------------------- GitHub, as the app itself
@@ -579,6 +610,32 @@ def api(method: str, route: str, bearer: str, what: str, expect: int = 200) -> d
     if status != expect:
         raise Stop(f"GitHub answered {status} to {what}.")
     return json.loads(body) if body else None
+
+
+def exchange_code(code: str, opener=urllib.request.urlopen) -> dict:
+    """R8: GitHub's one-time manifest code, exchanged by this process itself (HTTPS POST, no authentication), so it is
+    never on a command line."""
+    request = urllib.request.Request(f"{API}/app-manifests/{urllib.parse.quote(code, safe='')}/conversions", data=b"",
+                                     method="POST", headers={"Accept": "application/vnd.github+json",
+                                                             "User-Agent": "xtl-setup-apps",
+                                                             "X-GitHub-Api-Version": "2022-11-28"})
+    try:
+        with opener(request, timeout=30) as response:
+            status, body = response.status, response.read()
+    except urllib.error.HTTPError as error:
+        raise Stop(f"GitHub answered {error.code} to the code's exchange. If the app was created, delete it at "
+                   "https://github.com/settings/apps and run again.") from None
+    except (urllib.error.URLError, OSError):
+        raise Stop("No connection to GitHub for the code's exchange.") from None
+    if status != 201:
+        raise Stop(f"GitHub answered {status} to the code's exchange.")
+    try:
+        conversion = json.loads(body)
+    except ValueError:
+        raise Stop("GitHub's answer to the exchange could not be read.") from None
+    if not isinstance(conversion, dict):
+        raise Stop("GitHub's answer to the exchange is not an object.")
+    return conversion
 
 
 def check_installation(config: dict, role: str, app_id: int, slug: str, jwt: str, hint: str = "",
@@ -767,17 +824,8 @@ def create_app(config: dict, role: str) -> tuple[int, str, bytes]:
         FLOW.code, FLOW.state = "", ""
     if served_at and time.monotonic() - served_at > CODE_LIMIT_SECONDS:
         raise Stop("GitHub's code is close to its one-hour limit. Delete the new app on GitHub and run again.")
-    result = gh(["api", "--method", "POST", f"app-manifests/{code}/conversions"])
+    conversion = exchange_code(code)
     del code
-    if result.returncode != 0:
-        raise Stop(f"GitHub did not exchange the code (gh exited {result.returncode}). If the app was created, "
-                   "delete it at https://github.com/settings/apps and run again.")
-    try:
-        conversion = json.loads(result.stdout)
-    except ValueError:
-        raise Stop("GitHub's answer to the exchange could not be read.") from None
-    finally:
-        del result
     app_id = conversion.get("id")
     slug = str(conversion.get("slug") or "")
     pem_text = conversion.get("pem") or ""
@@ -839,7 +887,7 @@ def setup_role(config: dict, role: str, win: Windows, executor_sid: str | None) 
             except OSError:
                 raise Stop(f"Could not create the folder {folder}.") from None
             step(f"the folder {folder} created")
-    check_key_places(config, [role])
+    check_key_places(config, [role], win, executor_sid)
     app_id, slug, pem = create_app(config, role)
     try:
         if role == "executor":
@@ -892,10 +940,10 @@ def before_anything(config: dict, roles: list[str], win: Windows) -> str | None:
     """Every question and check that can stop the run, before any app is created. Returns the executor's SID."""
     for role in roles:
         check_name_is_new(config["roles"][role]["app_name"])
-    check_key_places(config, roles)
     executor_sid = None
     if "executor" in config["roles"]:
         executor_sid = check_executor_user(win, config["roles"]["executor"]["windows_user"], win.current_sid())
+    check_key_places(config, roles, win, executor_sid)
     if "executor" in roles:
         github_holds_no_executor_secret(config["full_name"])
     return executor_sid

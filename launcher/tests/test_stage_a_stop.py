@@ -232,17 +232,19 @@ def test_lr58_the_model_is_suspended_until_it_is_in_the_job(world, check, launch
 @pytest.mark.lr(64)
 @windows_only
 @pytest.mark.parametrize("seam", ["job_open", "job_add", "resume_process"])
-def test_lr58_a_failed_job_setup_starts_nothing(world, check, launcher, monkeypatch, seam):
+def test_lr58_a_failed_job_setup_starts_nothing(world, check, launcher, monkeypatch, seam, tmp_path):
     def fail(*args, **kwargs):
         raise OSError("the job could not be set up")
 
+    early = tmp_path / "early"  # the fake writes it first of all: absent means it never ran (amendment A2, R10)
     monkeypatch.setattr(launcher, seam, fail)
-    res = spec(world, [msg("m1")])
+    res = world.run("spec", "--slug", SLUG, steps=[COMMIT, msg("m1")], extra_env={"FAKE_CLAUDE_EARLY": str(early)})
     check.stopped(res, "JOB_SETUP_FAILED")
-    assert res.model is None, "the model ran"
+    assert res.model is None and not early.exists(), "the model ran"
     assert not res.pushed
     reserved, messages, finished = one_attempt(world, res)
     assert finished["outcome"] == "JOB_SETUP_FAILED" and finished["messages"] == 0 and messages == []
+    assert finished["exit_code"] is None, "LR-75: the model never ran, so its exit code is null"
     if seam != "job_open":
         assert wait_dead([logged_pid(res)], seconds=5) == [], "the suspended process was not terminated"
     second = spec(world, [msg("n1")])  # the seam still fails: a second reservation, a second failure

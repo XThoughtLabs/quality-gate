@@ -42,7 +42,7 @@ import tomllib
 import urllib.error
 import urllib.parse
 import urllib.request
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
 
 HERE = Path(__file__).resolve().parent
@@ -83,7 +83,11 @@ MODEL_FIELDS = ("num_turns", "is_error", "subtype", "total_cost_usd", "duration_
 LIMIT_KEYS = ("max_messages_attempt", "max_messages_task", "max_runs_task")  # LR-53
 GRACE_SECONDS = 10  # LR-58: CTRL_BREAK (or SIGINT), then this long, then the job (or the group) is ended
 END_CHECK_SECONDS = 5  # LR-58: how long the count of live processes is read again
-DRAIN_SECONDS = 5  # LR-57: how long lines written before the model ended are still read after it
+DRAIN_SECONDS = 30  # LR-71: the bound on reading the stream to its end after the model's job has ended
+SCAN_SECONDS = 1.0  # LR-67: the search for processes outside the job, while the model runs
+END_SEARCHES = 3  # LR-67: the searches after the end
+ASSISTANT_START = re.compile(rb'"type"\s*:\s*"assistant"')  # LR-72
+MAX_TIMEOUT_MINUTES = 59  # LR-76
 MAX_STREAM_LINE = 32 * 1024 * 1024  # LR-60
 MAX_BAD_LINES = 10  # LR-60
 MAX_MESSAGE_ID = 256  # LR-52
@@ -97,6 +101,10 @@ STOP_MESSAGES = {
     "PROCESS_SURVIVED": "A process of the model survived the stop. Nothing was pushed.",
     "JOB_SETUP_FAILED": "The model's job object could not be set up. Nothing was started.",
     "LEDGER_FAILED": "The ledger could not be written. Nothing was pushed.",
+    "PROCESS_OUTSIDE_JOB": "A process of this user appeared outside the model's job and was ended. Nothing was pushed.",
+    "SECOND_MODEL": "A second Claude Code appeared while the model ran. Nothing was pushed.",
+    "GIT_CONFIG_CHANGED": "The model changed the clone's git configuration or its .git folder. Nothing was pushed.",
+    "TIMEOUT_TOO_LONG": f"quality.toml's timeout_minutes is above {MAX_TIMEOUT_MINUTES}. Nothing was started.",
 }
 
 
@@ -349,6 +357,231 @@ def job_close(job) -> None:
     _win()["k32"].CloseHandle(job)
 
 
+# ---------------------------------------------------------------- seams: the user's processes (LR-67, LR-77)
+
+_PROC: dict = {}
+
+
+def _proc():
+    """kernel32 and advapi32 with the signatures the search for processes needs, made once. Windows only."""
+    if _PROC:
+        return _PROC
+    import ctypes
+    from ctypes import wintypes
+
+    class Entry(ctypes.Structure):
+        _fields_ = [("dwSize", wintypes.DWORD), ("cntUsage", wintypes.DWORD), ("th32ProcessID", wintypes.DWORD),
+                    ("th32DefaultHeapID", ctypes.c_size_t), ("th32ModuleID", wintypes.DWORD),
+                    ("cntThreads", wintypes.DWORD), ("th32ParentProcessID", wintypes.DWORD),
+                    ("pcPriClassBase", wintypes.LONG), ("dwFlags", wintypes.DWORD), ("szExeFile", wintypes.WCHAR * 260)]
+
+    class ServiceStatus(ctypes.Structure):
+        _fields_ = [("dwServiceType", wintypes.DWORD), ("dwCurrentState", wintypes.DWORD),
+                    ("dwControlsAccepted", wintypes.DWORD), ("dwWin32ExitCode", wintypes.DWORD),
+                    ("dwServiceSpecificExitCode", wintypes.DWORD), ("dwCheckPoint", wintypes.DWORD),
+                    ("dwWaitHint", wintypes.DWORD), ("dwProcessId", wintypes.DWORD), ("dwServiceFlags", wintypes.DWORD)]
+
+    k32 = ctypes.WinDLL("kernel32", use_last_error=True)
+    adv = ctypes.WinDLL("advapi32", use_last_error=True)
+    signatures = {
+        (k32, "CreateToolhelp32Snapshot"): ([wintypes.DWORD, wintypes.DWORD], wintypes.HANDLE),
+        (k32, "Process32FirstW"): ([wintypes.HANDLE, ctypes.POINTER(Entry)], wintypes.BOOL),
+        (k32, "Process32NextW"): ([wintypes.HANDLE, ctypes.POINTER(Entry)], wintypes.BOOL),
+        (k32, "OpenProcess"): ([wintypes.DWORD, wintypes.BOOL, wintypes.DWORD], wintypes.HANDLE),
+        (k32, "CloseHandle"): ([wintypes.HANDLE], wintypes.BOOL),
+        (k32, "GetProcessTimes"): ([wintypes.HANDLE] + [ctypes.POINTER(wintypes.FILETIME)] * 4, wintypes.BOOL),
+        (k32, "QueryFullProcessImageNameW"): ([wintypes.HANDLE, wintypes.DWORD, wintypes.LPWSTR,
+                                               ctypes.POINTER(wintypes.DWORD)], wintypes.BOOL),
+        (k32, "IsProcessInJob"): ([wintypes.HANDLE, wintypes.HANDLE, ctypes.POINTER(wintypes.BOOL)], wintypes.BOOL),
+        (k32, "TerminateProcess"): ([wintypes.HANDLE, wintypes.UINT], wintypes.BOOL),
+        (k32, "GetCurrentProcess"): ([], wintypes.HANDLE),
+        (k32, "GetSystemTimeAsFileTime"): ([ctypes.POINTER(wintypes.FILETIME)], None),
+        (k32, "LocalFree"): ([wintypes.HLOCAL], wintypes.HLOCAL),
+        (adv, "OpenProcessToken"): ([wintypes.HANDLE, wintypes.DWORD, ctypes.POINTER(wintypes.HANDLE)], wintypes.BOOL),
+        (adv, "GetTokenInformation"): ([wintypes.HANDLE, ctypes.c_int, wintypes.LPVOID, wintypes.DWORD,
+                                        ctypes.POINTER(wintypes.DWORD)], wintypes.BOOL),
+        (adv, "ConvertSidToStringSidW"): ([wintypes.LPVOID, ctypes.POINTER(wintypes.LPWSTR)], wintypes.BOOL),
+        (adv, "OpenSCManagerW"): ([wintypes.LPCWSTR, wintypes.LPCWSTR, wintypes.DWORD], wintypes.HANDLE),
+        (adv, "OpenServiceW"): ([wintypes.HANDLE, wintypes.LPCWSTR, wintypes.DWORD], wintypes.HANDLE),
+        (adv, "QueryServiceStatusEx"): ([wintypes.HANDLE, ctypes.c_int, wintypes.LPVOID, wintypes.DWORD,
+                                         ctypes.POINTER(wintypes.DWORD)], wintypes.BOOL),
+        (adv, "CloseServiceHandle"): ([wintypes.HANDLE], wintypes.BOOL),
+    }
+    for (dll, name), (argtypes, restype) in signatures.items():
+        function = getattr(dll, name)
+        function.argtypes, function.restype = argtypes, restype
+    _PROC.update(ctypes=ctypes, wintypes=wintypes, k32=k32, adv=adv, Entry=Entry, ServiceStatus=ServiceStatus)
+    return _PROC
+
+
+def _token_sid(handle) -> str | None:
+    p = _proc()
+    ctypes, wintypes, k32, adv = p["ctypes"], p["wintypes"], p["k32"], p["adv"]
+    token = wintypes.HANDLE()
+    if not adv.OpenProcessToken(handle, 0x8, ctypes.byref(token)):  # TOKEN_QUERY
+        return None
+    try:
+        size = wintypes.DWORD()
+        adv.GetTokenInformation(token, 1, None, 0, ctypes.byref(size))  # TokenUser
+        if not size.value:
+            return None
+        buffer = ctypes.create_string_buffer(size.value)
+        if not adv.GetTokenInformation(token, 1, buffer, size, ctypes.byref(size)):
+            return None
+        text = wintypes.LPWSTR()
+        if not adv.ConvertSidToStringSidW(ctypes.c_void_p.from_buffer(buffer).value, ctypes.byref(text)):
+            return None
+        try:
+            return text.value
+        finally:
+            k32.LocalFree(text)
+    finally:
+        k32.CloseHandle(token)
+
+
+def _schedule_pid() -> int | None:
+    """The process id of the Task Scheduler service, from the service manager."""
+    p = _proc()
+    ctypes, adv = p["ctypes"], p["adv"]
+    manager = adv.OpenSCManagerW(None, None, 0x1)  # SC_MANAGER_CONNECT
+    if not manager:
+        return None
+    try:
+        service = adv.OpenServiceW(manager, "Schedule", 0x4)  # SERVICE_QUERY_STATUS
+        if not service:
+            return None
+        try:
+            status = p["ServiceStatus"]()
+            needed = p["wintypes"].DWORD()
+            if not adv.QueryServiceStatusEx(service, 0, ctypes.byref(status), ctypes.sizeof(status), ctypes.byref(needed)):
+                return None
+            return int(status.dwProcessId) or None
+        finally:
+            adv.CloseServiceHandle(service)
+    finally:
+        adv.CloseServiceHandle(manager)
+
+
+def now_filetime() -> int:
+    """The current time as a Windows FILETIME (100-ns steps since 1601)."""
+    p = _proc()
+    value = p["wintypes"].FILETIME()
+    p["k32"].GetSystemTimeAsFileTime(p["ctypes"].byref(value))
+    return (value.dwHighDateTime << 32) | value.dwLowDateTime
+
+
+def user_processes(job) -> list[dict]:
+    """The processes of the current user, as LR-77 describes them. Never their command lines."""
+    p = _proc()
+    ctypes, wintypes, k32 = p["ctypes"], p["wintypes"], p["k32"]
+    me = _token_sid(k32.GetCurrentProcess())
+    snapshot = k32.CreateToolhelp32Snapshot(0x2, 0)  # TH32CS_SNAPPROCESS
+    if not snapshot or snapshot == wintypes.HANDLE(-1).value:
+        raise _last_error()
+    entries: dict[int, tuple[int, str]] = {}
+    try:
+        entry = p["Entry"]()
+        entry.dwSize = ctypes.sizeof(entry)
+        more = k32.Process32FirstW(snapshot, ctypes.byref(entry))
+        while more:
+            entries[int(entry.th32ProcessID)] = (int(entry.th32ParentProcessID), entry.szExeFile)
+            more = k32.Process32NextW(snapshot, ctypes.byref(entry))
+    finally:
+        k32.CloseHandle(snapshot)
+    schedule = _schedule_pid()
+
+    def details(pid: int):
+        handle = k32.OpenProcess(0x1000 | 0x0001, False, pid)  # QUERY_LIMITED_INFORMATION | TERMINATE
+        if not handle:
+            handle = k32.OpenProcess(0x1000, False, pid)
+        if not handle:
+            return None
+        try:
+            times = [wintypes.FILETIME() for _ in range(4)]
+            created = None
+            if k32.GetProcessTimes(handle, *[ctypes.byref(t) for t in times]):
+                created = (times[0].dwHighDateTime << 32) | times[0].dwLowDateTime
+            buffer = ctypes.create_unicode_buffer(1024)
+            size = wintypes.DWORD(1024)
+            path = buffer.value if k32.QueryFullProcessImageNameW(handle, 0, buffer, ctypes.byref(size)) else None
+            inside = wintypes.BOOL(False)
+            if job is not None:
+                k32.IsProcessInJob(handle, job, ctypes.byref(inside))
+            return _token_sid(handle), created, path, bool(inside.value)
+        finally:
+            k32.CloseHandle(handle)
+
+    found = []
+    for pid, (ppid, image) in entries.items():
+        if pid in (0, 4):
+            continue
+        facts = details(pid)
+        if facts is None or facts[0] != me:
+            continue
+        sid, created, path, inside = facts
+        parent = entries.get(ppid)
+        parent_facts = details(ppid) if parent else None
+        parent_image = parent[1] if parent else None
+        broker = ("wmi" if (parent_image or "").lower() == "wmiprvse.exe"
+                  else "schedule" if schedule is not None and ppid == schedule else None)
+        found.append({"pid": pid, "ppid": ppid, "image": image, "path": path, "parent_image": parent_image,
+                      "parent_path": parent_facts[2] if parent_facts else None, "created": created, "in_job": inside,
+                      "broker": broker})
+    return found
+
+
+def job_count(job) -> int:
+    """The job's number of live processes, without ending them."""
+    w = _win()
+    accounting = w["Accounting"]()
+    if not w["k32"].QueryInformationJobObject(job, 1, w["ctypes"].byref(accounting), w["ctypes"].sizeof(accounting), None):
+        return -1
+    return int(accounting.ActiveProcesses)
+
+
+def end_process(pid: int) -> bool:
+    """End one process (TerminateProcess). False when it cannot."""
+    p = _proc()
+    handle = p["k32"].OpenProcess(0x0001, False, pid)  # PROCESS_TERMINATE
+    if not handle:
+        return False
+    try:
+        return bool(p["k32"].TerminateProcess(handle, 1))
+    finally:
+        p["k32"].CloseHandle(handle)
+
+
+SESSION_IMAGES_SYSTEM = ("conhost.exe", "dllhost.exe", "runtimebroker.exe", "backgroundtaskhost.exe",
+                         "smartscreen.exe")  # LR-67: Windows' own session processes, in System32
+TERMINAL_IMAGE = "openconsole.exe"  # LR-67: Windows Terminal's console host
+
+
+def outside_processes(records: list[dict], since: int, exclude: set) -> list[dict]:
+    """LR-67's filter: the records that are foreign processes outside the job."""
+    root = os.environ.get("SystemRoot", "C:\\Windows").rstrip("\\/").lower()
+    program_files = os.environ.get("ProgramFiles", "C:\\Program Files").rstrip("\\/").lower()
+    allowed_folders = (root + "\\system32\\", root + "\\syswow64\\")
+    foreign = []
+    for record in records:
+        if record.get("in_job") or record.get("pid") in exclude:
+            continue
+        created = record.get("created")
+        if isinstance(created, int) and created < since:  # an unreadable creation time does not excuse it
+            continue
+        if record.get("broker"):
+            foreign.append(record)
+            continue
+        image = str(record.get("image") or "").lower()
+        path = str(record.get("path") or "").lower()
+        if image in SESSION_IMAGES_SYSTEM and path.startswith(allowed_folders) and path.endswith("\\" + image):
+            continue
+        if (image == TERMINAL_IMAGE and path.startswith(program_files + "\\windowsapps\\microsoft.windowsterminal_")
+                and path.endswith("\\" + image)):
+            continue
+        foreign.append(record)
+    return foreign
+
+
 # ---------------------------------------------------------------- pure functions named by the contract
 
 
@@ -479,6 +712,9 @@ def load_config(path: Path) -> dict:
     ledger = section.get("ledger_file")  # LR-55
     if not isinstance(ledger, str) or not DRIVE_PATH.fullmatch(ledger):
         raise ConfigError("[launcher] ledger_file must be a full drive path")
+    image = section.get("claude_image", Path(section["claude_command"][0]).name)  # LR-68
+    if not isinstance(image, str) or not re.fullmatch(r"[^\\/:*?\"<>|\r\n]+", image):
+        raise ConfigError("[launcher] claude_image must be a file name")
     if not Path(section["key_file"]).is_file():
         raise ConfigError("the key file is missing")
     return section
@@ -580,6 +816,9 @@ RECORD_FIELDS = {
 }
 
 
+OPTIONAL_FIELDS = {"attempt_finished": {"count_complete": lambda v: isinstance(v, bool)}}  # LR-71
+
+
 class Ledger:
     """An append-only JSON-lines file of attempts. Every read and append holds `<file>.lock`."""
 
@@ -652,8 +891,10 @@ class Ledger:
                 record = None
             kind = record.get("record") if isinstance(record, dict) else None
             fields = RECORD_FIELDS.get(kind) if isinstance(kind, str) else None
-            if (fields is None or set(record) != {"record", *fields}
-                    or not all(check(record[key]) for key, check in fields.items())):
+            optional = OPTIONAL_FIELDS.get(kind, {}) if fields is not None else {}
+            if (fields is None or not {"record", *fields} <= set(record) <= {"record", *fields, *optional}
+                    or not all(check(record[key]) for key, check in fields.items())
+                    or not all(check(record[key]) for key, check in optional.items() if key in record)):
                 raise Stop("LEDGER_FAILED", f"The ledger's line {number} is not a known record. The operator must repair it.")
             attempt = record["attempt"]
             if kind == "attempt_reserved":
@@ -794,7 +1035,8 @@ def run(argv: list[str], log: Log, what: str, cwd: Path | None = None, env: dict
 def plain_env() -> dict[str, str]:
     """The launcher's environment for git and the gate, without git config from the environment."""
     env = {k: v for k, v in os.environ.items() if not k.upper().startswith("GIT_CONFIG")}
-    env.update({"GIT_TERMINAL_PROMPT": "0", "GCM_INTERACTIVE": "never"})
+    # LR-70: the executor's global git configuration, which the model could write, is never read.
+    env.update({"GIT_TERMINAL_PROMPT": "0", "GCM_INTERACTIVE": "never", "GIT_CONFIG_GLOBAL": os.devnull})
     return env
 
 
@@ -842,14 +1084,17 @@ def write_prompt(stream, prompt: bytes) -> None:
 
 
 class ModelRun:
-    """One attempt of the model (LR-51 to LR-62): start it in its job, read and count its stream, stop it."""
+    """One attempt of the model (LR-51 to LR-62, LR-67 to LR-75): start it in its job, read and count its stream,
+    watch for processes outside the job, stop it."""
 
     def __init__(self, launcher: "Launcher", argv: list[str], env: dict[str, str], prompt: bytes, limit: int,
                  attempt: str) -> None:
         self.launcher, self.log, self.ledger = launcher, launcher.log, launcher.ledger
         self.argv, self.env, self.prompt, self.limit, self.attempt = argv, env, prompt, limit, attempt
+        self.claude_image = launcher.claude_image
         self.count = 0
         self.over = 0
+        self.complete = True  # LR-68, LR-71: False when the messages cannot all be known
         self.seen: set[str] = set()
         self.nth_id: str | None = None
         self.reached = False
@@ -861,9 +1106,16 @@ class ModelRun:
         self.exit_code: int | None = None
         self.process: subprocess.Popen | None = None
         self.job = None
+        self.in_job = False
+        self.ran = False
+        self.ended = False
+        self.since: int | None = None
+        self.last_scan = 0.0
         self.stop_began: float | None = None
+        self.lines: queue.Queue = queue.Queue()
+        self.open_stream = False
 
-    # -------- the stream (LR-52, LR-57, LR-60)
+    # -------- the stream (LR-52, LR-57, LR-60, LR-72)
 
     def want_stop(self, code: str) -> None:
         if code not in self.reasons:
@@ -877,9 +1129,16 @@ class ModelRun:
             event = json.loads(line.decode("utf-8"))
         except (UnicodeDecodeError, ValueError):
             event = None
+        except (RecursionError, MemoryError):  # LR-72: too deep or too large to parse
+            if ASSISTANT_START.search(line[:512]):
+                self.log.write("model stream: an assistant event that cannot be parsed counts as a message")
+                self.count_message(None, False, set(), False)
+                self.want_stop("STREAM_UNREADABLE")
+                return
+            event = None
         if not isinstance(event, dict):
             self.bad_lines += 1
-            text = scrub(line.decode("utf-8", "replace"), self.log.secrets)[:CUT]
+            text = scrub(line[:4 * CUT].decode("utf-8", "replace"), self.log.secrets)[:CUT]
             self.log.write(f"model stream: a line that is not a JSON object: {text}")
             if self.bad_lines > MAX_BAD_LINES:
                 self.log.write(f"model stream: more than {MAX_BAD_LINES} lines that are not JSON objects")
@@ -911,11 +1170,13 @@ class ModelRun:
                 self.pending |= tools
                 self.check_limit()
             return
+        self.count_message(mid if usable else None, usable, tools, event.get("parent_tool_use_id") is not None)
+
+    def count_message(self, mid: str | None, usable: bool, tools: set, subagent: bool) -> None:
         self.count += 1
         if usable:
             self.seen.add(mid)
         over = self.count > self.limit
-        subagent = event.get("parent_tool_use_id") is not None
         self.over += over
         record = {"record": "message", "attempt": self.attempt, "message_id": mid if usable else f"gen-{self.count}",
                   "generated": not usable, "ordinal": self.count, "time": utc_now(), "over_limit": over,
@@ -939,7 +1200,60 @@ class ModelRun:
             self.log.write(f"model reached its limit of {self.limit} messages")
             self.want_stop("MESSAGE_LIMIT")
 
-    # -------- processes (LR-58)
+    # -------- processes outside the job (LR-67, LR-68)
+
+    def describe(self, record: dict) -> str:
+        created = record.get("created")
+        when = "unknown"
+        if isinstance(created, int):
+            when = (datetime(1601, 1, 1, tzinfo=timezone.utc) + timedelta(microseconds=created // 10)).strftime(
+                "%Y-%m-%dT%H:%M:%S.%fZ")
+        return f"pid {record.get('pid')}, image {record.get('image')}, created {when}"
+
+    def scan(self) -> None:
+        """LR-67, LR-68 while the model runs."""
+        if os.name != "nt" or self.since is None:
+            return
+        self.last_scan = time.monotonic()
+        try:
+            records = user_processes(self.job)
+        except OSError:
+            self.log.write("search: the user's processes could not be listed")
+            return
+        model_pid = self.process.pid if self.process is not None else None
+        for record in records:
+            if (str(record.get("image") or "").lower() == self.claude_image and record.get("pid") != model_pid
+                    and "SECOND_MODEL" not in self.reasons):
+                self.log.write(f"search: a second Claude Code: {self.describe(record)}")
+                self.complete = False
+                self.want_stop("SECOND_MODEL")
+        for record in outside_processes(records, self.since, {os.getpid()}):
+            self.log.write(f"search: a process outside the job: {self.describe(record)}; it is ended")
+            end_process(record["pid"])
+            self.want_stop("PROCESS_OUTSIDE_JOB")
+
+    def search_after_end(self) -> None:
+        """LR-67 after the model's job has ended, before any git step."""
+        if os.name != "nt" or self.since is None:
+            return
+        found_any = False
+        for _ in range(END_SEARCHES):
+            try:
+                found = outside_processes(user_processes(self.job), self.since, {os.getpid()})
+            except OSError:
+                self.log.write("search: the user's processes could not be listed after the end")
+                found, found_any = [], True
+            if not found:
+                break
+            found_any = True
+            for record in found:
+                self.log.write(f"search after the end: a process outside the job: {self.describe(record)}; it is ended")
+                end_process(record["pid"])
+            time.sleep(0.5)
+        if found_any:
+            self.reasons.insert(0, "PROCESS_SURVIVED")
+
+    # -------- the model's own processes (LR-58, LR-73 to LR-75)
 
     def start(self) -> bool:
         """Start the model in its job. False when the job could not be set up (JOB_SETUP_FAILED)."""
@@ -961,20 +1275,27 @@ class ModelRun:
         if windows:
             try:
                 job_add(self.job, self.process)
+                self.in_job = True
+                self.since = now_filetime()
                 resume_process(self.process.pid)
             except OSError:
                 self.log.write("model: the job object could not be set up; the suspended process is terminated")
-                with contextlib.suppress(OSError):
-                    self.process.kill()
-                with contextlib.suppress(subprocess.TimeoutExpired):
-                    self.process.wait(timeout=30)
-                self.exit_code = self.process.returncode
+                self.kill_started()
                 return False
+        self.ran = True
         return True
+
+    def kill_started(self) -> None:
+        """LR-74, LR-75: kill a started process that never ran or is not known to be in the job."""
+        with contextlib.suppress(OSError):
+            self.process.kill()
+        with contextlib.suppress(subprocess.TimeoutExpired):
+            self.process.wait(timeout=30)
+        self.ended = True
 
     def begin_stop(self) -> None:
         self.stop_began = time.monotonic()
-        self.log.write(f"stop: {', '.join(self.reasons)}; a break to the model's process group")
+        self.log.write(f"stop: {', '.join(self.reasons)}; a break to the model's process group; grace begins")
         try:
             if os.name == "nt":
                 self.process.send_signal(signal.CTRL_BREAK_EVENT)
@@ -985,8 +1306,16 @@ class ModelRun:
 
     def end_all(self) -> int:
         """End every process of the model: the job (Windows) or the group (POSIX). Returns the survivors."""
+        self.ended = True
         if os.name == "nt":
-            return job_end(self.job)
+            alive = job_count(self.job)
+            self.log.write(f"job: {alive} processes alive before TerminateJobObject")
+            if self.stop_began is None and alive > 0:
+                self.log.write(f"job: {alive} processes still running after the model ended by itself; they are ended")
+            self.log.write("job: TerminateJobObject called")
+            left = job_end(self.job)
+            self.log.write(f"job: {left} processes left after TerminateJobObject")
+            return left
         with contextlib.suppress(ProcessLookupError, PermissionError):
             os.killpg(self.process.pid, signal.SIGKILL)
         deadline = time.monotonic() + END_CHECK_SECONDS
@@ -1012,39 +1341,57 @@ class ModelRun:
                 continue
         return self.process.poll() is not None
 
+    def drain(self) -> None:
+        """LR-71: read the stream to its end, for at most DRAIN_SECONDS; otherwise the count is incomplete."""
+        until = time.monotonic() + DRAIN_SECONDS
+        while self.open_stream and time.monotonic() < until:
+            try:
+                item = self.lines.get(timeout=0.2)
+            except queue.Empty:
+                continue
+            if item in (END_OF_STREAM, LINE_TOO_LONG, READ_FAILED):
+                self.open_stream = False
+            else:
+                self.handle(item)
+        if self.open_stream:
+            self.log.write(f"model stream: its end was not reached in {DRAIN_SECONDS} s; the count is incomplete")
+            self.complete = False
+
     def run(self, timeout_seconds: int) -> str:
         """Run the attempt to its end and return its outcome (LR-62)."""
-        lines: queue.Queue = queue.Queue()
-        ended = False
         try:
             if not self.start():
                 return "JOB_SETUP_FAILED"
             deadline = time.monotonic() + timeout_seconds
             threading.Thread(target=write_prompt, args=(self.process.stdin, self.prompt), daemon=True).start()
-            threading.Thread(target=read_stream, args=(self.process.stdout, lines), daemon=True).start()
-            open_stream = True
-            while open_stream:
+            threading.Thread(target=read_stream, args=(self.process.stdout, self.lines), daemon=True).start()
+            self.open_stream = True
+            while self.open_stream:
                 now = time.monotonic()
                 if self.stop_began is None and now >= deadline:
                     self.log.write(f"model: ran past {timeout_seconds // 60} minutes")
                     self.want_stop("TIMEOUT")
+                if self.stop_began is None and now - self.last_scan >= SCAN_SECONDS:
+                    self.scan()
                 if self.reasons and self.stop_began is None:
                     self.begin_stop()
                 until = deadline if self.stop_began is None else self.stop_began + GRACE_SECONDS
                 if self.stop_began is not None and now >= until:
                     break
                 try:
-                    item = lines.get(timeout=min(0.5, max(0.01, until - now)))
+                    item = self.lines.get(timeout=min(0.5, SCAN_SECONDS, max(0.01, until - now)))
                 except queue.Empty:
                     continue
                 if item in (LINE_TOO_LONG, READ_FAILED):
                     self.log.write(f"model stream: {'a line longer than 32 MiB' if item == LINE_TOO_LONG else 'the output could not be read'}")
                     self.want_stop("STREAM_UNREADABLE")
-                    open_stream = False
+                    self.open_stream = False
                 elif item == END_OF_STREAM:
-                    open_stream = False
+                    self.open_stream = False
                 else:
                     self.handle(item)
+            if self.stop_began is None:
+                self.scan()  # the last look while the model's processes may still run
             if self.reasons and self.stop_began is None:
                 self.begin_stop()
             if self.stop_began is None and not self.wait_process(deadline):
@@ -1053,34 +1400,31 @@ class ModelRun:
                 self.begin_stop()
             if self.stop_began is not None:
                 self.wait_process(self.stop_began + GRACE_SECONDS)
+                self.log.write("stop: grace ends")
             survivors = self.end_all()
-            ended = True
             if survivors:
                 self.log.write(f"model: {survivors} processes survived the end of its job or group")
                 self.reasons.insert(0, "PROCESS_SURVIVED")
-            with contextlib.suppress(subprocess.TimeoutExpired):
-                self.process.wait(timeout=30)
-            self.exit_code = self.process.returncode
-            drain_until = time.monotonic() + DRAIN_SECONDS
-            while open_stream and time.monotonic() < drain_until:
-                try:
-                    item = lines.get(timeout=0.2)
-                except queue.Empty:
-                    continue
-                if item in (END_OF_STREAM, LINE_TOO_LONG, READ_FAILED):
-                    open_stream = False
-                else:
-                    self.handle(item)
+            self.search_after_end()
         finally:
-            if self.process is not None and not ended:
+            if self.process is not None and not self.ended:
                 with contextlib.suppress(Exception):
-                    self.end_all()
+                    if os.name == "nt" and not self.in_job:
+                        self.kill_started()  # LR-74
+                    else:
+                        self.end_all()
+            if self.open_stream:
+                self.drain()
+            if self.process is not None and self.ran:
+                with contextlib.suppress(subprocess.TimeoutExpired):
+                    self.process.wait(timeout=30)
+                self.exit_code = self.process.returncode
             if self.job is not None:
                 job_close(self.job)
         return self.outcome()
 
     def outcome(self) -> str:
-        for code in ("PROCESS_SURVIVED", "LEDGER_FAILED"):
+        for code in ("PROCESS_SURVIVED", "LEDGER_FAILED", "SECOND_MODEL", "PROCESS_OUTSIDE_JOB"):
             if code in self.reasons:
                 return code
         if self.count >= self.limit:
@@ -1095,15 +1439,17 @@ class ModelRun:
 
 
 class Git:
-    def __init__(self, log: Log, repo: Path) -> None:
+    def __init__(self, log: Log, repo: Path, hooks: Path) -> None:
         self.log = log
         self.repo = repo
+        self.hooks = hooks  # LR-70: an empty folder, so that no hook runs
         self.exe = shutil.which("git") or "git"
 
     def __call__(self, *args: str, what: str = "", env: dict[str, str] | None = None, check: bool = True,
                  code: str = "GIT_FAILED") -> subprocess.CompletedProcess:
         label = what or "git " + " ".join(args[:2])
-        result = run([self.exe, "-C", str(self.repo), *args], self.log, label, env=env or plain_env())
+        result = run([self.exe, "-c", f"core.hooksPath={self.hooks}", "-C", str(self.repo), *args], self.log, label,
+                     env=env or plain_env())
         if check and result.returncode != 0:
             raise Stop(code, f"{label} failed.")
         return result
@@ -1134,6 +1480,7 @@ class Launcher:
         self.token = ""
         self.api = Api(self.api_url, self.log)
         self.ledger = Ledger(Path(config["ledger_file"]), self.log)
+        self.claude_image = str(config.get("claude_image", Path(config["claude_command"][0]).name)).lower()  # LR-68
         self.task_id = {"task": f"issue-{getattr(args, 'issue', '')}",
                         "spec": f"spec-{getattr(args, 'slug', '')}"}.get(args.command, "")
 
@@ -1230,11 +1577,14 @@ class Launcher:
         self.repo = self.run_dir / "repo"
         self.trusted = self.run_dir / "trusted"
         self.trusted.mkdir()
-        self.git = Git(self.log, self.repo)
+        self.hooks = self.run_dir / "no-hooks"
+        self.hooks.mkdir()
+        self.git = Git(self.log, self.repo, self.hooks)
         shallow = self.args.command == "spec"
         source = Path(self.repo_url).resolve().as_uri() if shallow and Path(self.repo_url).is_dir() else self.repo_url
         clone = ["clone", "--no-tags", *(["--depth", "1"] if shallow else []), source, str(self.repo)]
-        result = run([shutil.which("git") or "git", *clone], self.log, "git clone", env=plain_env())
+        result = run([shutil.which("git") or "git", "-c", f"core.hooksPath={self.hooks}", *clone], self.log,
+                     "git clone", env=plain_env())
         if result.returncode != 0:
             raise Stop("CLONE_FAILED", "The repository could not be cloned.")
         config = self.read_quality()
@@ -1260,11 +1610,11 @@ class Launcher:
             raise Stop("PIN_UNKNOWN", "judge.yml does not name quality-gate by exactly one full SHA.")
         self.pin = pins.pop()
         self.gate = self.run_dir / "gate"
-        result = run([shutil.which("git") or "git", "clone", "--no-tags", self.gate_url, str(self.gate)], self.log,
-                     "git clone gate", env=plain_env())
+        result = run([shutil.which("git") or "git", "-c", f"core.hooksPath={self.hooks}", "clone", "--no-tags",
+                      self.gate_url, str(self.gate)], self.log, "git clone gate", env=plain_env())
         if result.returncode != 0:
             raise Stop("PIN_UNKNOWN", "quality-gate could not be cloned.")
-        gate_git = Git(self.log, self.gate)
+        gate_git = Git(self.log, self.gate, self.hooks)
         gate_git("checkout", "--detach", self.pin, code="PIN_UNKNOWN")
         if gate_git.out("rev-parse", "HEAD") != self.pin:
             raise Stop("PIN_UNKNOWN", "quality-gate's checkout is not at the pin.")
@@ -1296,6 +1646,8 @@ class Launcher:
         values = dict(line.split("=", 1) for line in output.read_text(encoding="utf-8").splitlines() if "=" in line)
         self.max_turns = int(values["max-turns"])
         self.timeout_minutes = int(values["timeout-minutes"])
+        if self.timeout_minutes > MAX_TIMEOUT_MINUTES:  # LR-76
+            raise Stop("TIMEOUT_TOO_LONG", STOP_MESSAGES["TIMEOUT_TOO_LONG"])
         self.spec_settings = json.loads(values.get("spec-settings") or "{}")
         self.max_fix_rounds = self.quality.get("limits", {}).get("max_fix_rounds")
         self.log.write(f"limits: max_turns {self.max_turns}, timeout_minutes {self.timeout_minutes}")
@@ -1502,6 +1854,7 @@ class Launcher:
         argv = [*self.config["claude_command"], "-p", "--max-turns", str(limit), "--allowedTools",
                 ",".join(TOOLS[role]), "--settings", str(settings_path), "--output-format", "stream-json", "--verbose"]
         self.log.write(f"model starts: limit {limit}, timeout {self.timeout_minutes} min")
+        self.config_snapshot = self.clone_config()  # LR-70: what the clone's config must still be afterwards
         attempt = ModelRun(self, argv, model_env(role, venv), prompt.encode("utf-8"), limit, self.run_id)
         outcome = "ERROR"
         try:
@@ -1553,8 +1906,9 @@ class Launcher:
             self.log.write("model result: " + scrub(str(attempt.result.get("result") or ""), self.log.secrets)[:2000])
         else:
             self.log.write("model stream: no result event")
-        record = {"record": "attempt_finished", "attempt": self.run_id, "messages": attempt.count, "outcome": outcome,
-                  "result": result, "exit_code": attempt.exit_code, "time": utc_now()}
+        messages = attempt.count if attempt.complete else max(attempt.count, attempt.limit)  # LR-68, LR-71
+        record = {"record": "attempt_finished", "attempt": self.run_id, "messages": messages, "outcome": outcome,
+                  "result": result, "exit_code": attempt.exit_code, "time": utc_now(), "count_complete": attempt.complete}
         try:
             self.ledger.append(record)
         except Stop:
@@ -1564,7 +1918,20 @@ class Launcher:
 
     # -------- after the model (LR-33 to LR-41)
 
+    def clone_config(self) -> bytes | None:
+        """The clone's .git/config, or None when .git is not a plain folder (LR-70)."""
+        dot_git = self.repo / ".git"
+        if dot_git.is_symlink() or dot_git.is_junction() or not dot_git.is_dir():
+            return None
+        try:
+            return (dot_git / "config").read_bytes()
+        except OSError:
+            return None
+
     def after_model(self) -> None:
+        config = self.clone_config()  # LR-70: before any git command on the clone
+        if config is None or config != self.config_snapshot:
+            raise Stop("GIT_CONFIG_CHANGED", STOP_MESSAGES["GIT_CONFIG_CHANGED"])
         current = self.git("symbolic-ref", "--quiet", "--short", "HEAD", check=False).stdout.decode().strip()
         ancestor = self.git("merge-base", "--is-ancestor", self.start, "HEAD", check=False).returncode == 0
         if current != self.branch or not ancestor:
@@ -1587,6 +1954,10 @@ class Launcher:
             changed = self.git.out("diff", "--name-only", self.start, "HEAD").splitlines()
             if any(not path.startswith("acceptance/") for path in changed if path):
                 raise Stop("SPEC_OUTSIDE_ACCEPTANCE", "The spec-test author changed a path outside acceptance/. Nothing was pushed.")
+        self.verified = self.git.out("rev-parse", "--verify", "HEAD^{commit}")  # LR-69: the commit the checks saw
+        if not re.fullmatch(r"[0-9a-f]{40}", self.verified) or self.verified != commits[-1]:
+            raise Stop("GIT_FAILED", "The verified commit could not be read.")
+        self.log.write(f"verified commit {self.verified}")
         if self.args.command == "fix":
             pr = self.api.call("GET", f"/repos/{self.repository}/pulls/{self.args.pr}", self.token, code="HEAD_MOVED")
             if ((pr or {}).get("head") or {}).get("sha") != self.head_sha:
@@ -1595,7 +1966,9 @@ class Launcher:
 
     def push(self) -> None:
         env = {**plain_env(), **git_auth_env(self.token, self.repo_url)}
-        result = self.git("push", "origin", f"HEAD:refs/heads/{self.branch}", env=env, check=False, what="git push")
+        # LR-69: the verified commit, by its SHA, to the explicit repo_url: never HEAD, never origin.
+        result = self.git("push", self.repo_url, f"{self.verified}:refs/heads/{self.branch}", env=env, check=False,
+                          what="git push")
         if result.returncode != 0:
             raise Stop("PUSH_FAILED", f"The push of {self.branch} was refused.")
         self.log.write(f"pushed {self.branch}: {' '.join(self.commits)}")

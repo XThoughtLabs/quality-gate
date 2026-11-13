@@ -67,3 +67,15 @@ fake `quality.toml` or for the stop's 10-second grace.
   memory and cannot be changed that way.
 - On Linux and macOS the stop ends the model's process group; a descendant that leaves the group
   (`setsid`) can survive there (LR-58). Stage A's live runs are on Windows.
+- Since stage A2 (LR-67 to LR-70): the launcher also searches, once a second and after the end, for processes
+  of its own Windows user that appeared outside the model's job (for example started through WMI or the Task
+  Scheduler), ends them and pushes nothing; a second Claude Code stops the attempt; the push sends the commit the
+  checks verified, by its SHA, to the explicit repository URL; no git hook, no global git configuration and no
+  change the model makes to the clone's `.git/config` acts on the launcher's git commands. What remains: a process
+  that escapes and ends between two searches; anything run under another Windows user; code that a broker runs
+  inside a Windows host the search allows (for example a COM server in `dllhost.exe`); a second model under another
+  image name, inside the job. **Run the launcher in a session of the executor's user with nothing else of that user
+  running** (no browser, no vendor agent): any other new process of that user stops the attempt. Real isolation,
+  a separate Windows user per run or a sandbox, is stage B's.
+- The 80 / 240 / 3 limits live in `launcher.toml`; the launcher does not hold the customer's ceilings in its
+  code (the dispatcher will, from the approved queue). `timeout_minutes` above 59 is refused (LR-76).

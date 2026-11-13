@@ -18,7 +18,7 @@ COMMIT = {"op": "commit", "path": "acceptance/test_stage_a.py", "text": "def tes
 RESERVED_FIELDS = {"record", "task", "attempt", "role", "time", "limit", "max_messages_task", "max_runs_task",
                    "messages_before", "runs_before"}
 MESSAGE_FIELDS = {"record", "attempt", "message_id", "generated", "ordinal", "time", "over_limit", "subagent"}
-FINISHED_FIELDS = {"record", "attempt", "messages", "outcome", "result", "exit_code", "time"}
+FINISHED_FIELDS = {"record", "attempt", "messages", "outcome", "result", "exit_code", "time", "count_complete"}  # LR-71
 RESULT_FIELDS = {"num_turns": 13, "is_error": False, "subtype": "success", "total_cost_usd": 0.4321,
                  "duration_ms": 98765}
 

@@ -424,6 +424,31 @@ class FakeWindows:
         self.ignore = set()  # icacls arguments that silently do nothing
         self.after_icacls = None  # a hook that changes the ACL after a call
         self.readable_anyway = False  # readable by us through something the rules do not show
+        self.first_seen: dict[str, tuple] = {}  # each file's permissions when the model first saw it (R7)
+
+    def _remember(self, path):
+        state = self._state(path)
+        self.first_seen.setdefault(str(path), (state["protected"], dict(state["rules"])))
+
+    def create_with_acl(self, path, sddl):
+        """Create the file new, with the access the SDDL gives (amendment A2, R7). The same faults as icacls can be
+        played: `ignore` holding "/inheritance:r" keeps the folder's inherited rules, and `after_icacls` changes the
+        rules afterwards."""
+        import os as _os
+        flags = _os.O_WRONLY | _os.O_CREAT | _os.O_EXCL | getattr(_os, "O_BINARY", 0)
+        try:
+            _os.close(_os.open(path, flags, 0o600))
+        except OSError:
+            raise S.Stop(f"Could not create {path}. Nothing is overwritten.") from None
+        rights = {"FA": S.FULL_CONTROL, "FR": READ}
+        rules = {sid: rights[right] for right, sid in re.findall(r"\(A;;(FA|FR);;;(S-[0-9-]+)\)", sddl)}
+        state = {"protected": sddl.startswith("D:P"), "rules": rules}
+        if "/inheritance:r" in self.ignore:
+            state = {"protected": False, "rules": {"S-1-5-32-544": S.FULL_CONTROL, self.me: S.FULL_CONTROL, **rules}}
+        self.acl[str(path)] = state
+        self._remember(path)
+        if self.after_icacls:
+            self.after_icacls(state)
 
     def current_sid(self):
         return self.me
@@ -439,6 +464,7 @@ class FakeWindows:
                                                "rules": {"S-1-5-32-544": S.FULL_CONTROL, self.me: S.FULL_CONTROL}})
 
     def icacls(self, path, *args):
+        self._remember(path)
         state = self._state(path)
         items = list(args)
         i = 0
@@ -589,11 +615,102 @@ def test_keys_places_must_be_free(tmp_path, monkeypatch):
     entry = config["roles"]["executor"]
     entry["key_folder"], entry["key_file"], entry["app_file"] = folder, folder / "e.pem", folder / "e.app.json"
     config["roles"]["reviewer"]["key_file"] = tmp_path / "r.pem"
-    S.check_key_places(config, ["executor", "reviewer"])
+    S.check_key_places(config, ["executor", "reviewer"], FakeWindows(), EXECUTOR)
     (tmp_path / "r.pem").write_bytes(b"x")
-    assert "already exists" in stop_message(lambda: S.check_key_places(config, ["reviewer"]))
+    assert "already exists" in stop_message(lambda: S.check_key_places(config, ["reviewer"], FakeWindows(), EXECUTOR))
     (folder / "e.app.json").write_bytes(b"x")
-    assert "already exists" in stop_message(lambda: S.check_key_places(config, ["executor"]))
+    assert "already exists" in stop_message(lambda: S.check_key_places(config, ["executor"], FakeWindows(), EXECUTOR))
     monkeypatch.setattr(S, "inside_a_repository", lambda f: True)
     (tmp_path / "r.pem").unlink()
-    assert "inside a git repository" in stop_message(lambda: S.check_key_places(config, ["reviewer"]))
+    assert "inside a git repository" in stop_message(lambda: S.check_key_places(config, ["reviewer"], FakeWindows(), EXECUTOR))
+
+
+# ---------------------------------------------------------------- amendment A2: R7 and R8
+USERS, AUTHENTICATED = "S-1-5-32-545", "S-1-5-11"
+
+
+def test_r7_an_operators_key_never_exists_with_inherited_access(tmp_path):
+    win = FakeWindows()
+    path = tmp_path / "reviewer.pem"
+    S.write_operator_key(win, path, PEM, EXECUTOR)
+    protected, rules = win.first_seen[str(path)]
+    assert protected is True and rules == {OPERATOR: S.FULL_CONTROL}, "the file existed with inherited access"
+
+
+def test_r7_an_executors_key_never_exists_with_inherited_access(tmp_path):
+    win = FakeWindows()
+    path = tmp_path / "executor.pem"
+    S.write_for_executor(win, path, PEM, EXECUTOR)
+    protected, rules = win.first_seen[str(path)]
+    assert protected is True and set(rules) == {OPERATOR, EXECUTOR}, "the file existed with inherited access"
+    assert win.acl_of(path) == (True, [(EXECUTOR, READ, "Allow", "False")])
+
+
+@pytest.mark.parametrize("sid", [USERS, AUTHENTICATED, EXECUTOR])
+def test_r7_a_key_folder_open_to_others_is_refused(tmp_path, sid):
+    win = FakeWindows()
+    folder = tmp_path / "keys"
+    folder.mkdir()
+    win.acl[str(folder)] = {"protected": False, "rules": {OPERATOR: S.FULL_CONTROL, sid: READ}}
+    assert "folder" in stop_message(lambda: S.check_key_folder(win, folder, EXECUTOR))
+
+
+def test_r7_a_key_folder_of_the_operator_alone_passes(tmp_path):
+    win = FakeWindows()
+    folder = tmp_path / "keys"
+    folder.mkdir()
+    win.acl[str(folder)] = {"protected": True, "rules": {OPERATOR: S.FULL_CONTROL, "S-1-5-18": S.FULL_CONTROL,
+                                                         "S-1-5-32-544": S.FULL_CONTROL}}
+    S.check_key_folder(win, folder, EXECUTOR)
+
+
+def test_r7_the_reviewers_folder_is_checked_before_anything(tmp_path, monkeypatch):
+    monkeypatch.setattr(S, "inside_a_repository", lambda folder: False)
+    win = FakeWindows()
+    config = good(tmp_path)
+    config["roles"]["reviewer"]["key_file"] = tmp_path / "r.pem"
+    win.acl[str(tmp_path)] = {"protected": False, "rules": {OPERATOR: S.FULL_CONTROL, USERS: READ}}
+    assert "folder" in stop_message(lambda: S.check_key_places(config, ["reviewer"], win, EXECUTOR))
+
+
+class Opener:
+    def __init__(self, body=b'{"id": 1, "slug": "x", "pem": "k"}', status=201):
+        self.body, self.status, self.requests = body, status, []
+
+    def __call__(self, request, timeout=None):
+        self.requests.append(request)
+        opener = self
+
+        class Answer:
+            status = opener.status
+
+            def read(self):
+                return opener.body
+
+            def __enter__(self):
+                return self
+
+            def __exit__(self, *args):
+                return False
+
+        return Answer()
+
+
+def test_r8_the_code_is_exchanged_by_the_script_itself():
+    opener = Opener()
+    answer = S.exchange_code("abc123", opener)
+    assert answer == {"id": 1, "slug": "x", "pem": "k"}
+    request = opener.requests[0]
+    assert request.get_method() == "POST"
+    assert request.full_url == "https://api.github.com/app-manifests/abc123/conversions"
+    assert not request.has_header("Authorization")
+
+
+@pytest.mark.parametrize("body, status", [(b"[]", 201), (b"not json", 201), (b"{}", 200)])
+def test_r8_a_bad_answer_to_the_exchange_stops(body, status):
+    stop_message(lambda: S.exchange_code("abc123", Opener(body, status)))
+
+
+def test_r8_the_code_never_reaches_a_command_line():
+    text = (SETUP_DIR / "setup_apps.py").read_text(encoding="utf-8")
+    assert "app-manifests" not in "".join(re.findall(r"gh\(\[[^\]]*\]", text)), "the code is passed to gh"

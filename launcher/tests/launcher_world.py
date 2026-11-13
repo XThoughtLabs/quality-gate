@@ -420,6 +420,21 @@ class Seams:
         for name in ("current_sid", "is_admin", "gh_login_present", "git_credential_present",
                      "acl_of", "can_write", "folder_openable"):
             monkeypatch.setattr(module, name, getattr(self, name))  # raising=True: seams must exist
+        # Stage A2 (LR-67, LR-77): the scan of the user's processes. The tests run as the person's own
+        # Windows user, whose other programs start processes at any time; the world therefore shows the
+        # launcher only the processes the fake model lists (FAKE_CLAUDE_FOREIGN), as the real scan sees
+        # them. The real scan itself is tested on its own (test_stage_a2.py). raising=False: the code
+        # before stage A2 has no such seam, and the harness must still run against it.
+        real = getattr(module, "user_processes", None)
+        self.foreign_file = None
+
+        def listed_processes(job):
+            if real is None or self.foreign_file is None or not self.foreign_file.exists():
+                return []
+            wanted = {int(x) for x in self.foreign_file.read_text(encoding="utf-8").split() if x.strip()}
+            return [p for p in real(job) if p["pid"] in wanted]
+
+        monkeypatch.setattr(module, "user_processes", listed_processes, raising=False)
 
 
 # ---------------------------------------------------------------- observation
@@ -792,8 +807,12 @@ class World:
             "max_messages_attempt": 80,
             "max_messages_task": 240,
             "max_runs_task": 3,
+            # Stage A2 (LR-68): the fake model is a python.exe; no process of this name exists.
+            "claude_image": "claude-under-test.exe",
         }
         self.ledger_file = Path(self.config["ledger_file"])
+        self.foreign_file = root / "foreign-pids.txt"
+        self.seams.foreign_file = self.foreign_file
         self.seams.folders[norm(self.absent_folder)] = "absent"
         self.write_files()
         self.base_env(monkeypatch)
@@ -892,6 +911,7 @@ class World:
                 stale.unlink()
         self.mp.setenv("FAKE_CLAUDE_MODE", json.dumps(steps or []))
         self.mp.setenv("FAKE_CLAUDE_OUT", str(self.model_out))
+        self.mp.setenv("FAKE_CLAUDE_FOREIGN", str(self.foreign_file))
         for k, v in (extra_env or {}).items():
             self.mp.setenv(k, v)
         before_dirs = set(self._run_dirs())

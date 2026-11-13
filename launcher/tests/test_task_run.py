@@ -301,8 +301,11 @@ def test_lr39_push_without_force_with_the_header_in_its_environment(task_run):
     pushes = task_run.git_commands("push")
     assert len(pushes) == 1, [p["argv"] for p in pushes]
     argv = pushes[0]["argv"]
-    assert "origin" in argv
-    assert f"HEAD:refs/heads/{W.ISSUE_BRANCH}" in argv
+    # LR-69 (amendment Stage A2) replaced LR-39's `origin HEAD:refs/heads/<branch>`: the explicit
+    # repo_url and the verified commit's SHA, which is the branch's new tip on the remote.
+    tip = task_run.refs_after[f"refs/heads/{W.ISSUE_BRANCH}"]
+    assert "origin" not in argv and W.same_path(argv[argv.index("push") + 1], task_run.world.config["repo_url"])
+    assert f"{tip}:refs/heads/{W.ISSUE_BRANCH}" in argv
     for a in argv:
         assert not a.startswith("+"), argv
         assert a not in ("-f", "--force", "--mirror", "--delete", "-d") and not a.startswith("--force"), argv

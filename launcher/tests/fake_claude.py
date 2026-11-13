@@ -51,6 +51,15 @@ last (with `num_turns`), unless a step says otherwise. Stream steps:
   {"op": "crash", "code": N}                        end at once with exit code N, no result event
   {"op": "no_result"}                               end normally but write no result event
 
+Stage A2 (LR-67 to LR-72):
+
+  {"op": "wmi_spawn", "pids": F}                    have WMI (Win32_Process.Create) start a PING that
+                     runs 30 s: not a descendant, so outside the job; its pid
+                     goes to F and to the list in FAKE_CLAUDE_FOREIGN
+  {"op": "spawn_listed", "argv": [...], "pids": F}  start a child (in the job) and list its pid the same way
+  {"op": "gitfile"}                                 move .git aside and leave a .git file pointing to it
+  {"op": "deep_assistant", "depth": N}              an assistant event whose tool input is nested N deep
+
 `FAKE_CLAUDE_EARLY`, when set, names a file it writes first of all, before it
 reads its standard input.
 
@@ -135,6 +144,31 @@ def job_facts():
     if in_job.value and k32.QueryInformationJobObject(None, 9, ctypes.byref(info), ctypes.sizeof(info), None):
         flags = int(info.basic.LimitFlags)
     return bool(in_job.value), flags
+
+
+def list_foreign(pid, pids_path=None):
+    """Tell the test world about a process it may report through the scan's seam (LR-77)."""
+    listing = os.environ.get("FAKE_CLAUDE_FOREIGN")
+    for path in (listing, pids_path):
+        if path:
+            with open(path, "a", encoding="utf-8") as fh:
+                fh.write(f"{pid}\n")
+
+
+def wmi_spawn(pids_path):
+    command = "(Invoke-CimMethod -ClassName Win32_Process -MethodName Create -Arguments @{CommandLine=$env:XTL_CMD}).ProcessId"
+    env = dict(os.environ, XTL_CMD=os.path.join(os.environ.get("SystemRoot", "C:\\Windows"), "System32",
+                                                "PING.EXE") + " -n 30 127.0.0.1")
+    out = subprocess.run(["powershell", "-NoProfile", "-NonInteractive", "-Command", command], capture_output=True,
+                         text=True, env=env, check=True).stdout.strip()
+    list_foreign(int(out), pids_path)
+
+
+def deep_assistant(depth):
+    inner = "[" * depth + "]" * depth
+    return ('{"type": "assistant", "message": {"id": "deep-1", "type": "message", "role": "assistant", "content": '
+            '[{"type": "tool_use", "id": "tu-deep", "name": "Bash", "input": {"x": ' + inner + '}}]}, '
+            '"parent_tool_use_id": null, "session_id": "' + SESSION + '"}')
 
 
 def spawn_family(pids_path):
@@ -311,6 +345,19 @@ def main():
                 os._exit(int(step.get("code", 3)))
             elif op == "no_result":
                 write_result = False
+            elif op == "wmi_spawn":
+                wmi_spawn(step["pids"])
+            elif op == "spawn_listed":
+                child = subprocess.Popen(step["argv"])
+                list_foreign(child.pid, step["pids"])
+            elif op == "list_parent":  # the process the launcher started (a venv's python.exe starts this one)
+                list_foreign(os.getppid())
+            elif op == "gitfile":
+                os.rename(".git", "../moved.git")
+                with open(".git", "w", encoding="utf-8") as fh:
+                    fh.write("gitdir: ../moved.git\n")
+            elif op == "deep_assistant":
+                emit_raw(deep_assistant(int(step["depth"])).encode("utf-8"))
             elif op == "commit":
                 write_file(step["path"], step.get("text", "print('hello')\n"))
                 git("add", "--", step["path"])
