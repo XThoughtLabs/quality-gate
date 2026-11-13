@@ -51,6 +51,9 @@ last (with `num_turns`), unless a step says otherwise. Stream steps:
   {"op": "crash", "code": N}                        end at once with exit code N, no result event
   {"op": "no_result"}                               end normally but write no result event
 
+`FAKE_CLAUDE_EARLY`, when set, names a file it writes first of all, before it
+reads its standard input.
+
 Before any step it writes a record to `FAKE_CLAUDE_OUT`: its argv, working
 folder, standard input, environment, the settings file's content, and the
 state of the git work tree. The variables' names hold no word LR-28 removes.
@@ -197,6 +200,10 @@ def write_file(path, text):
 
 
 def main():
+    early = os.environ.get("FAKE_CLAUDE_EARLY")
+    if early:  # written first, before the standard input is read: a sign that the process runs at all
+        with open(early, "w", encoding="utf-8") as fh:
+            fh.write(f"{os.getpid()} {time.time()}\n")
     out_path = os.environ.get("FAKE_CLAUDE_OUT")
     steps = json.loads(os.environ.get("FAKE_CLAUDE_MODE") or "[]")
     stdin_bytes = sys.stdin.buffer.read()

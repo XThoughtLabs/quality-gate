@@ -17,8 +17,8 @@ import time
 import pytest
 
 import launcher_world as W
-from stage_a_kit import (GRACE, argv_value, kill_all, logged_pid, msg, one_attempt, read_json, result, spec,
-                         wait_dead)
+from stage_a_kit import (COMMIT, GRACE, SLUG, argv_value, kill_all, logged_pid, msg, one_attempt, read_json, result,
+                         spec, wait_dead)
 
 windows_only = pytest.mark.skipif(os.name != "nt", reason="LR-58's job object exists on Windows only")
 STAY = {"op": "pause", "seconds": 120}
@@ -107,6 +107,16 @@ def test_lr57_a_message_beyond_the_limit_stops_while_results_are_awaited(world, 
 def test_lr57_reaching_the_limit_is_message_limit_however_the_model_ends(world, check):
     res = spec(world, [msg("a1"), msg("a2")], "--max-messages", "2")
     check.post_model_stop(res, "MESSAGE_LIMIT")
+
+
+@pytest.mark.lr(57)
+def test_lr57_the_limit_reached_while_results_are_awaited_is_message_limit_when_the_model_ends(world, check):
+    """The L-th message's tool result never comes and the model ends by itself, exit 0 with a result event:
+    the stop never began, yet the count reached the limit, so the attempt is MESSAGE_LIMIT and nothing is pushed."""
+    res = spec(world, [msg("a1"), msg("a2", tools=["t2"])], "--max-messages", "2")
+    check.post_model_stop(res, "MESSAGE_LIMIT")
+    _, _, finished = one_attempt(world, res)
+    assert finished["outcome"] == "MESSAGE_LIMIT" and finished["messages"] == 2 and finished["exit_code"] == 0
 
 
 @pytest.mark.lr(57)
@@ -200,19 +210,21 @@ def test_lr58_children_left_by_a_model_that_ended_by_itself_are_ended(world, che
 @pytest.mark.lr(58)
 @pytest.mark.lr(64)
 @windows_only
-def test_lr58_the_model_is_suspended_until_it_is_in_the_job(world, check, launcher, monkeypatch):
+def test_lr58_the_model_is_suspended_until_it_is_in_the_job(world, check, launcher, monkeypatch, tmp_path):
+    early = tmp_path / "early"  # the fake writes it first of all, before it reads the prompt
     seen = {}
     real_add = launcher.job_add
 
     def watching_add(job, process):
-        time.sleep(2.0)  # a model that was not suspended would have written its record by now
-        seen["model_ran_before_assign"] = world.model_out.exists()
+        time.sleep(2.0)  # a model that was not suspended would have started by now
+        seen["model_ran_before_assign"] = early.exists()
         seen["calls"] = seen.get("calls", 0) + 1
         return real_add(job, process)
 
     monkeypatch.setattr(launcher, "job_add", watching_add)
-    res = spec(world, [msg("m1")])
+    res = world.run("spec", "--slug", SLUG, steps=[COMMIT, msg("m1")], extra_env={"FAKE_CLAUDE_EARLY": str(early)})
     check.success(res)
+    assert early.exists(), "the harness wrote no early mark"
     assert seen == {"model_ran_before_assign": False, "calls": 1}
 
 
