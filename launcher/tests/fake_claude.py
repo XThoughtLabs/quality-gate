@@ -73,6 +73,15 @@ Stage A3 (LR-79 to LR-85):
                      sleeps S seconds; it waits until the DACL is set, and lists the pid as wmi_spawn does
   {"op": "close_stdout"}                            close the standard output (the stream ends) and go on
 
+Stage A4 (LR-89 to LR-95):
+
+  {"op": "spoof_parent", "parent": P, "image": X, "pids": F}
+                     start X suspended with the process P named as its parent
+                     (PROC_THREAD_ATTRIBUTE_PARENT_PROCESS): it is outside the job; its pid
+                     goes to F and to the list in FAKE_CLAUDE_FOREIGN
+  {"op": "remove_commit", "path": P}               git rm P and commit
+  {"op": "merge_commit"}                            commit a merge of HEAD with a side commit on HEAD
+
 `FAKE_CLAUDE_EARLY`, when set, names a file it writes first of all, before it
 reads its standard input.
 
@@ -246,6 +255,65 @@ def wmi_hide(step):
     while time.time() < deadline and not os.path.exists(flag):
         time.sleep(0.05)
     list_foreign(int(out), step["pids"])
+
+
+def spoof_parent(step):
+    """M2: a process created under another parent leaves the job (the reviewer's dllhost.exe, suspended)."""
+    import ctypes
+    from ctypes import wintypes
+
+    k32 = ctypes.WinDLL("kernel32", use_last_error=True)
+
+    class StartupInfo(ctypes.Structure):
+        _fields_ = [("cb", wintypes.DWORD), ("lpReserved", wintypes.LPWSTR), ("lpDesktop", wintypes.LPWSTR),
+                    ("lpTitle", wintypes.LPWSTR), ("dwX", wintypes.DWORD), ("dwY", wintypes.DWORD),
+                    ("dwXSize", wintypes.DWORD), ("dwYSize", wintypes.DWORD), ("dwXCountChars", wintypes.DWORD),
+                    ("dwYCountChars", wintypes.DWORD), ("dwFillAttribute", wintypes.DWORD),
+                    ("dwFlags", wintypes.DWORD), ("wShowWindow", wintypes.WORD), ("cbReserved2", wintypes.WORD),
+                    ("lpReserved2", ctypes.c_void_p), ("hStdInput", wintypes.HANDLE),
+                    ("hStdOutput", wintypes.HANDLE), ("hStdError", wintypes.HANDLE)]
+
+    class StartupInfoEx(ctypes.Structure):
+        _fields_ = [("StartupInfo", StartupInfo), ("lpAttributeList", ctypes.c_void_p)]
+
+    class ProcessInformation(ctypes.Structure):
+        _fields_ = [("hProcess", wintypes.HANDLE), ("hThread", wintypes.HANDLE), ("dwProcessId", wintypes.DWORD),
+                    ("dwThreadId", wintypes.DWORD)]
+
+    k32.OpenProcess.restype = wintypes.HANDLE
+    k32.OpenProcess.argtypes = [wintypes.DWORD, wintypes.BOOL, wintypes.DWORD]
+    k32.InitializeProcThreadAttributeList.argtypes = [ctypes.c_void_p, wintypes.DWORD, wintypes.DWORD,
+                                                      ctypes.POINTER(ctypes.c_size_t)]
+    k32.UpdateProcThreadAttribute.argtypes = [ctypes.c_void_p, wintypes.DWORD, ctypes.c_size_t, ctypes.c_void_p,
+                                              ctypes.c_size_t, ctypes.c_void_p, ctypes.c_void_p]
+    k32.CreateProcessW.argtypes = [wintypes.LPCWSTR, wintypes.LPWSTR, ctypes.c_void_p, ctypes.c_void_p, wintypes.BOOL,
+                                   wintypes.DWORD, ctypes.c_void_p, wintypes.LPCWSTR, ctypes.POINTER(StartupInfoEx),
+                                   ctypes.POINTER(ProcessInformation)]
+    parent = k32.OpenProcess(0x0080, False, int(step["parent"]))  # PROCESS_CREATE_PROCESS
+    if not parent:
+        raise OSError(ctypes.get_last_error(), "the parent cannot be opened")
+    size = ctypes.c_size_t()
+    k32.InitializeProcThreadAttributeList(None, 1, 0, ctypes.byref(size))
+    attributes = ctypes.create_string_buffer(size.value)
+    if not k32.InitializeProcThreadAttributeList(attributes, 1, 0, ctypes.byref(size)):
+        raise OSError(ctypes.get_last_error(), "InitializeProcThreadAttributeList")
+    handle = wintypes.HANDLE(parent)
+    if not k32.UpdateProcThreadAttribute(attributes, 0, 0x00020000, ctypes.byref(handle), ctypes.sizeof(handle),
+                                         None, None):  # PROC_THREAD_ATTRIBUTE_PARENT_PROCESS
+        raise OSError(ctypes.get_last_error(), "UpdateProcThreadAttribute")
+    info = StartupInfoEx()
+    info.StartupInfo.cb = ctypes.sizeof(info)
+    info.lpAttributeList = ctypes.cast(attributes, ctypes.c_void_p)
+    created = ProcessInformation()
+    line = ctypes.create_unicode_buffer(f'"{step["image"]}"')
+    flags = 0x00000004 | 0x00080000 | 0x08000000  # CREATE_SUSPENDED | EXTENDED_STARTUPINFO_PRESENT | CREATE_NO_WINDOW
+    if not k32.CreateProcessW(step["image"], line, None, None, False, flags, None, None, ctypes.byref(info),
+                              ctypes.byref(created)):
+        raise OSError(ctypes.get_last_error(), "CreateProcessW")
+    k32.CloseHandle(created.hThread)
+    k32.CloseHandle(created.hProcess)
+    k32.CloseHandle(parent)
+    list_foreign(int(created.dwProcessId), step["pids"])
 
 
 def replace_decoy(bad):
@@ -468,6 +536,16 @@ def main():
             elif op == "shallow_head":  # mark the branch's head as a shallow boundary in the clone
                 with open(os.path.join(".git", "shallow"), "a", encoding="ascii", newline="\n") as fh:
                     fh.write(git_out("rev-parse", "HEAD") + "\n")
+            elif op == "spoof_parent":
+                spoof_parent(step)
+            elif op == "remove_commit":
+                git("rm", "-q", "--", step["path"])
+                git("commit", "-q", "-m", f"Remove {step['path']}")
+            elif op == "merge_commit":
+                tree = git_out("rev-parse", "HEAD^{tree}")
+                side = git("commit-tree", tree, "-p", "HEAD", "-m", "A side commit").stdout.strip()
+                merge = git("commit-tree", tree, "-p", "HEAD", "-p", side, "-m", "A merge").stdout.strip()
+                git("update-ref", "HEAD", merge)
             elif op == "close_stdout":
                 sys.stdout.flush()
                 os.close(1)

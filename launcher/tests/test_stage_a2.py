@@ -75,9 +75,11 @@ def test_lr67_a_process_found_after_the_end_is_ended_and_the_run_is_process_surv
 @pytest.mark.lr(67)
 def test_lr67_the_filter(launcher):
     start = 1000
+    # LR-90 (amendment Stage A4): an allowed image needs a live parent of another owner (here a service's svchost),
+    # and conhost.exe a parent in the job; so record 1, a conhost under svchost, became foreign, and 16 passes.
     base = {"ppid": 1, "path": SYSTEMROOT + "\\System32\\conhost.exe", "parent_image": "svchost.exe",
             "parent_path": SYSTEMROOT + "\\System32\\svchost.exe", "created": start + 5, "in_job": False,
-            "broker": None}
+            "broker": None, "parent_owner": "other", "parent_alive": True}
 
     def rec(pid, image, **more):
         return {**base, "pid": pid, "image": image, **more}
@@ -99,9 +101,10 @@ def test_lr67_the_filter(launcher):
         rec(14, "OpenConsole.exe", path=os.environ.get("ProgramFiles", "C:\\Program Files")
             + "\\WindowsApps\\Microsoft.WindowsTerminal_1.24.12741.0_x64__8wekyb3d8bbwe\\OpenConsole.exe"),
         rec(15, "powershell.exe", path=SYSTEMROOT + "\\System32\\WindowsPowerShell\\v1.0\\powershell.exe"),
+        rec(16, "conhost.exe", parent_in_job=True, parent_owner="self"),             # a job process's console host
     ]
     found = launcher.outside_processes(records, since=start, exclude={8})
-    assert sorted(p["pid"] for p in found) == [2, 3, 4, 7, 9, 15]
+    assert sorted(p["pid"] for p in found) == [1, 2, 3, 4, 7, 9, 15]
 
 
 @pytest.mark.lr(67)

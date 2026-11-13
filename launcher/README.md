@@ -93,5 +93,16 @@ fake `quality.toml` or for the stop's 10-second grace.
   is not; processes inside WSL or a virtual machine are not seen; the launcher and the model share one Windows user,
   so the new repository and the searches defend by time, not by permissions (real isolation is stage B's); the merge
   policy on GitHub, not the launcher, is the final guard.
+- Since stage A4 (LR-89 to LR-95): a foreign process the launcher cannot end is recorded in the ledger, the log and
+  the stop message say so, and the next start refuses while it lives (`PROCESS_UNENDED`: restart Windows first);
+  an allowed Windows image passes only under a live parent of another user (a service), never under the launcher, its
+  terminal or a dead parent; the clone gets `core.autocrlf=false`; every commit of a spec run is checked, and a merge
+  commit is refused; the virtual environment and pip run isolated, with nothing of the launcher's environment.
+- **The DEV-06 class.** The launcher and the model share one Windows user. A process running under that user, outside
+  the model's job or escaped from it, can in principle open the launcher and its terminal: it can evade the launcher's
+  searches, survive a run, or act on the launcher, its terminal, its records or its own repository. The searches
+  narrow this class but do not close it. A separate Windows user per run, or a sandbox, is stage B's; the merge
+  policy on GitHub is the final guard. Findings in this class are disclosed in the contract's LR-66, not repaired in
+  stage A.
 - The 80 / 240 / 3 limits live in `launcher.toml`; the launcher does not hold the customer's ceilings in its
   code (the dispatcher will, from the approved queue). `timeout_minutes` above 59 is refused (LR-76).

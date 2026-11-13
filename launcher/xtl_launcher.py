@@ -105,13 +105,17 @@ STOP_MESSAGES = {
     "PROCESS_SURVIVED": "A process of the model survived the stop. Nothing was pushed.",
     "JOB_SETUP_FAILED": "The model's job object could not be set up. Nothing was started.",
     "LEDGER_FAILED": "The ledger could not be written. Nothing was pushed.",
-    "PROCESS_OUTSIDE_JOB": "A process of this user appeared outside the model's job and was ended. Nothing was pushed.",
+    "PROCESS_OUTSIDE_JOB": "A process of this user appeared outside the model's job. Nothing was pushed.",
     "SECOND_MODEL": "A second Claude Code appeared while the model ran. Nothing was pushed.",
     "GIT_CONFIG_CHANGED": "The model changed the clone's git configuration or its .git folder. Nothing was pushed.",
     "TIMEOUT_TOO_LONG": f"quality.toml's timeout_minutes is above {MAX_TIMEOUT_MINUTES}. Nothing was started.",
     "GIT_REPO_UNSAFE": "The launcher's own repository holds what could change what git shows. Nothing was pushed.",
-    "PROCESS_BEFORE_PUSH": "A process of this user appeared before the push and was ended. Nothing was pushed.",
+    "PROCESS_BEFORE_PUSH": "A process of this user appeared before the push. Nothing was pushed.",
+    "PROCESS_UNENDED": "A process an earlier run could not end is still running. Restart Windows before the next run. "
+                       "Nothing was started.",
+    "SPEC_MERGE_COMMIT": "The spec-test author made a merge commit. Nothing was pushed.",
 }
+UNENDED_NOTE = " A process could not be ended: restart Windows before the next run."  # LR-89
 HOOKS_README = "README.md"  # LR-80: the only file the launcher's hooks folder may hold
 NO_GRAFTS = "no-grafts"  # LR-80: GIT_GRAFT_FILE names this file in the hooks folder, which never exists
 GIT_SAFE = ("-c", "gc.auto=0", "-c", "maintenance.auto=false")  # LR-80: no git process outlives its command
@@ -496,6 +500,7 @@ def _proc():
                                                ctypes.POINTER(wintypes.DWORD)], wintypes.BOOL),
         (k32, "IsProcessInJob"): ([wintypes.HANDLE, wintypes.HANDLE, ctypes.POINTER(wintypes.BOOL)], wintypes.BOOL),
         (k32, "TerminateProcess"): ([wintypes.HANDLE, wintypes.UINT], wintypes.BOOL),
+        (k32, "WaitForSingleObject"): ([wintypes.HANDLE, wintypes.DWORD], wintypes.DWORD),
         (k32, "GetCurrentProcess"): ([], wintypes.HANDLE),
         (k32, "GetSystemTimeAsFileTime"): ([ctypes.POINTER(wintypes.FILETIME)], None),
         (k32, "LocalFree"): ([wintypes.HLOCAL], wintypes.HLOCAL),
@@ -734,18 +739,30 @@ def _grant_terminate(pid: int) -> None:
 
 
 def end_process(pid: int) -> bool:
-    """End one process (TerminateProcess). False when it cannot (LR-82: after trying WRITE_DAC)."""
+    """End one process. True only when it is verified gone (LR-89); tries WRITE_DAC first when it cannot (LR-82)."""
     p = _proc()
-    handle = p["k32"].OpenProcess(0x0001, False, pid)  # PROCESS_TERMINATE
+    k32 = p["k32"]
+    rights = 0x0001 | 0x00100000  # PROCESS_TERMINATE | SYNCHRONIZE
+    handle = k32.OpenProcess(rights, False, pid)
     if not handle:
         _grant_terminate(pid)
-        handle = p["k32"].OpenProcess(0x0001, False, pid)
+        handle = k32.OpenProcess(rights, False, pid)
     if not handle:
         return False
     try:
-        return bool(p["k32"].TerminateProcess(handle, 1))
+        if not k32.TerminateProcess(handle, 1):
+            return k32.WaitForSingleObject(handle, 0) == 0  # already gone counts; anything else does not
+        return k32.WaitForSingleObject(handle, END_CHECK_SECONDS * 1000) == 0  # WAIT_OBJECT_0: it has ended
     finally:
-        p["k32"].CloseHandle(handle)
+        k32.CloseHandle(handle)
+
+
+def process_alive(pid: int, created: int) -> bool:
+    """LR-89, LR-95: whether a process with this id and creation time is in the process list (never opened)."""
+    if os.name != "nt":
+        return False
+    entry = _system_processes().get(int(pid))
+    return entry is not None and entry["created"] == int(created)
 
 
 SESSION_IMAGES_SYSTEM = ("conhost.exe", "dllhost.exe", "runtimebroker.exe", "backgroundtaskhost.exe",
@@ -753,8 +770,18 @@ SESSION_IMAGES_SYSTEM = ("conhost.exe", "dllhost.exe", "runtimebroker.exe", "bac
 TERMINAL_IMAGE = "openconsole.exe"  # LR-67: Windows Terminal's console host
 
 
-def outside_processes(records: list[dict], since: int, exclude: set) -> list[dict]:
-    """LR-67's filter, with LR-82's rule for a process of unknown owner: the records that are foreign processes."""
+def allowed_by_parent(record: dict, exclude: set, console_parents: set) -> bool:
+    """LR-90: an image of LR-67's list passes only under a live, older parent of another or unknown owner that is
+    neither the launcher nor its chain; conhost.exe only under a process of the job (at the start check: the chain)."""
+    if str(record.get("image") or "").lower() == "conhost.exe":
+        return bool(record.get("parent_in_job")) or record.get("ppid") in console_parents
+    return (bool(record.get("parent_alive")) and record.get("parent_owner") in ("other", "unknown")
+            and record.get("ppid") not in exclude)
+
+
+def outside_processes(records: list[dict], since: int, exclude: set, console_parents: set = frozenset()) -> list[dict]:
+    """LR-67's filter, with LR-82's rule for a process of unknown owner and LR-90's for an allowed image's parent:
+    the records that are foreign processes. `exclude` holds the launcher and its chain."""
     folders = system_folders()  # LR-81: never from the environment
     allowed_folders = tuple(str(f).rstrip("\\/").lower() + "\\" for f in (folders["system32"], folders["syswow64"]) if f)
     terminal_folders = tuple(str(f).rstrip("\\/").lower() + "\\windowsapps\\microsoft.windowsterminal_"
@@ -777,9 +804,11 @@ def outside_processes(records: list[dict], since: int, exclude: set) -> list[dic
             continue
         image = str(record.get("image") or "").lower()
         path = str(record.get("path") or "").lower()
-        if image in SESSION_IMAGES_SYSTEM and path.startswith(allowed_folders) and path.endswith("\\" + image):
+        if (image in SESSION_IMAGES_SYSTEM and path.startswith(allowed_folders) and path.endswith("\\" + image)
+                and allowed_by_parent(record, exclude, console_parents)):
             continue
-        if image == TERMINAL_IMAGE and terminal_folders and path.startswith(terminal_folders) and path.endswith("\\" + image):
+        if (image == TERMINAL_IMAGE and terminal_folders and path.startswith(terminal_folders)
+                and path.endswith("\\" + image) and allowed_by_parent(record, exclude, console_parents)):
             continue
         foreign.append(record)
     return foreign
@@ -1094,6 +1123,9 @@ def _is_text(value: object) -> bool:
 
 
 RECORD_FIELDS = {
+    "process_unended": {  # LR-89: a foreign process the launcher could not end
+        "attempt": _is_text, "pid": lambda v: _is_int(v, 1), "created": lambda v: _is_int(v, 0),
+        "image": lambda v: isinstance(v, str), "time": _is_text},
     "attempt_reserved": {
         "task": _is_text, "attempt": _is_text, "role": lambda v: v in ("task", "fix", "spec"), "time": _is_text,
         "limit": lambda v: _is_int(v, 1), "max_messages_task": lambda v: _is_int(v, 1),
@@ -1195,6 +1227,9 @@ class Ledger:
                 if attempt in reserved:
                     raise Stop("LEDGER_FAILED", f"The ledger's line {number} reserves an attempt twice.")
                 reserved.add(attempt)
+            elif kind == "process_unended":  # LR-89: written during an attempt or after its end
+                if attempt not in reserved:
+                    raise Stop("LEDGER_FAILED", f"The ledger's line {number} belongs to no reserved attempt.")
             elif attempt not in reserved or attempt in finished:
                 raise Stop("LEDGER_FAILED", f"The ledger's line {number} belongs to no open attempt.")
             elif kind == "attempt_finished":
@@ -1386,6 +1421,7 @@ class ModelRun:
         self.launcher, self.log, self.ledger = launcher, launcher.log, launcher.ledger
         self.argv, self.env, self.prompt, self.limit, self.attempt = argv, env, prompt, limit, attempt
         self.claude_image = launcher.claude_image
+        self.exclude = {os.getpid()} | set(launcher.chain)  # LR-90: the launcher and its chain
         self.count = 0
         self.over = 0
         self.complete = True  # LR-68, LR-71: False when the messages cannot all be known
@@ -1517,10 +1553,12 @@ class ModelRun:
                 self.log.write(f"search: a second Claude Code: {self.describe(record)}")
                 self.complete = False
                 self.want_stop("SECOND_MODEL")
-        for record in outside_processes(records, self.since, {os.getpid()}):
+        for record in outside_processes(records, self.since, self.exclude):
             ended = end_process(record["pid"])
             self.log.write(f"search: a process outside the job: {self.describe(record)}; "
                            f"{'it is ended' if ended else 'it could not be ended'}")
+            if not ended:
+                self.launcher.note_unended(record)  # LR-89
             self.want_stop("PROCESS_OUTSIDE_JOB")
 
     def search_after_end(self) -> None:
@@ -1530,7 +1568,7 @@ class ModelRun:
         found_any = False
         for _ in range(END_SEARCHES):
             try:
-                found = outside_processes(user_processes(self.job), self.since, {os.getpid()})
+                found = outside_processes(user_processes(self.job), self.since, self.exclude)
             except OSError:
                 self.log.write("search: the user's processes could not be listed after the end")
                 found, found_any = [], True
@@ -1538,8 +1576,11 @@ class ModelRun:
                 break
             found_any = True
             for record in found:
-                self.log.write(f"search after the end: a process outside the job: {self.describe(record)}; it is ended")
-                end_process(record["pid"])
+                ended = end_process(record["pid"])  # LR-89: the log says what really happened
+                self.log.write(f"search after the end: a process outside the job: {self.describe(record)}; "
+                               f"{'it is ended' if ended else 'it could not be ended'}")
+                if not ended:
+                    self.launcher.note_unended(record)
             time.sleep(0.5)
         if found_any:
             self.reasons.insert(0, "PROCESS_SURVIVED")
@@ -1775,6 +1816,8 @@ class Launcher:
         self.claude_image = str(config.get("claude_image", default_claude_image(config["claude_command"][0]))).lower()
         self.model_since: int | None = None  # LR-83: where LR-67's searches start, as a FILETIME
         self.watch_from: int | None = None  # LR-84: the start check's reading
+        self.chain: set[int] = set()  # LR-84, LR-90: the launcher's process and its ancestors
+        self.unended: set[tuple] = set()  # LR-89: (pid, creation time) of foreign processes that could not be ended
         self.task_id = {"task": f"issue-{getattr(args, 'issue', '')}",
                         "spec": f"spec-{getattr(args, 'slug', '')}"}.get(args.command, "")
 
@@ -1836,18 +1879,51 @@ class Launcher:
         """LR-84: nothing of this user runs besides the launcher's own chain and Windows' own session processes."""
         if os.name != "nt":
             return
+        self.watch_from = now_filetime()  # LR-84, LR-92: read first; from here on the searches look at every new process
+        self.check_unended()
         try:
             records = user_processes(None)
         except OSError:
             raise Stop("PROCESS_AT_START", "The processes of this user could not be listed. Nothing was started.") from None
-        self.watch_from = now_filetime()  # LR-84: from here on, LR-67's searches look at every new process
+        self.chain = launcher_chain(records)
         mine = [r for r in records if r.get("owner", "self") == "self"]
-        found = outside_processes(mine, 0, launcher_chain(records))
+        found = outside_processes(mine, 0, self.chain, console_parents=self.chain)  # LR-90: the chain's console host
         for record in found:
             self.log.write(f"start check: another process of this user: {describe_process(record)}")
         if found:
             raise Stop("PROCESS_AT_START", "Another process of this user is running. Close it, or end it, and start "
                                            "again. Nothing was started.")
+
+    def check_unended(self) -> None:
+        """LR-89: refuse while a process an earlier run could not end is alive, whatever its owner."""
+        with self.ledger.locked():
+            records = self.ledger.read()
+        alive = [r for r in records if r["record"] == "process_unended" and process_alive(r["pid"], r["created"])]
+        for record in alive:
+            self.log.write(f"start check: a process an earlier run could not end is alive: pid {record['pid']}, "
+                           f"image {record['image']}, run {record['attempt']}")
+        if alive:
+            raise Stop("PROCESS_UNENDED", STOP_MESSAGES["PROCESS_UNENDED"])
+
+    def note_unended(self, record: dict) -> None:
+        """LR-89: record, once per process and run, a foreign process the launcher could not end."""
+        pid, created = record.get("pid"), record.get("created")
+        if (pid, created) in self.unended:
+            return
+        self.unended.add((pid, created))
+        if not isinstance(pid, int) or isinstance(pid, bool) or not isinstance(created, int) or isinstance(created, bool):
+            self.log.write("ledger: a process that could not be ended has no readable id or creation time")
+            return
+        entry = {"record": "process_unended", "attempt": self.run_id, "pid": pid, "created": created,
+                 "image": str(record.get("image") or "")[:260], "time": utc_now()}
+        try:
+            self.ledger.append(entry)
+        except Stop:
+            self.log.write("ledger: a process_unended record could not be written")
+
+    def stop_message(self, code: str) -> str:
+        """LR-89: the stop's message, saying when a process could not be ended."""
+        return STOP_MESSAGES.get(code, code) + (UNENDED_NOTE if self.unended else "")
 
     def check_folders(self) -> None:
         for folder in self.config["must_not_open"]:
@@ -1986,6 +2062,7 @@ class Launcher:
         self.git("config", "user.name", self.bot_name)
         self.git("config", "user.email", self.bot_email)
         self.git("config", "credential.helper", "")
+        self.git("config", "core.autocrlf", "false")  # LR-91: the model's git and the launcher's agree on line endings
         exclude = self.repo / ".git" / "info" / "exclude"
         exclude.parent.mkdir(parents=True, exist_ok=True)
         with open(exclude, "a", encoding="utf-8", newline="\n") as handle:
@@ -2137,14 +2214,19 @@ class Launcher:
             return None
         venv = self.run_dir / "venv"
         lock = self.repo / "requirements.lock"
-        result = run([self.config["app_python"], "-m", "venv", *([] if lock.is_file() else ["--without-pip"]), str(venv)],
-                     self.log, "venv", env=plain_env())
+        temporary = self.run_dir / "tmp"
+        temporary.mkdir(exist_ok=True)
+        # LR-94: nothing of the launcher's environment (PIP_*, PYTHON*, proxies), no user configuration
+        env = git_env({"TEMP": str(temporary), "TMP": str(temporary), "TMPDIR": str(temporary)})
+        result = run([self.config["app_python"], "-I", "-m", "venv", *([] if lock.is_file() else ["--without-pip"]),
+                      str(venv)], self.log, "venv", env=env)
         if result.returncode != 0:
             raise Stop("VENV_FAILED", "The application's virtual environment could not be made.")
         if lock.is_file():
             python = venv / ("Scripts/python.exe" if os.name == "nt" else "bin/python")
-            result = run([str(python), "-m", "pip", "install", "--quiet", "-r", "requirements.lock"], self.log, "pip install",
-                         cwd=self.repo, env=plain_env())
+            result = run([str(python), "-I", "-m", "pip", "install", "--isolated", "--no-cache-dir",
+                          "--disable-pip-version-check", "--no-input", "--quiet", "-r", "requirements.lock"], self.log,
+                         "pip install", cwd=self.repo, env=env)
             if result.returncode != 0:
                 raise Stop("VENV_FAILED", "The application's requirements could not be installed.")
         return venv
@@ -2198,7 +2280,7 @@ class Launcher:
         if outcome == "MODEL_FAILED":
             raise Stop("MODEL_FAILED", f"The model exited with {attempt.exit_code}.")
         if outcome != "DONE":
-            raise Stop(outcome, STOP_MESSAGES.get(outcome, outcome))
+            raise Stop(outcome, self.stop_message(outcome))
 
     def reserve(self, role: str) -> dict:
         """LR-53, LR-56: the effective limit, and the attempt reserved in the ledger before the model starts."""
@@ -2291,10 +2373,13 @@ class Launcher:
         commits = git.out("rev-list", "--reverse", f"{self.start}..{tip}").split()
         if not commits:
             raise Stop("NO_CHANGES", "The model made no commit. Nothing was pushed.")
-        if self.args.command == "spec":
-            changed = git.out("diff", "--name-only", self.start, tip).splitlines()
-            if any(not path.startswith("acceptance/") for path in changed if path):
-                raise Stop("SPEC_OUTSIDE_ACCEPTANCE", "The spec-test author changed a path outside acceptance/. Nothing was pushed.")
+        if self.args.command == "spec":  # LR-93: every commit, against its parent; no merge commit
+            if git.out("rev-list", "--min-parents=2", f"{self.start}..{tip}"):
+                raise Stop("SPEC_MERGE_COMMIT", STOP_MESSAGES["SPEC_MERGE_COMMIT"])
+            for commit in commits:
+                changed = git.out("diff-tree", "-r", "--no-commit-id", "--name-only", commit).splitlines()
+                if any(not path.startswith("acceptance/") for path in changed if path):
+                    raise Stop("SPEC_OUTSIDE_ACCEPTANCE", "The spec-test author changed a path outside acceptance/. Nothing was pushed.")
         self.verified = git.out("rev-parse", "--verify", f"{tip}^{{commit}}")  # LR-69: the commit the checks saw
         if not re.fullmatch(r"[0-9a-f]{40}", self.verified) or self.verified != commits[-1]:
             raise Stop("GIT_FAILED", "The verified commit could not be read.")
@@ -2331,7 +2416,7 @@ class Launcher:
         if os.name != "nt" or self.model_since is None:
             return
         try:
-            found = outside_processes(user_processes(None), self.model_since, {os.getpid()})
+            found = outside_processes(user_processes(None), self.model_since, {os.getpid()} | self.chain)
         except OSError:
             self.log.write("search before the push: the user's processes could not be listed")
             raise Stop("PROCESS_BEFORE_PUSH", STOP_MESSAGES["PROCESS_BEFORE_PUSH"]) from None
@@ -2339,8 +2424,10 @@ class Launcher:
             ended = end_process(record["pid"])
             self.log.write(f"search before the push: a process: {describe_process(record)}; "
                            f"{'it is ended' if ended else 'it could not be ended'}")
+            if not ended:
+                self.note_unended(record)  # LR-89
         if found:
-            raise Stop("PROCESS_BEFORE_PUSH", STOP_MESSAGES["PROCESS_BEFORE_PUSH"])
+            raise Stop("PROCESS_BEFORE_PUSH", self.stop_message("PROCESS_BEFORE_PUSH"))
 
     def push(self) -> None:
         self.search_before_push()  # LR-83
