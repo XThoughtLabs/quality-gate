@@ -8,10 +8,11 @@ on Windows and on Linux alike."""
 from __future__ import annotations
 
 import copy
+import os
 import re
 import subprocess
 import sys
-from pathlib import Path
+from pathlib import Path, PureWindowsPath
 
 import pytest
 
@@ -96,11 +97,50 @@ def test_config_the_example_loads_once_its_placeholders_are_filled(tmp_path):
     assert config["homepage"] == "https://github.com/ExampleOrg/demo-repo"
 
 
+# Shown in place of the operator's own name, so that a failure's message and log never hold the name itself.
+OPERATOR_NAME = "<the operator's own name, from USERNAME or USERPROFILE>"
+
+
+def operator_names() -> tuple[str, ...]:
+    """The operator's own names, read at run time and never written into this file: the Windows user name
+    (USERNAME) and the last part of the profile folder (USERPROFILE). Unset or empty values are left out."""
+    names = (os.environ.get("USERNAME", ""), PureWindowsPath(os.environ.get("USERPROFILE", "")).name)
+    return tuple(dict.fromkeys(name.strip() for name in names if name.strip()))
+
+
+def real_values_in(text: str) -> list[str]:
+    """The pilot's values the text holds, and OPERATOR_NAME once if it holds one of the operator's own names
+    (compared without regard to case, as Windows compares user names)."""
+    found = [value for value in ("mp-claude", "gate-practice-app", "xtl-gate-executor", "xtl-gate-reviewer",
+                                 "C:\\xtl-gate-executor") if value in text]
+    if any(name.lower() in text.lower() for name in operator_names()):
+        found.append(OPERATOR_NAME)
+    return found
+
+
 def test_config_the_example_names_no_real_value():
     text = (SETUP_DIR / "setup.example.toml").read_text(encoding="utf-8")
-    for value in ("mp-claude", "gate-practice-app", "xtl-gate-executor", "xtl-gate-reviewer",
-                  "C:\\xtl-gate-executor"):
-        assert value not in text, value
+    found = real_values_in(text)
+    assert not found, found
+
+
+def test_config_the_check_takes_the_operators_name_at_run_time(monkeypatch):
+    """The check of the example finds the operator's own Windows user name and profile folder name, read at
+    run time (HQ-TASK-M1-A5 section 4 D): planted into a copy of the real example, each is reported; the real
+    example, and a run where neither variable is set, report nothing."""
+    monkeypatch.setenv("USERNAME", "planted-user-a5")
+    monkeypatch.setenv("USERPROFILE", "C:\\Users\\planted-profile-a5")
+    example = (SETUP_DIR / "setup.example.toml").read_text(encoding="utf-8")
+    assert "<" in example
+    assert real_values_in(example) == []
+    by_user = example.replace("<", "Planted-User-A5 <", 1)
+    by_profile = example.replace("<", "C:\\Users\\planted-profile-a5\\keys <", 1)
+    assert real_values_in(by_user) == [OPERATOR_NAME]
+    assert real_values_in(by_profile) == [OPERATOR_NAME]
+    monkeypatch.delenv("USERNAME")
+    monkeypatch.delenv("USERPROFILE")
+    assert operator_names() == ()
+    assert real_values_in(by_user) == []
 
 
 def test_config_good_values(tmp_path):
