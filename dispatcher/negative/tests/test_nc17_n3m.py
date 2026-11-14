@@ -133,6 +133,8 @@ def test_nc17_a_refusal_for_another_reason_is_not_done(world, status, message):
     world.fake.attempts["merge"] = (status, message)
     result = world.run(argv=n3m_argv(world))
     assert result.code == 6 and result.stop_line.startswith("NEGATIVE GITHUB_ERROR: "), result.out
+    # The refusal is reported as such, with GitHub's first line, never as an unexpected error (closes mutant N02).
+    assert "no refusal naming stage-a/policy" in result.stop_line and message.splitlines()[0][:40] in result.stop_line
 
 
 @pytest.mark.parametrize("status", [201, 202, 204])
