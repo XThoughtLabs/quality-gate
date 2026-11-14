@@ -121,6 +121,21 @@ NO_GRAFTS = "no-grafts"  # LR-80: GIT_GRAFT_FILE names this file in the hooks fo
 GIT_SAFE = ("-c", "gc.auto=0", "-c", "maintenance.auto=false")  # LR-80: no git process outlives its command
 POSIX_TRUSTED = ("/usr/", "/bin/", "/sbin/", "/opt/")  # LR-81
 FOLDERID_PROGRAM_FILES = ("{905E63B6-C1BF-494E-B29C-65B732D3D21A}", "{7C5A40EF-A0FB-4BFC-874A-C0F2E0B9FA8E}")
+SYSTEM_SID = "S-1-5-18"
+WITNESS_FORMAT = "xtl-witness/1"  # LR-97: the operator's witness file
+WITNESS_FRESH_SECONDS = 2  # LR-97: the witness's last write is at most this old
+WITNESS_AFTER_SECONDS = 0.5  # LR-97: a write this long after a process's creation can judge it
+WITNESS_WAIT_SECONDS = 2  # LR-97: the longest wait for such a write
+WITNESS_POLL_SECONDS = 0.1  # LR-97: how often the file is read again during that wait
+WITNESS_MAX_BYTES = 16 * 1024 * 1024  # LR-97: a larger witness file is not read
+WITNESS_WRITERS = (SYSTEM_SID, ADMINISTRATORS)  # LR-97: besides the operator, the only ones who may write there
+WITNESS_WRITE_BITS = WRITE_BITS | 0x40  # LR-97: and DeleteChild: write, delete, add, change the owner or the rules
+# LR-97 (review round 1, F2): on a folder above the witness, the rights that let someone move, replace or re-permit
+# what it holds: DeleteChild, Delete, WriteDAC, WriteOwner, GenericAll (adding a new entry replaces nothing)
+ANCESTOR_BITS = 0x40 | 0x10000 | 0x40000 | 0x80000 | 0x10000000
+TRUSTED_INSTALLER = "S-1-5-80-956008885-3418522649-1831038044-1853292631-2271478464"  # owns the drive's root
+FILETIME_SECOND = 10_000_000
+WATCH_MINUTE_SECONDS = 60  # LR-98: one minute of the watch
 
 
 class Stop(Exception):
@@ -665,6 +680,10 @@ def _process_facts(pid: int) -> tuple[str | None, str | None]:
         k32.CloseHandle(handle)
 
 
+OTHERS_SEEN: set[tuple[int, int]] = set()  # LR-97: (pid, creation time) of other users' processes the searches saw
+OTHERS_BOUND = 100_000
+
+
 def user_processes(job) -> list[dict]:
     """LR-82, LR-87: the processes of the current user and those of unknown owner. Never their command lines."""
     p = _proc()
@@ -689,6 +708,8 @@ def user_processes(job) -> list[dict]:
             continue
         sid, path = fact(pid)
         if whose(sid) == "other" and pid not in inside:
+            if len(OTHERS_SEEN) < OTHERS_BOUND:
+                OTHERS_SEEN.add((pid, entry["created"]))  # LR-97: counted at the end of a run, never named
             continue  # known to be another user's
         ppid = entry["ppid"]
         parent = table.get(ppid)
@@ -836,6 +857,414 @@ def describe_process(record: dict) -> str:
         when = (datetime(1601, 1, 1, tzinfo=timezone.utc) + timedelta(microseconds=created // 10)).strftime(
             "%Y-%m-%dT%H:%M:%S.%fZ")
     return f"pid {record.get('pid')}, image {record.get('image')}, created {when}, owner {record.get('owner', 'self')}"
+
+
+# ---------------------------------------------------------------- the operator and its witness (LR-96, LR-97)
+
+
+def _sid_text(ctypes, wintypes, adv, k32, pointer) -> str | None:
+    if not pointer:
+        return None
+    text = wintypes.LPWSTR()
+    if not adv.ConvertSidToStringSidW(pointer, ctypes.byref(text)):
+        return None
+    try:
+        return text.value
+    finally:
+        k32.LocalFree(ctypes.cast(text, ctypes.c_void_p))
+
+
+def session_user_sid() -> str | None:
+    """LR-97: the SID of the user logged on to the launcher's own Windows session: the session that holds this
+    process, its user from the terminal services' session information, and that account's SID. Read from Windows
+    alone, never from the configuration, an argument or the process's variables. None when it cannot be read."""
+    if os.name != "nt":
+        return None
+    import ctypes
+    from ctypes import wintypes
+    try:
+        wts = ctypes.WinDLL("wtsapi32", use_last_error=True)
+    except OSError:
+        return None
+    k32 = ctypes.WinDLL("kernel32", use_last_error=True)
+    adv = ctypes.WinDLL("advapi32", use_last_error=True)
+    wts.WTSQuerySessionInformationW.argtypes = [wintypes.HANDLE, wintypes.DWORD, ctypes.c_int,
+                                                ctypes.POINTER(wintypes.LPWSTR), ctypes.POINTER(wintypes.DWORD)]
+    wts.WTSQuerySessionInformationW.restype = wintypes.BOOL
+    wts.WTSFreeMemory.argtypes, wts.WTSFreeMemory.restype = [ctypes.c_void_p], None
+    k32.ProcessIdToSessionId.argtypes = [wintypes.DWORD, ctypes.POINTER(wintypes.DWORD)]
+    k32.ProcessIdToSessionId.restype = wintypes.BOOL
+    k32.LocalFree.argtypes, k32.LocalFree.restype = [wintypes.HLOCAL], wintypes.HLOCAL
+    adv.LookupAccountNameW.argtypes = [wintypes.LPCWSTR, wintypes.LPCWSTR, ctypes.c_void_p,
+                                       ctypes.POINTER(wintypes.DWORD), wintypes.LPWSTR, ctypes.POINTER(wintypes.DWORD),
+                                       ctypes.POINTER(ctypes.c_int)]
+    adv.LookupAccountNameW.restype = wintypes.BOOL
+    adv.ConvertSidToStringSidW.argtypes = [ctypes.c_void_p, ctypes.POINTER(wintypes.LPWSTR)]
+    adv.ConvertSidToStringSidW.restype = wintypes.BOOL
+    session = wintypes.DWORD()
+    if not k32.ProcessIdToSessionId(os.getpid(), ctypes.byref(session)):
+        return None
+
+    def text(kind: int) -> str | None:  # WTSUserName 5, WTSDomainName 7
+        buffer, size = wintypes.LPWSTR(), wintypes.DWORD()
+        if not wts.WTSQuerySessionInformationW(None, session.value, kind, ctypes.byref(buffer), ctypes.byref(size)):
+            return None
+        try:
+            return buffer.value
+        finally:
+            wts.WTSFreeMemory(ctypes.cast(buffer, ctypes.c_void_p))
+
+    user, domain = text(5), text(7)
+    if not user:
+        return None
+    name = f"{domain}\\{user}" if domain else user
+    sid_size, domain_size, use = wintypes.DWORD(0), wintypes.DWORD(0), ctypes.c_int()
+    adv.LookupAccountNameW(None, name, None, ctypes.byref(sid_size), None, ctypes.byref(domain_size), ctypes.byref(use))
+    if not sid_size.value:
+        return None
+    sid = ctypes.create_string_buffer(sid_size.value)
+    found_domain = ctypes.create_unicode_buffer(max(domain_size.value, 1))
+    if not adv.LookupAccountNameW(None, name, sid, ctypes.byref(sid_size), found_domain, ctypes.byref(domain_size),
+                                  ctypes.byref(use)):
+        return None
+    return _sid_text(ctypes, wintypes, adv, k32, ctypes.cast(sid, ctypes.c_void_p))
+
+
+def witness_security(path: str | Path) -> tuple[str | None, list[tuple[str, int, str]] | None, bool] | None:
+    """LR-97: (owner SID, the access list's rules as (SID, mask, "Allow" or "Deny"), or None for a null list, whether
+    it is a link or a junction) of a file or a folder, from its security descriptor; None when it cannot be read.
+    A rule of a kind this function does not parse is given as an allow rule of every right (fail closed)."""
+    if os.name != "nt":
+        return None
+    try:
+        reparse = bool(os.lstat(path).st_file_attributes & 0x400)  # FILE_ATTRIBUTE_REPARSE_POINT
+    except OSError:
+        return None
+    import ctypes
+    from ctypes import wintypes
+    k32 = ctypes.WinDLL("kernel32", use_last_error=True)
+    adv = ctypes.WinDLL("advapi32", use_last_error=True)
+    adv.GetNamedSecurityInfoW.argtypes = [wintypes.LPCWSTR, ctypes.c_int, wintypes.DWORD,
+                                          ctypes.POINTER(ctypes.c_void_p), ctypes.POINTER(ctypes.c_void_p),
+                                          ctypes.POINTER(ctypes.c_void_p), ctypes.POINTER(ctypes.c_void_p),
+                                          ctypes.POINTER(ctypes.c_void_p)]
+    adv.GetNamedSecurityInfoW.restype = wintypes.DWORD
+    adv.ConvertSidToStringSidW.argtypes = [ctypes.c_void_p, ctypes.POINTER(wintypes.LPWSTR)]
+    adv.ConvertSidToStringSidW.restype = wintypes.BOOL
+    k32.LocalFree.argtypes, k32.LocalFree.restype = [wintypes.HLOCAL], wintypes.HLOCAL
+    owner, dacl, descriptor = ctypes.c_void_p(), ctypes.c_void_p(), ctypes.c_void_p()
+    if adv.GetNamedSecurityInfoW(str(path), 1, 0x1 | 0x4, ctypes.byref(owner), None, ctypes.byref(dacl), None,
+                                 ctypes.byref(descriptor)) != 0:  # SE_FILE_OBJECT; OWNER and DACL
+        return None
+    try:
+        parts = _security_parts(ctypes, wintypes, adv, k32, owner.value, dacl.value)
+        return None if parts is None else (parts[0], parts[1], reparse)
+    finally:
+        k32.LocalFree(descriptor)
+
+
+def _security_parts(ctypes, wintypes, adv, k32, owner, dacl) -> tuple[str | None, list | None] | None:
+    """LR-97: the owner's SID and the access list's rules that apply to the object itself (a rule its children only
+    inherit is left out). A rule of a kind not parsed here reads as an allow rule of every right (fail closed)."""
+    adv.GetAce.argtypes = [ctypes.c_void_p, wintypes.DWORD, ctypes.POINTER(ctypes.c_void_p)]
+    adv.GetAce.restype = wintypes.BOOL
+
+    class Acl(ctypes.Structure):
+        _fields_ = [("AclRevision", ctypes.c_ubyte), ("Sbz1", ctypes.c_ubyte), ("AclSize", wintypes.WORD),
+                    ("AceCount", wintypes.WORD), ("Sbz2", wintypes.WORD)]
+
+    class Ace(ctypes.Structure):  # ACCESS_ALLOWED_ACE and ACCESS_DENIED_ACE, up to SidStart
+        _fields_ = [("AceType", ctypes.c_ubyte), ("AceFlags", ctypes.c_ubyte), ("AceSize", wintypes.WORD),
+                    ("Mask", wintypes.DWORD)]
+
+    owner_sid = _sid_text(ctypes, wintypes, adv, k32, owner)
+    if not dacl:
+        return owner_sid, None
+    rules: list[tuple[str, int, str]] = []
+    for index in range(Acl.from_address(dacl).AceCount):
+        pointer = ctypes.c_void_p()
+        if not adv.GetAce(dacl, index, ctypes.byref(pointer)):
+            return None
+        ace = Ace.from_address(pointer.value)
+        if ace.AceFlags & 0x8:  # INHERIT_ONLY_ACE: it grants nothing on this object
+            continue
+        if ace.AceType in (0, 1):  # ACCESS_ALLOWED_ACE_TYPE, ACCESS_DENIED_ACE_TYPE
+            sid = _sid_text(ctypes, wintypes, adv, k32, pointer.value + ctypes.sizeof(Ace))
+            rules.append((sid or "?", int(ace.Mask), "Allow" if ace.AceType == 0 else "Deny"))
+        elif ace.AceType in (6, 10, 12):  # denied object, denied callback, denied callback object
+            rules.append(("?", int(ace.Mask), "Deny"))
+        else:
+            rules.append(("?", 0xFFFFFFFF, "Allow"))
+    return owner_sid, rules
+
+
+def witness_file(path: str | Path) -> tuple[tuple, bytes] | None:
+    """LR-97 (review round 1, F2): the witness file opened once, without following a link: (its security as
+    witness_security gives it, read from that open; at most WITNESS_MAX_BYTES + 1 of its bytes, from the same
+    open). The open shares reading, writing and deleting; while it lasts the witness's replacement of the file may
+    still fail, and the witness then tries again (xtl_witness.py). None when it cannot be opened."""
+    if os.name != "nt":
+        return None
+    import ctypes
+    from ctypes import wintypes
+    k32 = ctypes.WinDLL("kernel32", use_last_error=True)
+    adv = ctypes.WinDLL("advapi32", use_last_error=True)
+    k32.CreateFileW.argtypes = [wintypes.LPCWSTR, wintypes.DWORD, wintypes.DWORD, ctypes.c_void_p, wintypes.DWORD,
+                                wintypes.DWORD, wintypes.HANDLE]
+    k32.CreateFileW.restype = wintypes.HANDLE
+    k32.ReadFile.argtypes = [wintypes.HANDLE, ctypes.c_void_p, wintypes.DWORD, ctypes.POINTER(wintypes.DWORD),
+                             ctypes.c_void_p]
+    k32.ReadFile.restype = wintypes.BOOL
+    k32.GetFileAttributesW.argtypes, k32.GetFileAttributesW.restype = [wintypes.LPCWSTR], wintypes.DWORD
+    k32.CloseHandle.argtypes, k32.CloseHandle.restype = [wintypes.HANDLE], wintypes.BOOL
+    k32.LocalFree.argtypes, k32.LocalFree.restype = [wintypes.HLOCAL], wintypes.HLOCAL
+    adv.GetSecurityInfo.argtypes = [wintypes.HANDLE, ctypes.c_int, wintypes.DWORD] + [ctypes.POINTER(ctypes.c_void_p)] * 5
+    adv.GetSecurityInfo.restype = wintypes.DWORD
+    adv.ConvertSidToStringSidW.argtypes = [ctypes.c_void_p, ctypes.POINTER(wintypes.LPWSTR)]
+    adv.ConvertSidToStringSidW.restype = wintypes.BOOL
+
+    class Information(ctypes.Structure):  # BY_HANDLE_FILE_INFORMATION, up to its attributes
+        _fields_ = [("dwFileAttributes", wintypes.DWORD), ("rest", ctypes.c_byte * 48)]
+
+    k32.GetFileInformationByHandle.argtypes = [wintypes.HANDLE, ctypes.POINTER(Information)]
+    k32.GetFileInformationByHandle.restype = wintypes.BOOL
+    # GENERIC_READ | READ_CONTROL; share read, write and delete; OPEN_EXISTING; FILE_FLAG_OPEN_REPARSE_POINT
+    handle = k32.CreateFileW(str(path), 0x80000000 | 0x20000, 0x7, None, 3, 0x00200000, None)
+    if not handle or handle == wintypes.HANDLE(-1).value:
+        return None
+    try:
+        information = Information()
+        if not k32.GetFileInformationByHandle(handle, ctypes.byref(information)):
+            return None
+        reparse = bool(information.dwFileAttributes & 0x400) or bool(information.dwFileAttributes & 0x10)
+        owner, dacl, descriptor = ctypes.c_void_p(), ctypes.c_void_p(), ctypes.c_void_p()
+        if adv.GetSecurityInfo(handle, 1, 0x1 | 0x4, ctypes.byref(owner), None, ctypes.byref(dacl), None,
+                               ctypes.byref(descriptor)) != 0:
+            return None
+        try:
+            parts = _security_parts(ctypes, wintypes, adv, k32, owner.value, dacl.value)
+        finally:
+            k32.LocalFree(descriptor)
+        if parts is None:
+            return None
+        chunks, left = [], WITNESS_MAX_BYTES + 1
+        buffer = ctypes.create_string_buffer(1 << 16)
+        while left > 0:
+            got = wintypes.DWORD()
+            if not k32.ReadFile(handle, buffer, min(len(buffer), left), ctypes.byref(got), None):
+                return None
+            if not got.value:
+                break
+            chunks.append(buffer.raw[:got.value])
+            left -= got.value
+        return (parts[0], parts[1], reparse), b"".join(chunks)
+    finally:
+        k32.CloseHandle(handle)
+
+
+def process_created(process) -> int | None:
+    """LR-96: the creation time, as a FILETIME, of a process the launcher started, from the launcher's own handle."""
+    handle = getattr(process, "_handle", None)
+    if os.name != "nt" or handle is None:
+        return None
+    p = _proc()
+    ctypes, wintypes = p["ctypes"], p["wintypes"]
+    times = [wintypes.FILETIME() for _ in range(4)]
+    if not p["k32"].GetProcessTimes(int(handle), *(ctypes.byref(t) for t in times)):
+        return None
+    created = (times[0].dwHighDateTime << 32) | times[0].dwLowDateTime
+    return created or None
+
+
+class Witness:
+    """LR-97: the operator's witness file. `read()` gives (written, pairs) only when the folder's owner is the operator,
+    SYSTEM or Administrators, the file's owner is the operator, nobody else may write, delete, add, or change the
+    owner or the rules of either, neither is a link, the file is well formed, and it was written at most
+    WITNESS_FRESH_SECONDS ago; otherwise None, and `reason` says why."""
+
+    def __init__(self, path: str | None, operator: str | None, me: str | None) -> None:
+        self.path = path
+        self.operator = operator if operator and operator != me else None
+        self.reason = ""
+
+    def refuse(self, reason: str) -> None:
+        self.reason = reason
+        return None
+
+    def problem(self, what: str, security, owners: tuple) -> str:
+        if security is None:
+            return f"the {what}'s security cannot be read"
+        owner, rules, reparse = security
+        if reparse:
+            return f"the {what} is a link"
+        if owner not in owners:
+            return f"the {what}'s owner is not the operator"
+        if rules is None:
+            return f"the {what} has no access list"
+        for sid, mask, kind in rules:
+            if kind != "Deny" and sid != self.operator and sid not in WITNESS_WRITERS and mask & WITNESS_WRITE_BITS:
+                return f"another user may change the {what}"
+        return ""
+
+    def ancestor_problem(self, folder: Path) -> str:
+        """Review round 1, F2: every folder above the witness's folder, up to the drive's root, is no link, belongs to
+        the operator, SYSTEM, Administrators or TrustedInstaller, and lets nobody else move, replace or re-permit
+        what it holds (ANCESTOR_BITS)."""
+        trusted = (self.operator, *WITNESS_WRITERS, TRUSTED_INSTALLER)
+        for ancestor in folder.parents:
+            security = witness_security(ancestor)
+            if security is None:
+                return "a folder above the witness cannot be read"
+            owner, rules, reparse = security
+            if reparse:
+                return "a folder above the witness is a link"
+            if owner not in trusted:
+                return "a folder above the witness belongs to another user"
+            if rules is None:
+                return "a folder above the witness has no access list"
+            for sid, mask, kind in rules:
+                if kind != "Deny" and sid not in trusted and mask & ANCESTOR_BITS:
+                    return "another user may move or change a folder above the witness"
+        return ""
+
+    def read(self) -> tuple[int, frozenset] | None:
+        if not self.path:
+            return self.refuse("no witness file is configured")
+        if not self.operator:
+            return self.refuse("no operator")
+        path = Path(self.path)
+        problem = (self.ancestor_problem(path.parent)
+                   or self.problem("folder", witness_security(path.parent), (self.operator, *WITNESS_WRITERS)))
+        if problem:
+            return self.refuse(problem)
+        opened = witness_file(path)  # the file's security and its bytes from one open (review round 1, F2)
+        if opened is None:
+            return self.refuse("the file cannot be read")
+        security, data = opened
+        problem = self.problem("file", security, (self.operator,))
+        if problem:
+            return self.refuse(problem)
+        if len(data) > WITNESS_MAX_BYTES:
+            return self.refuse("the file is too large")
+        try:
+            value = json.loads(data.decode("utf-8"))
+        except (UnicodeDecodeError, ValueError, RecursionError):
+            return self.refuse("the file is not JSON")
+        if (not isinstance(value, dict) or set(value) != {"format", "started", "written", "pairs"}
+                or value["format"] != WITNESS_FORMAT or not _is_int(value["started"], 0)
+                or not _is_int(value["written"], 0) or not isinstance(value["pairs"], list)):
+            return self.refuse("the file is not a witness file")
+        pairs = set()
+        for pair in value["pairs"]:
+            if not (isinstance(pair, list) and len(pair) == 2 and _is_int(pair[0], 0) and _is_int(pair[1], 0)):
+                return self.refuse("the file holds a malformed pair")
+            pairs.add((pair[0], pair[1]))
+        age = now_filetime() - value["written"]
+        if not 0 <= age <= WITNESS_FRESH_SECONDS * FILETIME_SECOND:
+            return self.refuse("the file is not fresh")
+        self.reason = ""
+        return value["written"], frozenset(pairs)
+
+
+class OperatorRule:
+    """LR-97: the operator's witness, applied to the processes of unknown owner that today's LR-82 judges foreign.
+    A listed (pid, creation time) is the operator's: passed and counted. Otherwise the rule waits, at most
+    WITNESS_WAIT_SECONDS, for a write made WITNESS_AFTER_SECONDS after the creation: listed by then, passed; not
+    listed and alive, foreign; not listed and gone, unjudged (counted, no stop). No witness, or one not trusted at
+    any reading: the old rules."""
+
+    def __init__(self, witness: "Witness | None", log, limit: int = 0) -> None:
+        self.witness, self.log = witness, log
+        self.limit = limit  # review round 1, F1: max_unjudged; one more stops the run
+        self.over = False
+        self.passed: set[tuple[int, int]] = set()
+        self.unjudged: set[tuple[int, int]] = set()
+        self.last_reason: str | None = None
+
+    @staticmethod
+    def plain_orphan(record: dict, exclude) -> bool:
+        """Review round 1, F1: LR-82 judges the record foreign only because its parent is gone; no mark of the
+        executor (the launcher or its chain as parent, a parent in the job or of the executor's user, WMI's or the
+        Task Scheduler's broker)."""
+        return (not record.get("parent_alive") and record.get("ppid") not in exclude and not record.get("parent_in_job")
+                and record.get("parent_owner") != "self" and not record.get("broker"))
+
+    def untrusted(self) -> None:
+        reason = getattr(self.witness, "reason", "") or "no witness"
+        if reason != self.last_reason:
+            self.log.write(f"witness: not trusted ({reason}): the old rules apply")
+            self.last_reason = reason
+
+    @staticmethod
+    def alive(pair: tuple[int, int]) -> bool:
+        try:
+            return process_alive(*pair)
+        except OSError:
+            return True  # fail closed: a process that cannot be shown gone stays foreign
+
+    def sort(self, found: list[dict], exclude=frozenset()) -> list[dict]:
+        """The records of `found` that stay foreign. `exclude` holds the launcher and its chain."""
+        waiting = [r for r in found if r.get("owner") == "unknown" and not r.get("in_job")
+                   and _is_int(r.get("pid"), 0) and _is_int(r.get("created"), 0)]
+        if not waiting or self.witness is None:
+            return list(found)
+        state = self.witness.read()
+        if state is None:
+            self.untrusted()
+            return list(found)
+        self.last_reason = None
+        verdict: dict[int, str] = {}
+        deadline = time.monotonic() + WITNESS_WAIT_SECONDS
+        after = int(WITNESS_AFTER_SECONDS * FILETIME_SECOND)
+        while True:
+            written, pairs = state
+            still = []
+            for record in waiting:
+                pair = (record["pid"], record["created"])
+                if pair in pairs:
+                    verdict[id(record)] = "passed"
+                elif written >= record["created"] + after:
+                    gone = self.plain_orphan(record, exclude) and not self.alive(pair)
+                    verdict[id(record)] = "unjudged" if gone else "foreign"
+                else:
+                    still.append(record)
+            waiting = still
+            if not waiting or time.monotonic() >= deadline:
+                break  # what still waits stays foreign: the old rules
+            time.sleep(WITNESS_POLL_SECONDS)
+            state = self.witness.read()
+            if state is None:
+                self.untrusted()
+                break
+        kept = []
+        for record in found:
+            outcome = verdict.get(id(record), "foreign")
+            pair = (record.get("pid"), record.get("created"))
+            if outcome == "passed":
+                if pair not in self.passed:
+                    self.log.write(f"search: a process of the operator, listed by the witness, passed: "
+                                   f"{describe_process(record)}")
+                self.passed.add(pair)
+            elif outcome == "unjudged":
+                if pair not in self.unjudged:
+                    self.log.write(f"search: a process of unknown owner, not listed by the witness and gone, "
+                                   f"unjudged: {describe_process(record)}")
+                self.unjudged.add(pair)
+                if len(self.unjudged) > self.limit and not self.over:
+                    self.over = True
+                    self.log.write(f"search: {len(self.unjudged)} processes unjudged, more than max_unjudged "
+                                   f"{self.limit}")
+            else:
+                kept.append(record)
+        return kept
+
+
+def local_time(created) -> str:
+    """LR-98: a FILETIME as the local clock's HH:MM:SS, for the watch."""
+    if not isinstance(created, int):
+        return "--:--:--"
+    moment = datetime(1601, 1, 1, tzinfo=timezone.utc) + timedelta(microseconds=created // 10)
+    return moment.astimezone().strftime("%H:%M:%S")
 
 
 def trusted_path() -> str:
@@ -1035,6 +1464,12 @@ def load_config(path: Path) -> dict:
     ledger = section.get("ledger_file")  # LR-55
     if not isinstance(ledger, str) or not DRIVE_PATH.fullmatch(ledger):
         raise ConfigError("[launcher] ledger_file must be a full drive path")
+    unjudged = section.get("max_unjudged", 0)  # review round 1, F1: unjudged processes a run may tolerate
+    if not isinstance(unjudged, int) or isinstance(unjudged, bool) or unjudged < 0:
+        raise ConfigError("[launcher] max_unjudged must be an integer of 0 or more")
+    witness = section.get("witness_file")  # LR-97: optional; without it the old rules apply
+    if witness is not None and (not isinstance(witness, str) or not DRIVE_PATH.fullmatch(witness)):
+        raise ConfigError("[launcher] witness_file must be a full drive path")
     image = section.get("claude_image", default_claude_image(section["claude_command"][0]))  # LR-68, LR-86
     if not isinstance(image, str) or not re.fullmatch(r"[^\\/:*?\"<>|\r\n]+", image):
         raise ConfigError("[launcher] claude_image must be a file name")
@@ -1440,6 +1875,8 @@ class ModelRun:
         self.ran = False
         self.ended = False
         self.since: int | None = None
+        self.model_created: int | None = None  # LR-96: from the launcher's own handle to the model's process
+        self.own_logged: set[tuple] = set()
         self.last_scan = 0.0
         self.stop_began: float | None = None
         self.lines: queue.Queue = queue.Queue()
@@ -1535,6 +1972,31 @@ class ModelRun:
     def describe(self, record: dict) -> str:
         return describe_process(record)
 
+    def own_exited(self, record: dict) -> bool:
+        """LR-96: a record with the model's pid and the model's creation time is the model's own process; listed
+        outside the job, it counts as gone only when the launcher's own handle shows that it has exited, waited for
+        at most END_CHECK_SECONDS. No readable creation time: never."""
+        if self.process is None or self.model_created is None:
+            return False
+        if record.get("pid") != self.process.pid or record.get("created") != self.model_created:
+            return False
+        try:
+            self.process.wait(timeout=END_CHECK_SECONDS)
+        except subprocess.TimeoutExpired:
+            return False
+        pair = (record.get("pid"), record.get("created"))
+        if pair not in self.own_logged:
+            self.own_logged.add(pair)
+            self.log.write(f"search: the model's own exited process was still listed: {self.describe(record)}")
+        return True
+
+    def judge(self, found: list[dict]) -> list[dict]:
+        """LR-96, then LR-97: the records of `found` that stay foreign."""
+        kept = self.launcher.rule.sort([record for record in found if not self.own_exited(record)], self.exclude)
+        if self.launcher.rule.over:  # review round 1, F1: more unjudged than max_unjudged
+            self.want_stop("PROCESS_OUTSIDE_JOB")
+        return kept
+
     def scan(self) -> None:
         """LR-67, LR-68 while the model runs, its grace and the wait for its exit included (LR-85)."""
         if os.name != "nt" or self.since is None:
@@ -1553,7 +2015,7 @@ class ModelRun:
                 self.log.write(f"search: a second Claude Code: {self.describe(record)}")
                 self.complete = False
                 self.want_stop("SECOND_MODEL")
-        for record in outside_processes(records, self.since, self.exclude):
+        for record in self.judge(outside_processes(records, self.since, self.exclude)):
             ended = end_process(record["pid"])
             self.log.write(f"search: a process outside the job: {self.describe(record)}; "
                            f"{'it is ended' if ended else 'it could not be ended'}")
@@ -1568,7 +2030,7 @@ class ModelRun:
         found_any = False
         for _ in range(END_SEARCHES):
             try:
-                found = outside_processes(user_processes(self.job), self.since, self.exclude)
+                found = self.judge(outside_processes(user_processes(self.job), self.since, self.exclude))
             except OSError:
                 self.log.write("search: the user's processes could not be listed after the end")
                 found, found_any = [], True
@@ -1605,6 +2067,7 @@ class ModelRun:
             raise Stop("MODEL_FAILED", "The model could not start.") from None
         self.log.write(f"model pid {self.process.pid}")
         if windows:
+            self.model_created = process_created(self.process)  # LR-96: read while it is still suspended
             try:
                 job_add(self.job, self.process)
                 self.in_job = True
@@ -1818,6 +2281,10 @@ class Launcher:
         self.watch_from: int | None = None  # LR-84: the start check's reading
         self.chain: set[int] = set()  # LR-84, LR-90: the launcher's process and its ancestors
         self.unended: set[tuple] = set()  # LR-89: (pid, creation time) of foreign processes that could not be ended
+        self.operator: str | None = None  # LR-97: the user of the launcher's session; never written anywhere
+        self.rule = OperatorRule(None, self.log)  # LR-97: the old rules until the operator and the witness are known
+        self.attempt: ModelRun | None = None  # LR-96: the model's attempt, for the search before the push
+        OTHERS_SEEN.clear()
         self.task_id = {"task": f"issue-{getattr(args, 'issue', '')}",
                         "spec": f"spec-{getattr(args, 'slug', '')}"}.get(args.command, "")
 
@@ -1861,7 +2328,83 @@ class Launcher:
             raise Stop("CLAUDE_IMAGE", f"Claude Code's image {self.claude_image} is not an .exe file name. "
                                        "Set claude_image in launcher.toml.")
         self.check_folders()
+        self.identify_operator(sid)
         self.check_start_processes()
+
+    def identify_operator(self, me: str | None) -> None:
+        """LR-97: the operator is the user of the launcher's own session, never this user and never configured; then
+        the operator's witness. Without an operator the old rules apply, and the log says so in one line."""
+        try:
+            operator = session_user_sid()
+        except OSError:
+            operator = None
+        if not isinstance(operator, str) or not SID.fullmatch(operator) or not me or operator == me:
+            operator = None  # review round 1, F9: without this user's own SID there is no operator either
+        self.operator = operator
+        limit = self.config.get("max_unjudged", 0)
+        if operator is None:
+            self.rule = OperatorRule(None, self.log, limit)
+            self.log.say("operator not identified: the old rules apply")
+            return
+        self.log.say("operator identified: yes")
+        path = self.config.get("witness_file")
+        witness = Witness(path, operator, me) if path else None
+        self.rule = OperatorRule(witness, self.log, limit)
+        if witness is None:
+            self.log.say("witness: not configured: the old rules apply")
+        elif witness.read() is None:
+            self.log.say(f"witness: not found or not trusted ({witness.reason}): the old rules apply")
+        else:
+            self.log.say("witness: found")
+
+    def operator_summary(self) -> None:
+        """LR-97: at the end of a run, how many processes of the operator and of other users were passed."""
+        since = self.model_since
+        others = sum(1 for _, created in OTHERS_SEEN if since is not None and created >= since)
+        self.log.write(f"operator rule: {len(self.rule.passed)} of the operator passed, {others} of other users "
+                       f"passed, {len(self.rule.unjudged)} unjudged")
+
+    def watch(self, minutes: int) -> None:
+        """LR-98: probe 2. For `minutes`, every second, the processes that today's rules (old) or the operator's
+        witness (new) would judge foreign, each once, with its time, image and owner class; then the counts. It ends
+        nothing, uses no network and writes no ledger."""
+        try:
+            me = current_sid()
+        except (OSError, Stop):
+            me = None
+        self.identify_operator(me)
+        since = now_filetime()
+        until = time.monotonic() + minutes * WATCH_MINUTE_SECONDS
+        old_flags: set[tuple] = set()
+        new_flags: set[tuple] = set()
+        reported: set[tuple] = set()
+        while time.monotonic() < until:
+            try:
+                records = user_processes(None)
+            except OSError:
+                self.log.say("watch: the processes could not be listed")
+                time.sleep(1.0)
+                continue
+            exclude = {os.getpid()} | launcher_chain(records)
+            old = outside_processes(records, since, exclude)
+            new = {(r.get("pid"), r.get("created")) for r in self.rule.sort(old, exclude)}
+            for record in old:
+                pair = (record.get("pid"), record.get("created"))
+                old_flags.add(pair)
+                if pair in new:
+                    new_flags.add(pair)
+                if pair in reported:
+                    continue
+                reported.add(pair)
+                owner = ("own" if record.get("owner", "self") == "self"
+                         else "operator" if pair in self.rule.passed else "unknown")
+                rules = ("old and new" if pair in new else "old; unjudged by the new" if pair in self.rule.unjudged
+                         else "old only")
+                self.log.say(f"watch: {local_time(record.get('created'))} {record.get('image')} owner {owner}: "
+                             f"flagged by {rules}")
+            time.sleep(max(0.0, min(1.0, until - time.monotonic())))
+        self.log.say(f"WATCH DONE: flagged by the old rules {len(old_flags)}, by the new rules {len(new_flags)}, "
+                     f"unjudged {len(self.rule.unjudged)}, passed as the operator's {len(self.rule.passed)}")
 
     def check_hooks_folder(self) -> None:
         """LR-10 extended by LR-80: the hooks folder is a plain folder that holds only its README, and is read-only."""
@@ -1926,11 +2469,12 @@ class Launcher:
         return STOP_MESSAGES.get(code, code) + (UNENDED_NOTE if self.unended else "")
 
     def check_folders(self) -> None:
-        for folder in self.config["must_not_open"]:
+        for number, folder in enumerate(self.config["must_not_open"], 1):
             state = folder_openable(folder)
-            self.log.write(f"must_not_open {folder}: {state}")
+            self.log.write(f"must_not_open entry {number}: {state}")  # LR-97 rule 6: the number, never the path
             if state == "open":
-                raise Stop("FOLDER_OPEN", f"This user can open {folder}. Deny it first; the launcher reads nothing there.")
+                raise Stop("FOLDER_OPEN", f"This user can open must_not_open entry {number} of launcher.toml. Deny it "
+                                          "first; the launcher reads nothing there.")
 
     # -------- token (LR-12 to LR-14)
 
@@ -2263,6 +2807,7 @@ class Launcher:
         self.log.write(f"model starts: limit {limit}, timeout {self.timeout_minutes} min")
         self.config_snapshot = self.clone_config()  # LR-70: what the clone's config must still be afterwards
         attempt = ModelRun(self, argv, model_env(role, venv), prompt.encode("utf-8"), limit, self.run_id)
+        self.attempt = attempt  # LR-96: the search before the push knows the model's own process too
         outcome = "ERROR"
         try:
             outcome = attempt.run(self.timeout_minutes * 60)
@@ -2420,6 +2965,12 @@ class Launcher:
         except OSError:
             self.log.write("search before the push: the user's processes could not be listed")
             raise Stop("PROCESS_BEFORE_PUSH", STOP_MESSAGES["PROCESS_BEFORE_PUSH"]) from None
+        if self.attempt is not None:  # LR-96, then LR-97
+            found = self.attempt.judge(found)
+        else:
+            found = self.rule.sort(found, {os.getpid()} | self.chain)
+        if self.rule.over and not found:  # review round 1, F1: more unjudged than max_unjudged
+            raise Stop("PROCESS_BEFORE_PUSH", self.stop_message("PROCESS_BEFORE_PUSH"))
         for record in found:
             ended = end_process(record["pid"])
             self.log.write(f"search before the push: a process: {describe_process(record)}; "
@@ -2491,6 +3042,7 @@ def parse(argv: list[str] | None) -> argparse.Namespace:
     parser.add_argument("--config", default=str(DEFAULT_CONFIG))
     commands = parser.add_subparsers(dest="command", required=True)
     commands.add_parser("check")
+    commands.add_parser("watch").add_argument("--minutes", type=positive, required=True)  # LR-98: probe 2
     for name, flag, kind in (("task", "--issue", positive), ("spec", "--slug", slug), ("fix", "--pr", positive)):
         command = commands.add_parser(name)
         command.add_argument(flag, type=kind, required=True)
@@ -2502,8 +3054,8 @@ def main(argv: list[str] | None = None) -> int:
     try:
         args = parse(argv)
     except SystemExit:
-        print("CONFIG: usage: xtl_launcher [--config FILE] check | task --issue N | spec --slug S | fix --pr N"
-              " [--max-messages M]", flush=True)
+        print("CONFIG: usage: xtl_launcher [--config FILE] check | watch --minutes M | task --issue N | spec --slug S"
+              " | fix --pr N [--max-messages M]", flush=True)
         return 2
     try:
         config_path = Path(args.config)
@@ -2521,6 +3073,10 @@ def main(argv: list[str] | None = None) -> int:
     log.write(f"start {args.command} {launcher.run_id}")
     code = 1
     try:
+        if args.command == "watch":  # LR-98: read-only, without the preflight's refusals
+            launcher.watch(args.minutes)
+            code = 0
+            return code
         launcher.preflight()
         if args.command == "check":
             log.say("PREFLIGHT OK")
@@ -2537,6 +3093,8 @@ def main(argv: list[str] | None = None) -> int:
         log.say(f"STOPPED ERROR: an unexpected {type(error).__name__}.")
     finally:
         launcher.revoke()
+        if args.command in ("task", "spec", "fix") and launcher.model_since is not None:
+            launcher.operator_summary()  # LR-97
         log.write(f"end, exit {code}")
         log.close()
     return code

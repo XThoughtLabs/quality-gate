@@ -435,6 +435,35 @@ class Seams:
             return [p for p in real(job) if p["pid"] in wanted]
 
         monkeypatch.setattr(module, "user_processes", listed_processes, raising=False)
+        # LR-97 (HQ-TASK-M1-C2S and its amendments): the user of the launcher's session, and the security of the
+        # witness's file and folder. By default no operator is identified, so every older test runs by the old rules.
+        # raising=False: the code before LR-97 has no such seams.
+        self.session_sid = None
+        self.witness_acl: dict[str, object] = {}
+
+        def session_user_sid():
+            self.calls.append(("session_user_sid", None, time.time()))
+            return self.session_sid
+
+        def witness_security(path):
+            key = norm(path)
+            if key in self.witness_acl:
+                value = self.witness_acl[key]
+                return value(self) if callable(value) else value
+            operator = self.session_sid
+            return (operator, [(operator, 0x1F01FF, "Allow"), ("S-1-5-18", 0x1F01FF, "Allow"),
+                               ("S-1-5-32-544", 0x1F01FF, "Allow"), (self.sid, 0x1200A9, "Allow")], False)
+
+        def witness_file(path):  # the file's security and its bytes, from one open (review round 1, F2)
+            try:
+                data = Path(path).read_bytes()
+            except OSError:
+                return None
+            return witness_security(path), data
+
+        monkeypatch.setattr(module, "session_user_sid", session_user_sid, raising=False)
+        monkeypatch.setattr(module, "witness_security", witness_security, raising=False)
+        monkeypatch.setattr(module, "witness_file", witness_file, raising=False)
         # Stage A3 (LR-80, LR-87): the launcher's hooks folder is read-only for the executor in a real setup; the
         # tests run as the person's own user, who can write it, so the seam says it cannot. raising=False: the code
         # before stage A3 has no such seam.

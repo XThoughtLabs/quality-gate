@@ -191,7 +191,8 @@ def test_lr11_folder_open(world, check):
     world.seams.folders[W.norm(world.candidate_folder)] = "open"
     res = world.run("task", "--issue", "5")
     check.preflight_stop(res, "FOLDER_OPEN")
-    assert str(world.candidate_folder) in res.last, res.last
+    # LR-97 rule 6 and review round 1's F3 (the CEO, 2026-11-14): the entry's number, never its path
+    assert "must_not_open entry 1" in res.last, res.last
     for text in (res.stdout, res.stderr, res.log_text):
         assert "INNER-SECRET-NAME-0451" not in text
 
@@ -201,7 +202,7 @@ def test_lr11_second_path_open(world, check):
     world.seams.folders[W.norm(world.absent_folder)] = "open"
     res = world.run("check")
     check.preflight_stop(res, "FOLDER_OPEN")
-    assert str(world.absent_folder) in res.last
+    assert "must_not_open entry 2" in res.last, res.last
 
 
 def test_lr11_control_absent_and_denied_pass_and_the_log_records_which(world):

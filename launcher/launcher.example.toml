@@ -30,6 +30,18 @@ max_messages_attempt = 80
 max_messages_task = 240
 max_runs_task = 3
 
+# The operator's witness and command (LAUNCHER-CONTRACT.md, LR-97 and LR-98). witness_file is the file the
+# operator's witness writes; xtl_operator.py makes its folder (only the operator, SYSTEM and Administrators may
+# write there; the executor's user may read). windows_user is the executor's Windows user and launcher_python the
+# executor's Python that runs this launcher; only xtl_operator.py reads these two. Without witness_file the launcher
+# keeps its old rules.
+witness_file = '<launcher root folder>\witness\witness.json'
+windows_user = '<executor user>'
+launcher_python = '<executor profile folder>\xtl-launcher-venv\Scripts\python.exe'
+# How many processes the witness could not judge (not listed, gone) a run tolerates; one more stops the run (LR-97
+# rule 4). 0 until the operator decides after the watch (probe 2).
+max_unjudged = 0
+
 # Optional. Outside tests the only values allowed are these defaults, and for repo_url
 # 'https://github.com/<owner>/<repository>.git' as the app file names it.
 api_url = "https://api.github.com"
