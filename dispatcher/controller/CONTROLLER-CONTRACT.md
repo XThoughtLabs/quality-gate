@@ -68,6 +68,8 @@ the code `UNREADABLE` (fail closed). The first rule that fails, in this order, i
     `user.type` = `Bot`.
 
   Codes: `PR_NOT_OPEN`, `PR_DRAFT`, `PR_WRONG_BASE`, `PR_FROM_FORK`, `PR_NOT_BY_EXECUTOR`.
+  - The PR's first read gives the head. If it cannot be read at all, or gives no head SHA of 40 hexadecimal characters,
+    nothing can be evaluated or posted: the run ends `GITHUB_ERROR` (exit 6).
 - **CR-3 The task.** The queue's own rule: the executor's launcher names a task's branch
   `ai/<issue number>-<branch_slug(issue title)>` (launcher contract LR-22), and the issue's title is the task's
   `title`. So the PR's `head.ref` must match `^ai/[1-9][0-9]{0,9}-(.+)$` and the captured slug must equal
@@ -105,9 +107,12 @@ the code `UNREADABLE` (fail closed). The first rule that fails, in this order, i
     GitHub does not give is `PATCH_UNREADABLE`.
   - `CODEOWNERS_PATH`: a path that a pattern of the base tip's CODEOWNERS names. The file is read from
     `.github/CODEOWNERS`, `CODEOWNERS` or `docs/CODEOWNERS` at the base tip, the first that exists, as GitHub does
-    (`GET /repos/{repo}/contents/{path}?ref={base tip}`). No CODEOWNERS file is `CODEOWNERS_MISSING`. Supported
-    patterns: `/dir/`, `/path`, `name` and `name/`, matched without regard to letter case (GitHub matches the exact
-    case; this match refuses more, never less). A pattern with `*`, `?`, `[`, `]`, `!` or `\` is
+    (`GET /repos/{repo}/contents/{path}?ref={base tip}`). No CODEOWNERS file is `CODEOWNERS_MISSING`. Each line's
+    first word is its pattern; blank lines and lines starting with `#` are skipped. Supported patterns, with
+    gitignore's meaning: `/dir/` and `/path` (anchored at the root), `dir/name` (a slash inside: anchored at the root
+    too), `name` (a file or folder of that name at any depth) and `name/` (a folder of that name at any depth). A
+    pattern names a path when it names the path itself or one of its folders. Matching ignores letter case (GitHub
+    matches the exact case; this match refuses more, never less). A pattern with `*`, `?`, `[`, `]`, `!` or `\` is
     `CODEOWNERS_UNSUPPORTED` for every PR (fail closed).
   - `OUTSIDE_POLICY`: anything else that is not one of the two admitted kinds:
     - *ordinary application code*: status `added` or `modified`, under one of `code_folders`, ending `.py`;
@@ -158,7 +163,9 @@ Otherwise a failing run is *refused*.
     then every other failing rule's code. It never holds a token or a key.
   - A merged PR gets no post (CR-9).
 - **CR-8 The merge.** Only after a success was posted:
-  1. Everything is read again: the PR, and CR-2 to CR-6 evaluated again. The PR's head must still be the head, and every
+  1. Everything is read again: the PR, and CR-2 to CR-6 evaluated again with every request of section 2 made again
+     (the base tip, the compare, the check runs, the `reports` branch, the statuses). The PR's head must still be the
+     head, and every
      rule must still hold. If the head moved, the run ends `REFUSED` with `HEAD_MOVED` and nothing more is posted. If a
      rule now fails on the same head, the controller's check is updated to `failure` (CR-7) and the run ends `REFUSED`.
   2. The PR's `mergeable` must be `true`. When it is `null` (GitHub is still computing it, the documented transient
@@ -174,10 +181,13 @@ Otherwise a failing run is *refused*.
   - Two runs at the same time are refused: the run creates `<log_file>.lock` exclusively before any request and removes
     it at its end. An existing lock ends the run `LOCKED` (exit 7) with nothing done. A lock left by a crash is removed
     by the operator after checking that no controller runs.
-- **CR-10 The record.** Each run that got past CR-1 appends one JSON line to `[controller] log_file` (its folder is
-  created if missing) and flushes it to disk: `time` (UTC), `repository`, `pr`, `head_sha`, `base_tip`, `task_id`,
-  `queue_sha256`, `rules` (each rule's `ok` and, when it failed, its code and detail), `outcome`, `policy_check_id`,
-  `merge_sha`, and `message` for a GitHub refusal. Never a token, a JWT or a key.
+- **CR-10 The record.** Each run that got past CR-1, CR-1a, CR-1b, CR-11's key check and the lock appends one JSON line
+  to `[controller] log_file` (its folder is created if missing) and flushes it to disk: `time` (UTC, ISO 8601),
+  `repository`, `pr`, `head_sha`, `base_tip`, `task_id`, `queue_sha256`, `rules`, `outcome`, `policy_check_id`,
+  `merge_sha`, and `message` (GitHub's status code and message, for a GitHub refusal or error). `rules` is an object
+  keyed by `CR-2` to `CR-6`: `{"ok": true}`, or `{"ok": false, "code": <code>, "detail": <text>}`; a rule not
+  evaluated is absent. A value not known is `null`. Never a token, a JWT or a key. A usage error and `LOCKED` write
+  no record.
 - **CR-11 The key.**
   - Before the key is read: `key_file` must be an absolute path to a regular file that is no symbolic link, and its
     access rules and its folder's must allow nobody but the operator's own user, SYSTEM (`S-1-5-18`) and the
@@ -204,6 +214,21 @@ Otherwise a failing run is *refused*.
   | 5 | `ALREADY_MERGED` | the PR was merged before this run | nothing |
   | 6 | `GITHUB_ERROR` | the token could not be had, or the check could not be posted; the detail says what was posted | as stated |
   | 7 | `LOCKED` | another run holds the lock (CR-9) | nothing |
+
+  The details: `MERGED` gives `PR <N> at <head> merged as <merge sha>`; `REFUSED` and `WAITING` start with the first
+  failing rule and its code (`CR-4 TEST_CHANGED: …`), or `HEAD_MOVED`; `MERGE_REFUSED` gives GitHub's status code and
+  message, or `NOT_MERGEABLE`; `USAGE` names the error's code where this contract gives one (`QUEUE_CHANGED`,
+  `QUEUE_INVALID`, `KEY_UNSAFE`).
+
+## 3a. Seams for the tests
+
+The module offers `main(argv, *, http=None, windows=None, sleep=None, clock=None) -> int`. Left out, `http` is
+`default_http(method, url, headers, body) -> (status, body bytes)`, which sends one request with `urllib` and a 30 s
+timeout, gives an HTTP error's status and body as an answer, and raises `ControllerError` for any URL that does not
+start with `https://api.github.com/`, before any request; `windows` is `default_windows()`, the setup script's
+`Windows` object loaded from `setup/setup_apps.py` of this repository; `sleep` is `time.sleep`; `clock` is
+`time.time`. `branch_slug(title)` is LR-22's function. The tests replace `http` with a fake GitHub, `windows` with a fake
+of `current_sid` and `acl_of`, `sleep` with a recorder and `clock` with a fixed time.
 
 ## 4. Limits of this contract
 
