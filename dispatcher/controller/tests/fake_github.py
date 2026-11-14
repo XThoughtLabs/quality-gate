@@ -328,6 +328,8 @@ class FakeGitHub:
                 data = None
             if data is None:
                 return 404, {"message": "Not Found"}
+            if isinstance(data, dict):
+                return 200, dict(data)  # an answer given verbatim (for example encoding "none")
             return 200, {"type": "file", "encoding": "base64", "content": b64(data)}
         if route == "tree":
             sha = path.rsplit("/", 1)[1]

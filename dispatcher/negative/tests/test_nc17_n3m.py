@@ -106,3 +106,46 @@ def test_nc17_writes_nothing_but_the_merge_attempt(world):
     world.run(argv=n3m_argv(world))
     writes = [c for c in world.fake.writes()]
     assert len(writes) == 1 and writes[0]["path"].endswith("/pulls/5/merge")
+
+
+# ---------------------------------------------------------------- amendment S4 and the gaps of review round 2 (S5)
+def test_nc17_draft_is_a_precondition(world):
+    add_pr(world, draft=True)
+    result = world.run(argv=n3m_argv(world))
+    assert result.code == 3, result.out
+    assert merges(world) == []
+
+
+def test_nc17_done_quotes_the_policy_line(world):
+    add_pr(world)
+    result = world.run(argv=n3m_argv(world))
+    assert result.code == 0, result.out
+    assert 'Required status check "stage-a/policy" is expected' in result.stop_line
+
+
+@pytest.mark.parametrize("status, message", [
+    (405, "Repository rule violations found\n\nRequired status check \"gate/final\" is expected.\n"),
+    (409, "Head branch was modified. Review and try the merge again."),
+    (422, "Validation Failed"),
+])
+def test_nc17_a_refusal_for_another_reason_is_not_done(world, status, message):
+    add_pr(world)
+    world.fake.attempts["merge"] = (status, message)
+    result = world.run(argv=n3m_argv(world))
+    assert result.code == 6 and result.stop_line.startswith("NEGATIVE GITHUB_ERROR: "), result.out
+
+
+@pytest.mark.parametrize("status", [201, 202, 204])
+def test_nc17_any_2xx_is_a_finding(world, status):
+    add_pr(world)
+    world.fake.attempts["merge"] = (status, "accepted by the fake")
+    result = world.run(argv=n3m_argv(world))
+    assert result.code == 1 and result.stop_line.startswith("NEGATIVE FINDING: "), result.out
+
+
+def test_nc17_no_answer_says_the_merge_may_have_been_done(world):
+    add_pr(world)
+    world.fake.disconnect("PUT", r"pulls/5/merge")
+    result = world.run(argv=n3m_argv(world))
+    assert result.code == 6, result.out
+    assert "may have been done" in result.stop_line and "#5" in result.stop_line
