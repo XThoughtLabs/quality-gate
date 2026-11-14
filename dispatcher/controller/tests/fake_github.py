@@ -221,7 +221,7 @@ class FakeGitHub:
         if route == "token":
             if not self._jwt_ok(headers.get("Authorization", "")):
                 return 401, b'{"message": "A JSON web token could not be decoded"}'
-        elif headers.get("Authorization") not in ("Bearer " + TOKEN, "token " + TOKEN):
+        elif headers.get("Authorization") not in ("Bearer " + self.token_value, "token " + self.token_value):
             return 401, b'{"message": "Bad credentials"}'
         if route in self.fail:
             status, answer = self.fail[route]
@@ -314,6 +314,9 @@ class FakeGitHub:
             if name.endswith("CODEOWNERS"):
                 if ref != self.base_tip or name not in self.codeowners:
                     return 404, {"message": "Not Found"}
+                if self.codeowners_encoding == "none-with-content":
+                    return 200, {"type": "file", "encoding": "none",
+                                 "content": b64(self.codeowners[name].encode())}
                 if self.codeowners_encoding != "base64":
                     return 200, {"type": "file", "encoding": self.codeowners_encoding, "content": ""}
                 return 200, {"type": "file", "encoding": "base64", "content": b64(self.codeowners[name].encode())}

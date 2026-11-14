@@ -176,6 +176,16 @@ def test_token_shaped_text_is_scrubbed(world, secret):
     assert secret not in text
 
 
+@pytest.mark.cr("CR-11")
+def test_a_token_of_another_shape_is_still_scrubbed_by_its_value(world):
+    """GitHub's older installation tokens looked like v1.<hex>: no shape filter knows them (closes mutant M49)."""
+    world.gh.token_value = "v1." + "f" * 40
+    world.gh.merge_answer = (405, {"message": "echo " + world.gh.token_value})
+    result = world.run()
+    assert result.code == 4, result.out
+    assert world.gh.token_value not in result.out + world.log_file.read_text(encoding="utf-8")
+
+
 # ---------------------------------------------------------------- R5: filter=all
 @pytest.mark.cr("CR-5")
 def test_check_runs_are_read_with_filter_all(world):
@@ -219,6 +229,13 @@ def test_a_pr_needs_code_and_a_new_test(world, files, code):
 @pytest.mark.cr("CR-4")
 def test_codeowners_without_base64_content_is_unreadable(world):
     world.gh.codeowners_encoding = "none"
+    refused(world, world.run(), "CR-4", "UNREADABLE")
+
+
+@pytest.mark.cr("CR-4")
+def test_codeowners_with_content_but_not_base64_is_unreadable(world):
+    """The contract asks for encoding base64 itself, not only a non-empty text (closes mutant M79)."""
+    world.gh.codeowners_encoding = "none-with-content"
     refused(world, world.run(), "CR-4", "UNREADABLE")
 
 
