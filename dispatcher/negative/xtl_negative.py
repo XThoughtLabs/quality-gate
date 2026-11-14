@@ -669,6 +669,8 @@ class Run:
             raise GitHubError(f"GitHub's answer to GET PR #{number} is not a PR")
         if data.get("state") != "open" or data.get("merged") is True:
             raise Precondition(f"PR #{number} is not open")
+        if data.get("draft") is not False:  # amendment S4
+            raise Precondition(f"PR #{number} is a draft")
         if base.get("ref") != self.base:
             raise Precondition(f"PR #{number} is not based on {self.base}")
         if head.get("sha") != expected:
@@ -687,10 +689,17 @@ class Run:
         if accepted:
             return "FINDING", (f"GitHub ACCEPTED the merge of PR #{number} at {expected} from the executor's app "
                                f"({shown}). This is a finding: stop and report it")
-        if result.status is not None and 400 <= result.status < 500:
-            return "DONE", (f"N3M: GitHub refused the executor's app's merge of PR #{number} at {expected} ({shown} "
-                            f"{result.message.splitlines()[0][:200] if result.message.strip() else ''}). Nothing changed")
-        return "GITHUB_ERROR", f"N3M: the merge attempt of PR #{number} got no clear refusal ({shown})"
+        if result.status is None:  # amendment S4
+            return "GITHUB_ERROR", (f"N3M: the merge request got no answer: the merge may have been done; read PR "
+                                    f"#{number}")
+        lines = [line.strip() for line in result.message.splitlines() if line.strip()]
+        policy_lines = [line for line in lines if POLICY_CHECK in line]
+        if 400 <= result.status < 500 and policy_lines:
+            return "DONE", (f"N3M: GitHub refused the executor's app's merge of PR #{number} at {expected} ({shown}: "
+                            f"{policy_lines[0][:200]}). Nothing changed")
+        first = lines[0][:200] if lines else "no message"
+        return "GITHUB_ERROR", (f"N3M: the merge attempt of PR #{number} got no refusal naming {POLICY_CHECK} "
+                                f"({shown}: {first})")
 
     def work(self) -> tuple[str, str]:
         app = load_app_file(Path(self.options["--app-file"]))

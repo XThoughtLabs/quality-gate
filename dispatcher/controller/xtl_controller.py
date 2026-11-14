@@ -652,15 +652,45 @@ class Run:
         if not isinstance(answer, dict) or answer.get("encoding") != "base64":
             raise Unreadable(f"{path} at {ref} comes back without base64 content")
         source = base64.b64decode(answer["content"]).decode("utf-8")
-        kinds = {tokenize.STRING, getattr(tokenize, "FSTRING_MIDDLE", tokenize.STRING)}
-        found = []
+        # Amendment S3: a "literal" is a whole run of adjacent string literals, and a whole f-string with its
+        # replacement fields counted as "{}".
+        fstring_start = getattr(tokenize, "FSTRING_START", None)
+        fstring_middle = getattr(tokenize, "FSTRING_MIDDLE", None)
+        fstring_end = getattr(tokenize, "FSTRING_END", None)
+        groups: list[str] = []
+        current: list[str] | None = None
+        depth = 0  # f-strings open
+        braces = 0  # replacement-field braces open inside the f-strings
         try:
             for token in tokenize.generate_tokens(io.StringIO(source).readline):
-                if token.type in kinds and DDL.search(token.string):
-                    found.append(" ".join(token.string.split()).lower())
+                kind = token.type
+                if fstring_start is not None and kind == fstring_start:
+                    depth += 1
+                    current = [] if current is None else current
+                elif depth and kind == fstring_middle:
+                    current.append(token.string)
+                elif depth and kind == fstring_end:
+                    depth -= 1
+                elif depth:
+                    if kind == tokenize.OP and token.string == "{":
+                        if braces == 0:
+                            current.append("{}")
+                        braces += 1
+                    elif kind == tokenize.OP and token.string == "}":
+                        braces = max(braces - 1, 0)
+                elif kind == tokenize.STRING:
+                    current = [] if current is None else current
+                    current.append(token.string)
+                elif kind in (tokenize.NL, tokenize.COMMENT):
+                    continue  # adjacent literals may stand on separate lines
+                elif current is not None:
+                    groups.append("".join(current))
+                    current = None
+            if current is not None:
+                groups.append("".join(current))
         except (tokenize.TokenError, SyntaxError) as error:
             raise Unreadable(f"{path} at {ref} cannot be read as Python ({type(error).__name__})") from None
-        return sorted(found)
+        return sorted(" ".join(group.split()).lower() for group in groups if DDL.search(group))
 
     def rule_diff(self, pr: dict, info: dict) -> None:
         head = pr["head"]["sha"]
@@ -949,9 +979,15 @@ class Run:
             pr = self.get(f"/repos/{self.repo}/pulls/{self.pr}")
             merged = pr.get("merged") is True
             merge_sha = pr.get("merge_commit_sha")
+            merged_head = (pr.get("head") or {}).get("sha")
+            merged_by = (pr.get("merged_by") or {}).get("login")
         except (Unreadable, AttributeError, TypeError):
             return "GITHUB_ERROR", f"the merge request got no answer and the PR cannot be read: the merge's outcome is " \
                                    f"unknown; posted: {self.posted}"
+        self.record["message"] = self.secrets.scrub(f"the merge answer was lost ({why}); merged_by {merged_by}")
+        if merged and merged_head != head:  # amendment S1
+            return "GITHUB_ERROR", f"the merge request got no answer; the PR is merged, but not at this run's head " \
+                                   f"({merged_head}); posted: {self.posted}"
         if merged and isinstance(merge_sha, str) and SHA40.fullmatch(merge_sha):
             self.record["merge_sha"] = merge_sha
             return "MERGED", f"PR {self.pr} at {head} merged as {merge_sha}"
@@ -1015,7 +1051,10 @@ def main(argv: list[str] | None = None, *, http: Callable | None = None, windows
             run.record["outcome"] = outcome
             if outcome == "GITHUB_ERROR" and run.record.get("message") is None:
                 run.record["message"] = detail
-            write_record(log_file, run.record, secrets, clock)
+            try:
+                write_record(log_file, run.record, secrets, clock)
+            except (OSError, ValueError, TypeError):  # amendment S2: the outcome and its exit code stay
+                detail += "; the record could not be written"
     finally:
         if lock is not None:
             try:
