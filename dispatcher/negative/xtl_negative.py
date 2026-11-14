@@ -44,10 +44,15 @@ MAX_INPUT_BYTES = 64 * 1024  # NC-2, NC-3
 MESSAGE_LIMIT = 1000  # NC-8
 RAW_MESSAGE_LIMIT = 300  # NC-8
 POLICY_CHECK = "stage-a/policy"
-CASES = ("N1", "N2", "N3")
+CASES = ("N1", "N2", "N3", "N3M")
 OPTIONS = ("--case", "--key-file", "--app-file", "--repo", "--base", "--branch", "--log")
+# NC-17 (amendment R3): N3M acts on an existing PR instead of opening one.
+N3M_OPTIONS = ("--case", "--key-file", "--app-file", "--repo", "--base", "--pr", "--expect-head", "--log")
+ALL_OPTIONS = tuple(dict.fromkeys(OPTIONS + N3M_OPTIONS))
 USAGE = ("usage: python -I xtl_negative.py --case N1|N2|N3 --key-file <pem> --app-file <app.json> "
-         "--repo <owner>/<name> --base <branch> --branch <new branch name> --log <jsonl path>")
+         "--repo <owner>/<name> --base <branch> --branch <new branch name> --log <jsonl path>; or --case N3M "
+         "--key-file <pem> --app-file <app.json> --repo <owner>/<name> --base <branch> --pr <n> "
+         "--expect-head <40 hex> --log <jsonl path>")
 REPOSITORY = re.compile(r"[A-Za-z0-9-]+/[A-Za-z0-9._-]+")  # the launcher's form
 REF_CHARS = re.compile(r"[A-Za-z0-9._/-]{1,200}")
 SLUG = re.compile(r"[a-z0-9][a-z0-9-]*")
@@ -276,7 +281,7 @@ def parse_args(argv: list[str]) -> dict[str, str]:
     index = 0
     while index < len(argv):
         word = argv[index]
-        if word not in OPTIONS:
+        if word not in ALL_OPTIONS:
             raise UsageError(f"unknown argument {word[:40]!r}")
         if word in options:
             raise UsageError(f"{word} is given more than once")
@@ -284,17 +289,27 @@ def parse_args(argv: list[str]) -> dict[str, str]:
             raise UsageError(f"{word} has no value")
         options[word] = argv[index + 1]
         index += 2
-    missing = [option for option in OPTIONS if option not in options]
+    required = N3M_OPTIONS if options.get("--case") == "N3M" else OPTIONS
+    missing = [option for option in required if option not in options]
     if missing:
         raise UsageError("missing " + ", ".join(missing))
+    extra = [option for option in options if option not in required]
+    if extra:
+        raise UsageError(", ".join(extra) + f" is not used with --case {options['--case'][:10]}")
     if options["--case"] not in CASES:
-        raise UsageError("--case must be N1, N2 or N3")
+        raise UsageError("--case must be N1, N2, N3 or N3M")
     if not REPOSITORY.fullmatch(options["--repo"]):
         raise UsageError("--repo must be <owner>/<name> of letters, digits, '.', '_' and '-'")
     check_ref(options["--base"], "--base")
-    check_ref(options["--branch"], "--branch")
-    if options["--branch"] == options["--base"]:
-        raise UsageError("--branch must differ from --base")
+    if options["--case"] == "N3M":
+        if not re.fullmatch(r"[1-9][0-9]{0,9}", options["--pr"]):
+            raise UsageError("--pr must be a positive decimal integer")
+        if not SHA.fullmatch(options["--expect-head"]):
+            raise UsageError("--expect-head must be 40 lowercase hexadecimal characters")
+    else:
+        check_ref(options["--branch"], "--branch")
+        if options["--branch"] == options["--base"]:
+            raise UsageError("--branch must differ from --base")
     for option in ("--key-file", "--app-file", "--log"):
         if not Path(options[option]).is_absolute():
             raise UsageError(f"{option} must be an absolute path")
@@ -336,11 +351,11 @@ class Run:
     def __init__(self, options: dict[str, str]) -> None:
         self.options = options
         self.case = options["--case"]
-        self.edit = EDITS[self.case]
+        self.edit = EDITS.get(self.case)  # N3M edits nothing (NC-17)
         self.repo = options["--repo"]
         self.owner, self.name = self.repo.split("/", 1)
         self.base = options["--base"]
-        self.branch = options["--branch"]
+        self.branch = options.get("--branch")
         self.secrets: list[str] = []
         self.token = ""
         self.opener = None
@@ -350,7 +365,8 @@ class Run:
         self.maybe: str | None = None
         self.record: dict = {key: None for key in RECORD_KEYS}
         self.record.update({"tool": "xtl_negative", "case": self.case, "repository": self.repo, "base": self.base,
-                            "branch": self.branch, "path": self.edit.path, "attempts": [], "created": self.created})
+                            "branch": self.branch, "path": self.edit.path if self.edit else None, "attempts": [],
+                            "created": self.created})
 
     # -------- output and the record (NC-14, NC-15)
 
@@ -638,6 +654,44 @@ class Run:
         return "GITHUB_ERROR", (f"N3 attempts without a clear refusal: {', '.join(unclear)} ({summary}); "
                                 + self.created_text())
 
+    def merge_existing(self, app: dict) -> tuple[str, str]:
+        """NC-17 (amendment R3): one merge attempt, as the executor's app, on an existing PR of the executor whose head
+        is the one the operator checked (every required check green but stage-a/policy)."""
+        number = int(self.options["--pr"])
+        expected = self.options["--expect-head"]
+        self.record["pr_number"] = number
+        answer = self.call("GET", f"/repos/{self.repo}/pulls/{number}", self.token)
+        data = self.expect(answer, (200,), f"GET PR #{number}")
+        head = data.get("head") if isinstance(data, dict) else None
+        base = data.get("base") if isinstance(data, dict) else None
+        user = data.get("user") if isinstance(data, dict) else None
+        if not (isinstance(head, dict) and isinstance(base, dict) and isinstance(user, dict)):
+            raise GitHubError(f"GitHub's answer to GET PR #{number} is not a PR")
+        if data.get("state") != "open" or data.get("merged") is True:
+            raise Precondition(f"PR #{number} is not open")
+        if base.get("ref") != self.base:
+            raise Precondition(f"PR #{number} is not based on {self.base}")
+        if head.get("sha") != expected:
+            raise Precondition(f"PR #{number}'s head is {head.get('sha')}, not the expected {expected}")
+        if user.get("login") != f"{app['slug']}[bot]":
+            raise Precondition(f"PR #{number} was not opened by {app['slug']}[bot]")
+        self.record["head_sha"] = expected
+        self.record["pr_url"] = data.get("html_url") if isinstance(data.get("html_url"), str) else None
+        name, method, template = ATTEMPTS[2]
+        route = template.format(r=self.repo, head=expected, n=number)
+        result = self.call(method, route, self.token, {"sha": expected, "merge_method": "merge"})
+        accepted = result.status is not None and 200 <= result.status < 300
+        self.record["attempts"].append({"name": name, "method": method, "route": template, "status": result.status,
+                                        "accepted": accepted, "message": result.message})
+        shown = result.status if result.status is not None else "no answer"
+        if accepted:
+            return "FINDING", (f"GitHub ACCEPTED the merge of PR #{number} at {expected} from the executor's app "
+                               f"({shown}). This is a finding: stop and report it")
+        if result.status is not None and 400 <= result.status < 500:
+            return "DONE", (f"N3M: GitHub refused the executor's app's merge of PR #{number} at {expected} ({shown} "
+                            f"{result.message.splitlines()[0][:200] if result.message.strip() else ''}). Nothing changed")
+        return "GITHUB_ERROR", f"N3M: the merge attempt of PR #{number} got no clear refusal ({shown})"
+
     def work(self) -> tuple[str, str]:
         app = load_app_file(Path(self.options["--app-file"]))
         if app["repository"] != self.repo:
@@ -651,6 +705,8 @@ class Run:
         self.opener = urllib.request.build_opener(urllib.request.ProxyHandler({}), _NoRedirect())
         self.mint_token(app, jwt)
         del jwt
+        if self.case == "N3M":
+            return self.merge_existing(app)
         base_sha = self.read_base()
         content = self.read_file(base_sha)
         new_content = apply_edit(self.case, content)

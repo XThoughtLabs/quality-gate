@@ -217,6 +217,30 @@ of NC-6.
     and compared with the launcher's by tests.
   - It uses no `assert` for its runtime checks: every check raises explicitly.
 
+## 5a. Amendment R3 (review round 1, the CEO's word of 2026-11-14)
+
+The first review found that N3's merge attempt comes about a second after its PR is opened, before the gate has run,
+so GitHub refuses it for the missing gate checks whatever stage-a/policy would say: it cannot show that the executor's
+app is unable to pass the required policy check. N3 stays as it is (its check-run and status attempts show the
+missing permissions); a new case shows the merge.
+
+- **NC-17 N3M, the merge attempt on a green PR.**
+  - Command: `--case N3M --key-file <pem> --app-file <app.json> --repo <owner>/<name> --base <branch> --pr <N>
+    --expect-head <40 hex> --log <jsonl path>`: every option once, no `--branch`; `--pr` a positive decimal integer,
+    `--expect-head` 40 lowercase hexadecimal characters. With N1 to N3, `--pr` and `--expect-head` are refused, and
+    with N3M `--branch` is. Otherwise exit 2.
+  - The token as in NC-5 and NC-6 (not narrowed). Then `GET /repos/{r}/pulls/{N}` (route 8): the PR must be open and
+    not merged, based on `--base`, with `head.sha` equal to `--expect-head`, opened by `<slug>[bot]` of the app file;
+    otherwise exit 3 (`PRECONDITION`) with nothing attempted.
+  - Then exactly one attempt, route 11: `PUT /repos/{r}/pulls/{N}/merge` with `{"sha": <expect-head>,
+    "merge_method": "merge"}`, recorded like N3's attempts (NC-14). A 2xx answer is `FINDING` (exit 1); a 4xx is
+    `DONE` (exit 0); anything else, or no answer, `GITHUB_ERROR` (exit 6).
+  - The tool does not read the PR's checks or statuses: the executor's app may lack the permission. The run sheet has
+    the operator read them with his own login right before, and give the head he saw as `--expect-head`: every
+    required check green except `stage-a/policy`, which must be absent. The intended PR is the positive task's PR,
+    between its review and the controller's run.
+  - It writes nothing else: no branch, no commit, no PR, no check, no status.
+
 ## 6. Limits of this contract
 
 - The tool does not check which Windows user runs it. The guard is the key file's access rules: only the executor's
