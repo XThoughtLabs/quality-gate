@@ -259,6 +259,24 @@ def test_a_review_with_an_unknown_state_is_unreadable(world):
     refused(world, world.run(), "CR-6", "UNREADABLE")
 
 
+@pytest.mark.cr("CR-12")
+def test_an_unexpected_error_is_a_github_error(world, controller):
+    """Amendment R2: an error no rule expects (here the wait for mergeable null fails) still ends with one stop line,
+    a record and exit 6."""
+    world.gh.mergeable = [True, None, True]
+
+    def broken_sleep(seconds):
+        raise RuntimeError("the wait failed")
+    code = controller.main(world.argv(), http=world.gh.handle, windows=world.win, sleep=broken_sleep,
+                           clock=lambda: F.NOW)
+    captured = world.capsys.readouterr()
+    assert code == 6, captured.out
+    lines = [line for line in captured.out.splitlines() if line.startswith("CONTROLLER ")]
+    assert len(lines) == 1 and lines[0].startswith("CONTROLLER GITHUB_ERROR: unexpected error (RuntimeError)")
+    assert world.last_record()["outcome"] == "GITHUB_ERROR"
+    assert "merge" not in world.gh.routes()
+
+
 @pytest.mark.cr("CR-10")
 def test_the_record_of_a_github_error_holds_the_message(world):
     world.gh.no_answer.add("post_check")
