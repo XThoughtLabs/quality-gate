@@ -102,9 +102,17 @@ the code `UNREADABLE` (fail closed). The first rule that fails, in this order, i
     `requirements*.lock`, `constraints*.txt`, `pyproject.toml`, `setup.py`, `Pipfile`, `Pipfile.lock`, `poetry.lock`,
     `uv.lock`.
   - `SCHEMA`: a schema or migration file: a segment `migrations`, `migration` or `alembic`, or a name ending `.sql`;
-    and any added or removed line of a code file's patch that matches (any case)
-    `\b(CREATE|ALTER|DROP)\s+(TABLE|INDEX|VIEW|TRIGGER)\b` or `\bPRAGMA\s+user_version\b`. A code file whose patch
-    GitHub does not give is `PATCH_UNREADABLE`.
+    and any added or removed line of a code file's patch that matches (any case) the *schema words*
+    `\b(CREATE|ALTER|DROP)\s+((TEMP|TEMPORARY|UNIQUE|VIRTUAL)\s+)*(TABLE|INDEX|VIEW|TRIGGER)\b` or
+    `\bPRAGMA\s+user_version\b`. A code file whose patch GitHub does not give is `PATCH_UNREADABLE`.
+    **Amendment R1 (review round 1, the CEO's word of 2026-11-14):** a schema held as SQL text inside ordinary code
+    (the stand's `workflow/store.py`) changes without a schema word on a changed line. So for every *modified* code
+    file, its contents at the merge base and at the head are read (`GET /repos/{repo}/contents/{path}?ref={sha}`), and
+    the Python string literals that hold a schema word (found with the standard `tokenize` module; comments are not
+    string literals) are compared, each with its runs of white space made one space and in lower case, as sorted lists.
+    Any difference is `SCHEMA`. A file that cannot be read, is not base64, or does not tokenize is `UNREADABLE`.
+  - **Amendment R6:** `CASE_CLASH`: an added path whose lower-case form equals the lower-case form of another path in
+    the head's tree (on a checkout that ignores letter case, one file would replace the other).
   - `CODEOWNERS_PATH`: a path that a pattern of the base tip's CODEOWNERS names. The file is read from
     `.github/CODEOWNERS`, `CODEOWNERS` or `docs/CODEOWNERS` at the base tip, the first that exists, as GitHub does
     (`GET /repos/{repo}/contents/{path}?ref={base tip}`). No CODEOWNERS file is `CODEOWNERS_MISSING`. Each line's
@@ -117,12 +125,21 @@ the code `UNREADABLE` (fail closed). The first rule that fails, in this order, i
   - `OUTSIDE_POLICY`: anything else that is not one of the two admitted kinds:
     - *ordinary application code*: status `added` or `modified`, under one of `code_folders`, ending `.py`;
     - *an ordinary test*: status `added`, under `test_folder`, file name `test_*.py`.
+
+    **Amendment R6:** "under" a folder is matched in its exact letter case (`Tests/test_x.py` is not under `tests/`);
+    the refusing rules above still ignore case.
   - `MODE`: an admitted file whose entry in the head's tree (`GET /repos/{repo}/git/trees/{head}?recursive=1`) is not a
     blob of mode `100644` (a symbolic link, a submodule, an executable). A truncated tree is `UNREADABLE`.
 
   The letter case of the fixed names above is ignored. The order of the checks for one file is the order of this list.
+  - **Amendment R7 (the CEO's reading of the letter, 2026-11-14: «Требовать и код, и тест»):** when every file is
+    admitted, the PR must hold at least one file of ordinary application code and at least one added ordinary test;
+    otherwise `NO_CODE_CHANGE` or `NO_NEW_TEST`.
+  - **Amendment R8:** the CODEOWNERS file's answer must have `encoding` `base64` and decode to a non-empty text
+    (GitHub gives a file over 1 MB without content); otherwise `UNREADABLE`.
 - **CR-5 The gate.**
-  - **The checks.** `GET /repos/{repo}/commits/{head}/check-runs` (every page). For each name of `[gate] checks`, the
+  - **The checks.** `GET /repos/{repo}/commits/{head}/check-runs?filter=all` (every page; amendment R5: `filter=all`,
+    as the gate reads them, never GitHub's default `latest`). For each name of `[gate] checks`, the
     run with the highest `id` among those of that name whose `app.id` is `[gate] actions_app_id` and whose `head_sha`
     is the head must be `completed` with conclusion `success`. Codes: `GATE_CHECK_MISSING` (no run of that name from
     that app), `GATE_CHECK_PENDING` (the newest is not completed), `GATE_CHECK_FAILED` (completed, not success).
@@ -153,7 +170,8 @@ Otherwise a failing run is *refused*.
 ## 3. The check, the merge and the record
 
 - **CR-7 The policy check.** The controller posts `[gate] policy_check` on the head as its own app:
-  - If check runs of that name from the controller's app (`app.id` = `[controller] app_id`) already exist on the head,
+  - If check runs of that name from the controller's app (`app.id` = `[controller] app_id`) already exist on the head
+    (read with `filter=all`, amendment R5),
     the newest of them is updated (`PATCH /repos/{repo}/check-runs/{id}`); otherwise one is created
     (`POST /repos/{repo}/check-runs`). So the head never carries two results of the controller's check.
   - It is always posted `completed`. Its conclusion is `success` only when CR-2 to CR-6 all hold; otherwise `failure`.
@@ -172,7 +190,10 @@ Otherwise a failing run is *refused*.
      answer), the PR is read once more after 5 seconds; a second `null`, or `false`, is `NOT_MERGEABLE`.
   3. `PUT /repos/{repo}/pulls/{N}/merge` with `{"sha": <head>, "merge_method": "merge"}`. A 200 answer with `merged`
      true ends the run `MERGED`, and its `sha` is the merge commit. Any other answer ends the run `MERGE_REFUSED` with
-     GitHub's status code and message, without a retry. The controller never approves, never changes a rule or a
+     GitHub's status code and message, without a retry. **Amendment R2:** when the merge request gets no answer at
+     all, the PR is read once more: merged, with a `merge_commit_sha`, ends the run `MERGED` (the record's `message`
+     says the answer was lost); not merged ends it `GITHUB_ERROR` ("the merge request got no answer; the PR is not
+     merged"); unreadable ends it `GITHUB_ERROR` ("the merge's outcome is unknown"). The controller never approves, never changes a rule or a
      setting, and uses no other route than those named in this contract.
 - **CR-9 Running twice.**
   - A PR that is already merged ends the run `ALREADY_MERGED`, after CR-2's first read, with nothing posted and no merge.
@@ -200,7 +221,11 @@ Otherwise a failing run is *refused*.
     `contents: write`, `checks: write`, `pull_requests: read`, `statuses: read`.
   - The JWT and the token live in memory only: never on a command line, in an environment variable, in a file or in a
     log. Every message the controller prints or logs passes through a filter that replaces them.
-  - Requests go only to `https://api.github.com`, each with a timeout of 30 seconds.
+  - Requests go only to `https://api.github.com`, each with a timeout of 30 seconds. **Amendment R4:** with no proxy
+    (environment proxies are ignored) and no redirect followed: a 3xx answer is an answer, never followed.
+  - **Amendment R2:** the installation token must be a text of letters, digits, `_`, `-` and `.` only; otherwise the
+    run ends `GITHUB_ERROR`. The filter also replaces anything shaped like a GitHub token (`gh[pousr]_…`,
+    `github_pat_…`) or a JWT.
 - **CR-12 Exit codes and stop lines.** The run prints exactly one stop line, `CONTROLLER <OUTCOME>: <detail>`, and
   exits with:
 
@@ -212,7 +237,7 @@ Otherwise a failing run is *refused*.
   | 3 | `WAITING` | the gate or the reviewer has not finished (section 2); run again later | failure |
   | 4 | `MERGE_REFUSED` | every rule held and the check is `success`, but GitHub refused the merge or it is not mergeable | success |
   | 5 | `ALREADY_MERGED` | the PR was merged before this run | nothing |
-  | 6 | `GITHUB_ERROR` | the token could not be had, or the check could not be posted; the detail says what was posted | as stated |
+  | 6 | `GITHUB_ERROR` | the token could not be had, the check could not be posted, a request outside the rules got no answer, or an unexpected error (amendment R2: any of these ends here, with the stop line and the record, never as an uncaught exception); the detail says what was posted | as stated |
   | 7 | `LOCKED` | another run holds the lock (CR-9) | nothing |
 
   The details: `MERGED` gives `PR <N> at <head> merged as <merge sha>`; `REFUSED` and `WAITING` start with the first
@@ -235,7 +260,8 @@ of `current_sid` and `acl_of`, `sleep` with a recorder and `clock` with a fixed 
 - The controller trusts GitHub's answers for the PR, the checks, the statuses and the `reports` branch, as the gate does.
 - CODEOWNERS is matched for the four simple pattern forms only; any other form refuses every PR until the matcher is
   extended.
-- A schema change hidden in ordinary code without one of CR-4's DDL words is not seen by this controller; the gate's
-  checks and the review are the other guards.
+- A schema change is seen when it changes a string literal that holds a schema word, or a changed line holds one
+  (CR-4, amendment R1). A schema built at run time from pieces without a schema word (for example column names joined
+  in code) is not seen; the gate's checks and the review are the other guards.
 - The merge path is GitHub's: the ruleset on the integration branch, with no bypass, is the final guard. The controller
   never asks for, uses or simulates the operator's approval.
