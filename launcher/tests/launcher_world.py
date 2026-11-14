@@ -35,6 +35,8 @@ FAKE_CLAUDE = TESTS_DIR / "fake_claude.py"
 GATE_URL = str(LAUNCHER_DIR.parent)
 GATE_PIN = "fdc99189d797e0df35baaf64233cb6e657628e31"
 UNKNOWN_SHA = "0123456789abcdef0123456789abcdef01234567"
+# The names below (repository, apps, users, folders) are the pilot's example (DEV-06), kept as this
+# test world's synthetic values; the launcher's code holds none of them (LR-63).
 REPOSITORY = "XThoughtLabs/gate-practice-app"
 OWNER, REPO_NAME = REPOSITORY.split("/")
 SLUG = "xtl-gate-executor"
@@ -418,6 +420,55 @@ class Seams:
         for name in ("current_sid", "is_admin", "gh_login_present", "git_credential_present",
                      "acl_of", "can_write", "folder_openable"):
             monkeypatch.setattr(module, name, getattr(self, name))  # raising=True: seams must exist
+        # Stage A2 (LR-67, LR-77): the scan of the user's processes. The tests run as the person's own
+        # Windows user, whose other programs start processes at any time; the world therefore shows the
+        # launcher only the processes the fake model lists (FAKE_CLAUDE_FOREIGN), as the real scan sees
+        # them. The real scan itself is tested on its own (test_stage_a2.py). raising=False: the code
+        # before stage A2 has no such seam, and the harness must still run against it.
+        real = getattr(module, "user_processes", None)
+        self.foreign_file = None
+
+        def listed_processes(job):
+            if real is None or self.foreign_file is None or not self.foreign_file.exists():
+                return []
+            wanted = {int(x) for x in self.foreign_file.read_text(encoding="utf-8").split() if x.strip()}
+            return [p for p in real(job) if p["pid"] in wanted]
+
+        monkeypatch.setattr(module, "user_processes", listed_processes, raising=False)
+        # LR-97 (HQ-TASK-M1-C2S and its amendments): the user of the launcher's session, and the security of the
+        # witness's file and folder. By default no operator is identified, so every older test runs by the old rules.
+        # raising=False: the code before LR-97 has no such seams.
+        self.session_sid = None
+        self.witness_acl: dict[str, object] = {}
+
+        def session_user_sid():
+            self.calls.append(("session_user_sid", None, time.time()))
+            return self.session_sid
+
+        def witness_security(path):
+            key = norm(path)
+            if key in self.witness_acl:
+                value = self.witness_acl[key]
+                return value(self) if callable(value) else value
+            operator = self.session_sid
+            return (operator, [(operator, 0x1F01FF, "Allow"), ("S-1-5-18", 0x1F01FF, "Allow"),
+                               ("S-1-5-32-544", 0x1F01FF, "Allow"), (self.sid, 0x1200A9, "Allow")], False)
+
+        def witness_file(path):  # the file's security and its bytes, from one open (review round 1, F2)
+            try:
+                data = Path(path).read_bytes()
+            except OSError:
+                return None
+            return witness_security(path), data
+
+        monkeypatch.setattr(module, "session_user_sid", session_user_sid, raising=False)
+        monkeypatch.setattr(module, "witness_security", witness_security, raising=False)
+        monkeypatch.setattr(module, "witness_file", witness_file, raising=False)
+        # Stage A3 (LR-80, LR-87): the launcher's hooks folder is read-only for the executor in a real setup; the
+        # tests run as the person's own user, who can write it, so the seam says it cannot. raising=False: the code
+        # before stage A3 has no such seam.
+        self.creatable: set[str] = set()
+        monkeypatch.setattr(module, "can_create", lambda folder: norm(folder) in self.creatable, raising=False)
 
 
 # ---------------------------------------------------------------- observation
@@ -785,7 +836,17 @@ class World:
             "api_url": self.api.url,
             "repo_url": str(self.remote),
             "gate_url": GATE_URL,
+            # Stage A (LR-53, LR-55): stage A's limits and a ledger of this world's own.
+            "ledger_file": str(root / "state" / "ledger.jsonl"),
+            "max_messages_attempt": 80,
+            "max_messages_task": 240,
+            "max_runs_task": 3,
+            # Stage A2 (LR-68): the fake model is a python.exe; no process of this name exists.
+            "claude_image": "claude-under-test.exe",
         }
+        self.ledger_file = Path(self.config["ledger_file"])
+        self.foreign_file = root / "foreign-pids.txt"
+        self.seams.foreign_file = self.foreign_file
         self.seams.folders[norm(self.absent_folder)] = "absent"
         self.write_files()
         self.base_env(monkeypatch)
@@ -884,6 +945,7 @@ class World:
                 stale.unlink()
         self.mp.setenv("FAKE_CLAUDE_MODE", json.dumps(steps or []))
         self.mp.setenv("FAKE_CLAUDE_OUT", str(self.model_out))
+        self.mp.setenv("FAKE_CLAUDE_FOREIGN", str(self.foreign_file))
         for k, v in (extra_env or {}).items():
             self.mp.setenv(k, v)
         before_dirs = set(self._run_dirs())
@@ -918,6 +980,19 @@ class World:
                          run_dirs=sorted(set(self._run_dirs()) - before_dirs), logs=logs,
                          world=self, model_error=model_error, refs_before=refs_before,
                          refs_after=self.remote_refs())
+
+    # ---- the ledger (LR-55) -------------------------------------------------------
+    def ledger_records(self) -> list[dict]:
+        if not self.ledger_file.exists():
+            return []
+        text = self.ledger_file.read_bytes().decode("utf-8")
+        return [json.loads(line) for line in text.split("\n") if line.strip()]
+
+    def seed_ledger(self, records: list[dict], raw: bytes | None = None) -> None:
+        self.ledger_file.parent.mkdir(parents=True, exist_ok=True)
+        data = raw if raw is not None else b"".join(
+            json.dumps(r, sort_keys=True).encode("utf-8") + b"\n" for r in records)
+        self.ledger_file.write_bytes(data)
 
     def _run_dirs(self):
         if not self.runs_dir.exists():

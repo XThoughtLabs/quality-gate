@@ -20,6 +20,71 @@ with the prompt on standard input and `<run>/repo` as its working folder.
   {"op": "exit", "code": N}                         stop here with exit code N
   {"op": "result", "text": T}                       the `result` text of the JSON output
 
+Stage A (LR-51): with `--output-format stream-json` on its command line it writes
+a stream instead of one JSON object, one event per line, flushed at once: a
+`system/init` event first, then what the steps below emit, and a `result` event
+last (with `num_turns`), unless a step says otherwise. Stream steps:
+
+  {"op": "assistant", "id": I, "tools": [T, ...], "text": X, "parent": P}
+                     an `assistant` event; without "id" (or with null) it has no
+                     message.id; "raw_id" puts any JSON value there instead; one
+                     `tool_use` block per id in "tools"; "parent" is its
+                     parent_tool_use_id (a subagent's message), null by default
+  {"op": "tool_result", "ids": [T, ...]}            a `user` event with those tool results
+  {"op": "line", "text": X}                         a raw line, as is (not JSON, for instance);
+                                                    with "hex" instead, those bytes
+  {"op": "snapshot", "src": F, "dst": G}            copy the file F to G as it is now
+  {"op": "big_line", "bytes": N}                    one line of N bytes
+  {"op": "event", "event": E}                       any JSON value as one line
+  {"op": "api_retry", "error": C}                   a `system/api_retry` event with that category
+  {"op": "burst", "count": N, "prefix": X, "tools": B}
+                     N messages written at once, ids X-1 ... X-N, each with one
+                     tool_use (and its result) when B is true
+  {"op": "forever", "interval": S, "prefix": X}     messages with tool use and results, every S
+                     seconds, never ending by itself (it ignores --max-turns)
+  {"op": "ignore_break"}                            ignore CTRL_BREAK (SIGBREAK) and SIGINT
+  {"op": "spawn_family", "pids": F}                 start a hidden-window child (CREATE_NO_WINDOW)
+                     and a grandchild whose parent has already exited, both
+                     sleeping 300 s; write the pids to F
+  {"op": "marker", "file": F}                       write the file F (a sign of progress)
+  {"op": "pause", "seconds": S}                     sleep S seconds, no child
+  {"op": "crash", "code": N}                        end at once with exit code N, no result event
+  {"op": "no_result"}                               end normally but write no result event
+
+Stage A2 (LR-67 to LR-72):
+
+  {"op": "wmi_spawn", "pids": F, "count": N}        have WMI (Win32_Process.Create) start a PING that
+                     runs about N s (30 by default): not a descendant, so outside the job;
+                     its pid goes to F and to the list in FAKE_CLAUDE_FOREIGN
+  {"op": "spawn_listed", "argv": [...], "pids": F}  start a child (in the job) and list its pid the same way
+  {"op": "gitfile"}                                 move .git aside and leave a .git file pointing to it
+  {"op": "deep_assistant", "depth": N}              an assistant event whose tool input is nested N deep
+
+Stage A3 (LR-79 to LR-85):
+
+  {"op": "replace_decoy", "bad": B}                 commit E and a decoy D on E's parent, and write
+                     .git/refs/replace/<E> = D (one file, no git command): with "bad" true, E adds
+                     outside.txt and D only acceptance/decoy.txt; with "bad" false, the other way round
+  {"op": "commondir", "marker": M}                  copy .git to ../other.git, give the copy core.fsmonitor
+                     (a script that writes M), push.followTags and an annotated tag, and write
+                     .git/commondir pointing at it
+  {"op": "wmi_hide", "mode": "dacl"|"owner-rights", "seconds": S, "pids": F}
+                     have WMI start a python that sets its own DACL to D:P (or D:P(D;;GA;;;OW)) and
+                     sleeps S seconds; it waits until the DACL is set, and lists the pid as wmi_spawn does
+  {"op": "close_stdout"}                            close the standard output (the stream ends) and go on
+
+Stage A4 (LR-89 to LR-95):
+
+  {"op": "spoof_parent", "parent": P, "image": X, "pids": F}
+                     start X suspended with the process P named as its parent
+                     (PROC_THREAD_ATTRIBUTE_PARENT_PROCESS): it is outside the job; its pid
+                     goes to F and to the list in FAKE_CLAUDE_FOREIGN
+  {"op": "remove_commit", "path": P}               git rm P and commit
+  {"op": "merge_commit"}                            commit a merge of HEAD with a side commit on HEAD
+
+`FAKE_CLAUDE_EARLY`, when set, names a file it writes first of all, before it
+reads its standard input.
+
 Before any step it writes a record to `FAKE_CLAUDE_OUT`: its argv, working
 folder, standard input, environment, the settings file's content, and the
 state of the git work tree. The variables' names hold no word LR-28 removes.
@@ -27,9 +92,269 @@ state of the git work tree. The variables' names hold no word LR-28 removes.
 
 import json
 import os
+import signal
 import subprocess
 import sys
 import time
+
+SESSION = "00000000-0000-4000-8000-000000000000"
+NO_WINDOW = 0x08000000  # CREATE_NO_WINDOW: what Node's spawn sets with windowsHide
+
+
+def streaming():
+    argv = sys.argv
+    return any(a == "--output-format" and i + 1 < len(argv) and argv[i + 1] == "stream-json"
+               for i, a in enumerate(argv))
+
+
+def emit_raw(data):
+    sys.stdout.buffer.write(data + b"\n")
+    sys.stdout.buffer.flush()
+
+
+def emit(event):
+    emit_raw(json.dumps(event).encode("utf-8"))
+
+
+def assistant_event(step):
+    content = []
+    if step.get("text", "Working.") is not None:
+        content.append({"type": "text", "text": step.get("text", "Working.")})
+    for tool_id in step.get("tools", []):
+        content.append({"type": "tool_use", "id": tool_id, "name": "Bash", "input": {"command": "git status"}})
+    message = {"type": "message", "role": "assistant", "model": "fake", "content": content}
+    if "raw_id" in step:
+        message["id"] = step["raw_id"]
+    elif step.get("id") is not None:
+        message["id"] = step["id"]
+    return {"type": "assistant", "message": message, "parent_tool_use_id": step.get("parent"),
+            "session_id": SESSION}
+
+
+def tool_result_event(ids):
+    return {"type": "user", "message": {"role": "user", "content": [
+        {"type": "tool_result", "tool_use_id": i, "content": "ok"} for i in ids]},
+        "parent_tool_use_id": None, "session_id": SESSION}
+
+
+def job_facts():
+    """Windows: whether this process is in a job, and that job's limit flags (LR-58)."""
+    if os.name != "nt":
+        return None, None
+    import ctypes
+    from ctypes import wintypes
+
+    k32 = ctypes.WinDLL("kernel32", use_last_error=True)
+    k32.GetCurrentProcess.restype = wintypes.HANDLE
+    in_job = wintypes.BOOL()
+    k32.IsProcessInJob.argtypes = [wintypes.HANDLE, wintypes.HANDLE, ctypes.POINTER(wintypes.BOOL)]
+    if not k32.IsProcessInJob(k32.GetCurrentProcess(), None, ctypes.byref(in_job)):
+        return None, None
+
+    class Basic(ctypes.Structure):
+        _fields_ = [("a", ctypes.c_int64), ("b", ctypes.c_int64), ("LimitFlags", wintypes.DWORD),
+                    ("c", ctypes.c_size_t), ("d", ctypes.c_size_t), ("e", wintypes.DWORD),
+                    ("f", ctypes.c_size_t), ("g", wintypes.DWORD), ("h", wintypes.DWORD)]
+
+    class Extended(ctypes.Structure):
+        _fields_ = [("basic", Basic), ("io", ctypes.c_uint64 * 6), ("m", ctypes.c_size_t * 4)]
+
+    info = Extended()
+    k32.QueryInformationJobObject.argtypes = [wintypes.HANDLE, ctypes.c_int, ctypes.c_void_p, wintypes.DWORD,
+                                              ctypes.c_void_p]
+    flags = None
+    if in_job.value and k32.QueryInformationJobObject(None, 9, ctypes.byref(info), ctypes.sizeof(info), None):
+        flags = int(info.basic.LimitFlags)
+    return bool(in_job.value), flags
+
+
+def list_foreign(pid, pids_path=None):
+    """Tell the test world about a process it may report through the scan's seam (LR-77)."""
+    listing = os.environ.get("FAKE_CLAUDE_FOREIGN")
+    for path in (listing, pids_path):
+        if path:
+            with open(path, "a", encoding="utf-8") as fh:
+                fh.write(f"{pid}\n")
+
+
+def wmi_spawn(pids_path, count=30):
+    command = "(Invoke-CimMethod -ClassName Win32_Process -MethodName Create -Arguments @{CommandLine=$env:XTL_CMD}).ProcessId"
+    env = dict(os.environ, XTL_CMD=os.path.join(os.environ.get("SystemRoot", "C:\\Windows"), "System32",
+                                                "PING.EXE") + f" -n {int(count)} 127.0.0.1")
+    out = subprocess.run(["powershell", "-NoProfile", "-NonInteractive", "-Command", command], capture_output=True,
+                         text=True, env=env, check=True).stdout.strip()
+    list_foreign(int(out), pids_path)
+
+
+def deep_assistant(depth):
+    inner = "[" * depth + "]" * depth
+    return ('{"type": "assistant", "message": {"id": "deep-1", "type": "message", "role": "assistant", "content": '
+            '[{"type": "tool_use", "id": "tu-deep", "name": "Bash", "input": {"x": ' + inner + '}}]}, '
+            '"parent_tool_use_id": null, "session_id": "' + SESSION + '"}')
+
+
+def spawn_family(pids_path):
+    sleeper = "import time; time.sleep(300)"
+    flags = NO_WINDOW if os.name == "nt" else 0
+    hidden = subprocess.Popen([sys.executable, "-c", sleeper], creationflags=flags)
+    grandchild_file = pids_path + ".grandchild"
+    middle = subprocess.Popen([sys.executable, "-c",
+                               "import subprocess, sys; p = subprocess.Popen([sys.executable, '-c', "
+                               f"{sleeper!r}], creationflags={flags}); "
+                               "open(sys.argv[1], 'w').write(str(p.pid))", grandchild_file])
+    middle.wait(timeout=60)
+    with open(grandchild_file, encoding="utf-8") as fh:
+        grandchild = int(fh.read().strip())
+    with open(pids_path, "w", encoding="utf-8") as fh:
+        json.dump({"model": os.getpid(), "hidden_child": hidden.pid, "middle": middle.pid,
+                   "grandchild": grandchild}, fh)
+
+
+HIDE_SCRIPT = r'''
+import ctypes, sys, time
+from ctypes import wintypes
+adv = ctypes.WinDLL("advapi32", use_last_error=True); k32 = ctypes.WinDLL("kernel32", use_last_error=True)
+k32.GetCurrentProcess.restype = wintypes.HANDLE
+adv.ConvertStringSecurityDescriptorToSecurityDescriptorW.argtypes = [wintypes.LPCWSTR, wintypes.DWORD,
+    ctypes.POINTER(ctypes.c_void_p), ctypes.c_void_p]
+adv.GetSecurityDescriptorDacl.argtypes = [ctypes.c_void_p, ctypes.POINTER(wintypes.BOOL),
+    ctypes.POINTER(ctypes.c_void_p), ctypes.POINTER(wintypes.BOOL)]
+adv.SetSecurityInfo.argtypes = [wintypes.HANDLE, ctypes.c_int, wintypes.DWORD, ctypes.c_void_p, ctypes.c_void_p,
+    ctypes.c_void_p, ctypes.c_void_p]
+sd = ctypes.c_void_p()
+adv.ConvertStringSecurityDescriptorToSecurityDescriptorW("D:P" if sys.argv[1] == "dacl" else "D:P(D;;GA;;;OW)", 1,
+    ctypes.byref(sd), None)
+present, dacl, defaulted = wintypes.BOOL(), ctypes.c_void_p(), wintypes.BOOL()
+adv.GetSecurityDescriptorDacl(sd, ctypes.byref(present), ctypes.byref(dacl), ctypes.byref(defaulted))
+rc = adv.SetSecurityInfo(k32.GetCurrentProcess(), 6, 0x4 | 0x80000000, None, None, dacl, None)
+open(sys.argv[2], "w").write(str(rc))
+time.sleep(float(sys.argv[3]))
+'''
+
+
+def hide_script_path(folder):
+    path = os.path.join(folder, "xtl-hide.py")
+    with open(path, "w", encoding="utf-8") as fh:
+        fh.write(HIDE_SCRIPT)
+    return path
+
+
+def wmi_hide(step):
+    """S4: a process outside the job that denies itself to OpenProcess (the reviewer's child)."""
+    folder = os.path.dirname(os.path.abspath(step["pids"]))
+    script = hide_script_path(folder)
+    flag = step["pids"] + ".hidden"
+    # the base interpreter, not a virtual environment's launcher, which would start the real one as its own child
+    python = getattr(sys, "_base_executable", sys.executable)
+    line = f'"{python}" -I "{script}" {step["mode"]} "{flag}" {float(step.get("seconds", 40))}'
+    command = ("(Invoke-CimMethod -ClassName Win32_Process -MethodName Create "
+               "-Arguments @{CommandLine=$env:XTL_CMD}).ProcessId")
+    out = subprocess.run(["powershell", "-NoProfile", "-NonInteractive", "-Command", command], capture_output=True,
+                         text=True, env=dict(os.environ, XTL_CMD=line), check=True).stdout.strip()
+    deadline = time.time() + 30
+    while time.time() < deadline and not os.path.exists(flag):
+        time.sleep(0.05)
+    list_foreign(int(out), step["pids"])
+
+
+def spoof_parent(step):
+    """M2: a process created under another parent leaves the job (the reviewer's dllhost.exe, suspended)."""
+    import ctypes
+    from ctypes import wintypes
+
+    k32 = ctypes.WinDLL("kernel32", use_last_error=True)
+
+    class StartupInfo(ctypes.Structure):
+        _fields_ = [("cb", wintypes.DWORD), ("lpReserved", wintypes.LPWSTR), ("lpDesktop", wintypes.LPWSTR),
+                    ("lpTitle", wintypes.LPWSTR), ("dwX", wintypes.DWORD), ("dwY", wintypes.DWORD),
+                    ("dwXSize", wintypes.DWORD), ("dwYSize", wintypes.DWORD), ("dwXCountChars", wintypes.DWORD),
+                    ("dwYCountChars", wintypes.DWORD), ("dwFillAttribute", wintypes.DWORD),
+                    ("dwFlags", wintypes.DWORD), ("wShowWindow", wintypes.WORD), ("cbReserved2", wintypes.WORD),
+                    ("lpReserved2", ctypes.c_void_p), ("hStdInput", wintypes.HANDLE),
+                    ("hStdOutput", wintypes.HANDLE), ("hStdError", wintypes.HANDLE)]
+
+    class StartupInfoEx(ctypes.Structure):
+        _fields_ = [("StartupInfo", StartupInfo), ("lpAttributeList", ctypes.c_void_p)]
+
+    class ProcessInformation(ctypes.Structure):
+        _fields_ = [("hProcess", wintypes.HANDLE), ("hThread", wintypes.HANDLE), ("dwProcessId", wintypes.DWORD),
+                    ("dwThreadId", wintypes.DWORD)]
+
+    k32.OpenProcess.restype = wintypes.HANDLE
+    k32.OpenProcess.argtypes = [wintypes.DWORD, wintypes.BOOL, wintypes.DWORD]
+    k32.InitializeProcThreadAttributeList.argtypes = [ctypes.c_void_p, wintypes.DWORD, wintypes.DWORD,
+                                                      ctypes.POINTER(ctypes.c_size_t)]
+    k32.UpdateProcThreadAttribute.argtypes = [ctypes.c_void_p, wintypes.DWORD, ctypes.c_size_t, ctypes.c_void_p,
+                                              ctypes.c_size_t, ctypes.c_void_p, ctypes.c_void_p]
+    k32.CreateProcessW.argtypes = [wintypes.LPCWSTR, wintypes.LPWSTR, ctypes.c_void_p, ctypes.c_void_p, wintypes.BOOL,
+                                   wintypes.DWORD, ctypes.c_void_p, wintypes.LPCWSTR, ctypes.POINTER(StartupInfoEx),
+                                   ctypes.POINTER(ProcessInformation)]
+    parent = k32.OpenProcess(0x0080, False, int(step["parent"]))  # PROCESS_CREATE_PROCESS
+    if not parent:
+        raise OSError(ctypes.get_last_error(), "the parent cannot be opened")
+    size = ctypes.c_size_t()
+    k32.InitializeProcThreadAttributeList(None, 1, 0, ctypes.byref(size))
+    attributes = ctypes.create_string_buffer(size.value)
+    if not k32.InitializeProcThreadAttributeList(attributes, 1, 0, ctypes.byref(size)):
+        raise OSError(ctypes.get_last_error(), "InitializeProcThreadAttributeList")
+    handle = wintypes.HANDLE(parent)
+    if not k32.UpdateProcThreadAttribute(attributes, 0, 0x00020000, ctypes.byref(handle), ctypes.sizeof(handle),
+                                         None, None):  # PROC_THREAD_ATTRIBUTE_PARENT_PROCESS
+        raise OSError(ctypes.get_last_error(), "UpdateProcThreadAttribute")
+    info = StartupInfoEx()
+    info.StartupInfo.cb = ctypes.sizeof(info)
+    info.lpAttributeList = ctypes.cast(attributes, ctypes.c_void_p)
+    created = ProcessInformation()
+    line = ctypes.create_unicode_buffer(f'"{step["image"]}"')
+    flags = 0x00000004 | 0x00080000 | 0x08000000  # CREATE_SUSPENDED | EXTENDED_STARTUPINFO_PRESENT | CREATE_NO_WINDOW
+    if not k32.CreateProcessW(step["image"], line, None, None, False, flags, None, None, ctypes.byref(info),
+                              ctypes.byref(created)):
+        raise OSError(ctypes.get_last_error(), "CreateProcessW")
+    k32.CloseHandle(created.hThread)
+    k32.CloseHandle(created.hProcess)
+    k32.CloseHandle(parent)
+    list_foreign(int(created.dwProcessId), step["pids"])
+
+
+def replace_decoy(bad):
+    """S3: a replace ref that shows the checks a decoy while the branch holds the real commit."""
+    real, decoy = ("outside.txt", "acceptance/decoy.txt") if bad else ("acceptance/real.txt", "outside.txt")
+    write_file(real, "real\n")
+    git("add", "--", real)
+    git("commit", "-q", "-m", "The real commit")
+    head = git_out("rev-parse", "HEAD")
+    write_file(decoy, "decoy\n")
+    env = dict(os.environ, GIT_INDEX_FILE=os.path.join(git_out("rev-parse", "--git-dir"), "decoy-index"))
+    git("read-tree", "HEAD~1", env=env)
+    blob = git("hash-object", "-w", "--", decoy).stdout.strip()
+    git("update-index", "--add", "--cacheinfo", f"100644,{blob},{decoy}", env=env)
+    tree = git("write-tree", env=env).stdout.strip()
+    commit = git("commit-tree", tree, "-p", "HEAD~1", "-m", "The decoy").stdout.strip()
+    os.remove(decoy)
+    os.makedirs(os.path.join(".git", "refs", "replace"), exist_ok=True)
+    with open(os.path.join(".git", "refs", "replace", head), "w", encoding="ascii", newline="\n") as fh:
+        fh.write(commit + "\n")
+    if bad:  # the clone looks like the decoy, as in the reviewer's probe: its index and files are the decoy's
+        os.remove(real)
+        git("read-tree", "HEAD")
+        git("checkout-index", "-a", "-f")
+        git("update-index", "-q", "--refresh", check=False)
+
+
+def commondir(marker):
+    """S2: .git/commondir sends git to another folder's config, refs and objects; .git/config stays as it was."""
+    import shutil
+    other = os.path.abspath(os.path.join("..", "other.git"))
+    shutil.copytree(".git", other)
+    script = os.path.abspath(os.path.join("..", "fsmonitor.sh"))
+    with open(script, "w", encoding="utf-8", newline="\n") as fh:
+        fh.write(f"#!/bin/sh\necho ran >> '{marker.replace(os.sep, '/')}'\nexit 0\n")
+    with open(os.path.join(other, "config"), "a", encoding="utf-8", newline="\n") as fh:
+        fh.write(f"[core]\n\tfsmonitor = {script.replace(os.sep, '/')}\n[push]\n\tfollowTags = true\n")
+    git("--git-dir", other, "-c", "user.name=evil", "-c", "user.email=evil@example.com", "tag", "-a", "-m", "evil",
+        "t-evil", "HEAD")
+    with open(os.path.join(".git", "commondir"), "w", encoding="utf-8", newline="\n") as fh:
+        fh.write(other.replace(os.sep, "/") + "\n")
 
 
 def git(*args, env=None, check=True):
@@ -78,6 +403,10 @@ def write_file(path, text):
 
 
 def main():
+    early = os.environ.get("FAKE_CLAUDE_EARLY")
+    if early:  # written first, before the standard input is read: a sign that the process runs at all
+        with open(early, "w", encoding="utf-8") as fh:
+            fh.write(f"{os.getpid()} {time.time()}\n")
     out_path = os.environ.get("FAKE_CLAUDE_OUT")
     steps = json.loads(os.environ.get("FAKE_CLAUDE_MODE") or "[]")
     stdin_bytes = sys.stdin.buffer.read()
@@ -115,6 +444,10 @@ def main():
         "started": time.time(),
     }
     try:
+        record["in_job"], record["job_limit_flags"] = job_facts()
+    except Exception as exc:  # noqa: BLE001  # reason: a harness probe must not stop the fake
+        record["in_job"], record["job_limit_flags"] = None, f"<probe failed: {exc!r}>"
+    try:
         stdin_bytes.decode("utf-8")
     except UnicodeDecodeError:
         record["stdin_is_utf8"] = False
@@ -124,10 +457,100 @@ def main():
 
     result_text = "The fake model finished."
     exit_code = 0
+    stream = streaming()
+    write_result = True
+    if stream:
+        emit({"type": "system", "subtype": "init", "session_id": SESSION, "model": "fake", "tools": []})
     try:
         for step in steps:
             op = step["op"]
-            if op == "commit":
+            if op == "assistant":
+                emit(assistant_event(step))
+            elif op == "tool_result":
+                emit(tool_result_event(step["ids"]))
+            elif op == "line":
+                emit_raw(bytes.fromhex(step["hex"]) if "hex" in step else step["text"].encode("utf-8"))
+            elif op == "snapshot":
+                with open(step["src"], "rb") as src, open(step["dst"], "wb") as dst:
+                    dst.write(src.read())
+            elif op == "big_line":
+                emit_raw(b"x" * int(step["bytes"]))
+            elif op == "event":
+                emit(step["event"])
+            elif op == "api_retry":
+                emit({"type": "system", "subtype": "api_retry", "attempt": 1, "max_retries": 10,
+                      "retry_delay_ms": 500, "error_status": 429, "error": step["error"],
+                      "session_id": SESSION})
+            elif op == "burst":
+                prefix = step.get("prefix", "burst")
+                lines = []
+                for n in range(1, int(step["count"]) + 1):
+                    tools = [f"tu-{prefix}-{n}"] if step.get("tools") else []
+                    lines.append(json.dumps(assistant_event({"id": f"{prefix}-{n}", "tools": tools})))
+                    if tools:
+                        lines.append(json.dumps(tool_result_event(tools)))
+                emit_raw("\n".join(lines).encode("utf-8"))
+            elif op == "forever":
+                prefix = step.get("prefix", "loop")
+                n = 0
+                while True:
+                    n += 1
+                    emit(assistant_event({"id": f"{prefix}-{n}", "tools": [f"tu-{prefix}-{n}"]}))
+                    emit(tool_result_event([f"tu-{prefix}-{n}"]))
+                    time.sleep(float(step.get("interval", 0.05)))
+            elif op == "ignore_break":
+                if hasattr(signal, "SIGBREAK"):
+                    signal.signal(signal.SIGBREAK, signal.SIG_IGN)
+                signal.signal(signal.SIGINT, signal.SIG_IGN)
+            elif op == "spawn_family":
+                spawn_family(step["pids"])
+            elif op == "marker":
+                with open(step["file"], "w", encoding="utf-8") as fh:
+                    fh.write(f"{time.time()}\n")
+            elif op == "pause":
+                time.sleep(float(step["seconds"]))
+            elif op == "crash":
+                sys.stdout.flush()
+                os._exit(int(step.get("code", 3)))
+            elif op == "no_result":
+                write_result = False
+            elif op == "wmi_spawn":
+                wmi_spawn(step["pids"], step.get("count", 30))
+            elif op == "spawn_listed":
+                child = subprocess.Popen(step["argv"])
+                list_foreign(child.pid, step["pids"])
+            elif op == "list_parent":  # the process the launcher started (a venv's python.exe starts this one)
+                list_foreign(os.getppid())
+            elif op == "gitfile":
+                os.rename(".git", "../moved.git")
+                with open(".git", "w", encoding="utf-8") as fh:
+                    fh.write("gitdir: ../moved.git\n")
+            elif op == "deep_assistant":
+                emit_raw(deep_assistant(int(step["depth"])).encode("utf-8"))
+            elif op == "replace_decoy":
+                replace_decoy(bool(step.get("bad", True)))
+            elif op == "commondir":
+                commondir(step["marker"])
+            elif op == "wmi_hide":
+                wmi_hide(step)
+            elif op == "shallow_head":  # mark the branch's head as a shallow boundary in the clone
+                with open(os.path.join(".git", "shallow"), "a", encoding="ascii", newline="\n") as fh:
+                    fh.write(git_out("rev-parse", "HEAD") + "\n")
+            elif op == "spoof_parent":
+                spoof_parent(step)
+            elif op == "remove_commit":
+                git("rm", "-q", "--", step["path"])
+                git("commit", "-q", "-m", f"Remove {step['path']}")
+            elif op == "merge_commit":
+                tree = git_out("rev-parse", "HEAD^{tree}")
+                side = git("commit-tree", tree, "-p", "HEAD", "-m", "A side commit").stdout.strip()
+                merge = git("commit-tree", tree, "-p", "HEAD", "-p", side, "-m", "A merge").stdout.strip()
+                git("update-ref", "HEAD", merge)
+            elif op == "close_stdout":
+                sys.stdout.flush()
+                os.close(1)
+                write_result = False
+            elif op == "commit":
                 write_file(step["path"], step.get("text", "print('hello')\n"))
                 git("add", "--", step["path"])
                 git("commit", "-q", "-m", step.get("message", f"Add {step['path']}"))
@@ -197,8 +620,12 @@ def main():
         "duration_api_ms": 87654,
         "total_cost_usd": 0.4321,
         "result": result_text,
-        "session_id": "00000000-0000-4000-8000-000000000000",
+        "session_id": SESSION,
     }
+    if stream:
+        if write_result:
+            emit(answer)
+        return exit_code
     sys.stdout.write(json.dumps(answer))
     sys.stdout.flush()
     return exit_code

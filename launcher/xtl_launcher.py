@@ -7,31 +7,46 @@ Run by the separate standard Windows user that holds the executor's key, never b
     python -I xtl_launcher.py [--config launcher.toml] spec --slug S
     python -I xtl_launcher.py [--config launcher.toml] fix --pr N
 
-The rules it meets are in LAUNCHER-CONTRACT.md beside it, numbered LR-1 to LR-50. In short:
+task, spec and fix also take --max-messages M, which can only lower the attempt's limit.
+
+The rules it meets are in LAUNCHER-CONTRACT.md beside it, numbered LR-1 to LR-66. In short:
 it refuses to run as the CEO's user, as an administrator, or beside a stored GitHub login; it
 mints a one-hour installation token for one repository and revokes it at the end; the model
 works in a fresh clone with no token and no network credential, and only commits; the launcher
 then checks the commits, pushes the branch as the app and opens the PR with the pinned gate's
 own code. It never merges, approves, labels or changes a setting.
+
+Stage A (LR-51 to LR-66): the launcher reads the model's stream-json output, counts its messages
+by message.id, keeps an append-only ledger of attempts, refuses a task whose budget is used up,
+and stops the model by itself at the attempt's limit, ending its whole process tree (on Windows,
+a job object).
+
+Stages A2 and A3 (LR-67 to LR-88): it searches for processes of its user outside the model's job (listed without
+opening them), and after the model it runs every git step in a new repository of its own, which takes the
+branch's head from the clone as data, with an allow-list environment and a read-only hooks folder.
 """
 
 from __future__ import annotations
 
 import argparse
 import base64
+import contextlib
 import json
 import os
+import queue
 import re
 import secrets
 import shutil
+import signal
 import subprocess
 import sys
+import threading
 import time
 import tomllib
 import urllib.error
 import urllib.parse
 import urllib.request
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
 
 HERE = Path(__file__).resolve().parent
@@ -61,13 +76,66 @@ TOOLS = {
 }
 TOOLS["fix"] = TOOLS["task"]
 ALWAYS_DENIED = ["Bash(git push:*)", "Bash(git remote:*)", "Bash(git config:*)", "Bash(git checkout:*)",
-                 "Bash(git switch:*)", "Bash(gh:*)", "Bash(curl:*)", "WebFetch", "WebSearch"]
+                 "Bash(git switch:*)", "Bash(gh:*)", "Bash(curl:*)", "WebFetch", "WebSearch",
+                 "Agent", "Task"]  # LR-59: no subagents
 FILE_TOOLS = ("Read", "Grep", "Glob", "Edit", "Write")
 PEM_BLOCK = re.compile(r"-----BEGIN [A-Z0-9 ]+-----.*?-----END [A-Z0-9 ]+-----", re.S)
 PEM_LINE = re.compile(r"-----(BEGIN|END) [A-Z0-9 ]*PRIVATE KEY-----")
 GITHUB_TOKEN_SHAPE = re.compile(r"gh[pousr]_[A-Za-z0-9]{20,}|github_pat_[A-Za-z0-9_]{20,}")
 MARKER = re.compile(r"<!-- gate-review sha=([0-9a-f]{40}) verdict=(pass|changes_requested) -->")
 MODEL_FIELDS = ("num_turns", "is_error", "subtype", "total_cost_usd", "duration_ms")
+LIMIT_KEYS = ("max_messages_attempt", "max_messages_task", "max_runs_task")  # LR-53
+GRACE_SECONDS = 10  # LR-58: CTRL_BREAK (or SIGINT), then this long, then the job (or the group) is ended
+END_CHECK_SECONDS = 5  # LR-58: how long the count of live processes is read again
+DRAIN_SECONDS = 30  # LR-71: the bound on reading the stream to its end after the model's job has ended
+SCAN_SECONDS = 1.0  # LR-67: the search for processes outside the job, while the model runs
+END_SEARCHES = 3  # LR-67: the searches after the end
+ASSISTANT_START = re.compile(rb'"type"\s*:\s*"assistant"')  # LR-72
+MAX_TIMEOUT_MINUTES = 59  # LR-76
+MAX_STREAM_LINE = 32 * 1024 * 1024  # LR-60
+MAX_BAD_LINES = 10  # LR-60
+MAX_MESSAGE_ID = 256  # LR-52
+CUT = 200  # LR-60, LR-62: logged pieces of the stream
+FIX_TASK = re.compile(r"ai/([1-9][0-9]{0,9})-")  # LR-54
+CREATE_SUSPENDED = 0x4
+JOB_KILL_ON_CLOSE = 0x2000  # JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE; no BREAKAWAY_OK, no SILENT_BREAKAWAY_OK
+STOP_MESSAGES = {
+    "MESSAGE_LIMIT": "The model reached its message limit and was stopped. Nothing was pushed.",
+    "STREAM_UNREADABLE": "The model's stream could not be read. Nothing was pushed.",
+    "PROCESS_SURVIVED": "A process of the model survived the stop. Nothing was pushed.",
+    "JOB_SETUP_FAILED": "The model's job object could not be set up. Nothing was started.",
+    "LEDGER_FAILED": "The ledger could not be written. Nothing was pushed.",
+    "PROCESS_OUTSIDE_JOB": "A process of this user appeared outside the model's job. Nothing was pushed.",
+    "SECOND_MODEL": "A second Claude Code appeared while the model ran. Nothing was pushed.",
+    "GIT_CONFIG_CHANGED": "The model changed the clone's git configuration or its .git folder. Nothing was pushed.",
+    "TIMEOUT_TOO_LONG": f"quality.toml's timeout_minutes is above {MAX_TIMEOUT_MINUTES}. Nothing was started.",
+    "GIT_REPO_UNSAFE": "The launcher's own repository holds what could change what git shows. Nothing was pushed.",
+    "PROCESS_BEFORE_PUSH": "A process of this user appeared before the push. Nothing was pushed.",
+    "PROCESS_UNENDED": "A process an earlier run could not end is still running. Restart Windows before the next run. "
+                       "Nothing was started.",
+    "SPEC_MERGE_COMMIT": "The spec-test author made a merge commit. Nothing was pushed.",
+}
+UNENDED_NOTE = " A process could not be ended: restart Windows before the next run."  # LR-89
+HOOKS_README = "README.md"  # LR-80: the only file the launcher's hooks folder may hold
+NO_GRAFTS = "no-grafts"  # LR-80: GIT_GRAFT_FILE names this file in the hooks folder, which never exists
+GIT_SAFE = ("-c", "gc.auto=0", "-c", "maintenance.auto=false")  # LR-80: no git process outlives its command
+POSIX_TRUSTED = ("/usr/", "/bin/", "/sbin/", "/opt/")  # LR-81
+FOLDERID_PROGRAM_FILES = ("{905E63B6-C1BF-494E-B29C-65B732D3D21A}", "{7C5A40EF-A0FB-4BFC-874A-C0F2E0B9FA8E}")
+SYSTEM_SID = "S-1-5-18"
+WITNESS_FORMAT = "xtl-witness/1"  # LR-97: the operator's witness file
+WITNESS_FRESH_SECONDS = 2  # LR-97: the witness's last write is at most this old
+WITNESS_AFTER_SECONDS = 0.5  # LR-97: a write this long after a process's creation can judge it
+WITNESS_WAIT_SECONDS = 2  # LR-97: the longest wait for such a write
+WITNESS_POLL_SECONDS = 0.1  # LR-97: how often the file is read again during that wait
+WITNESS_MAX_BYTES = 16 * 1024 * 1024  # LR-97: a larger witness file is not read
+WITNESS_WRITERS = (SYSTEM_SID, ADMINISTRATORS)  # LR-97: besides the operator, the only ones who may write there
+WITNESS_WRITE_BITS = WRITE_BITS | 0x40  # LR-97: and DeleteChild: write, delete, add, change the owner or the rules
+# LR-97 (review round 1, F2): on a folder above the witness, the rights that let someone move, replace or re-permit
+# what it holds: DeleteChild, Delete, WriteDAC, WriteOwner, GenericAll (adding a new entry replaces nothing)
+ANCESTOR_BITS = 0x40 | 0x10000 | 0x40000 | 0x80000 | 0x10000000
+TRUSTED_INSTALLER = "S-1-5-80-956008885-3418522649-1831038044-1853292631-2271478464"  # owns the drive's root
+FILETIME_SECOND = 10_000_000
+WATCH_MINUTE_SECONDS = 60  # LR-98: one minute of the watch
 
 
 class Stop(Exception):
@@ -157,6 +225,70 @@ def can_write(path: str | Path) -> bool:
         return False
 
 
+def can_create(folder: str | Path) -> bool:
+    """LR-80, LR-87: whether the current user can create a file in the folder (made and removed at once)."""
+    probe = Path(folder) / f".xtl-probe-{secrets.token_hex(8)}"
+    try:
+        descriptor = os.open(probe, os.O_CREAT | os.O_EXCL | os.O_WRONLY)
+    except OSError:
+        return False
+    os.close(descriptor)
+    with contextlib.suppress(OSError):
+        os.unlink(probe)
+    return True
+
+
+def hooks_folder() -> Path:
+    """LR-80, LR-87: the launcher's own hooks folder, beside xtl_launcher.py; it holds only its README."""
+    return HERE / "git-hooks"
+
+
+def system_folders() -> dict:
+    """LR-81, LR-87: the Windows folders, from the system, never from the environment."""
+    if os.name != "nt":
+        return {"windows": "C:\\Windows", "system32": "C:\\Windows\\System32", "syswow64": "C:\\Windows\\SysWOW64",
+                "program_files": ["C:\\Program Files", "C:\\Program Files (x86)"]}
+    import ctypes
+    from ctypes import wintypes
+
+    k32 = ctypes.WinDLL("kernel32", use_last_error=True)
+
+    def folder(name: str) -> str | None:
+        function = getattr(k32, name)
+        function.argtypes, function.restype = [wintypes.LPWSTR, wintypes.UINT], wintypes.UINT
+        buffer = ctypes.create_unicode_buffer(1024)
+        size = function(buffer, 1024)
+        return buffer.value if 0 < size < 1024 else None
+
+    class Guid(ctypes.Structure):
+        _fields_ = [("Data1", wintypes.DWORD), ("Data2", wintypes.WORD), ("Data3", wintypes.WORD),
+                    ("Data4", ctypes.c_ubyte * 8)]
+
+    shell32, ole32 = ctypes.WinDLL("shell32"), ctypes.WinDLL("ole32")
+    shell32.SHGetKnownFolderPath.argtypes = [ctypes.POINTER(Guid), wintypes.DWORD, wintypes.HANDLE,
+                                             ctypes.POINTER(ctypes.c_wchar_p)]
+    shell32.SHGetKnownFolderPath.restype = ctypes.c_long
+    ole32.CLSIDFromString.argtypes = [wintypes.LPCWSTR, ctypes.POINTER(Guid)]
+    ole32.CoTaskMemFree.argtypes = [ctypes.c_void_p]
+
+    def known(text: str) -> str | None:
+        guid, path = Guid(), ctypes.c_wchar_p()
+        if ole32.CLSIDFromString(text, ctypes.byref(guid)) != 0:
+            return None
+        if shell32.SHGetKnownFolderPath(ctypes.byref(guid), 0, None, ctypes.byref(path)) != 0:
+            return None
+        try:
+            return path.value
+        finally:
+            ole32.CoTaskMemFree(ctypes.cast(path, ctypes.c_void_p))
+
+    windows, system32 = folder("GetSystemWindowsDirectoryW"), folder("GetSystemDirectoryW")
+    if not windows or not system32:
+        raise OSError("the Windows folders cannot be read")
+    return {"windows": windows, "system32": system32, "syswow64": folder("GetSystemWow64DirectoryW"),
+            "program_files": [p for p in (known(g) for g in FOLDERID_PROGRAM_FILES) if p]}
+
+
 def folder_openable(path: str | Path) -> str:
     """Whether the current user can open the folder for listing. It never lists it."""
     if os.name != "nt":
@@ -185,6 +317,1023 @@ def folder_openable(path: str | Path) -> str:
     return "open"
 
 
+# ---------------------------------------------------------------- seams: the Windows job object (LR-58, LR-64)
+
+_WIN: dict = {}
+
+
+def _win():
+    """kernel32 with the signatures the job object needs, made once. Windows only."""
+    if _WIN:
+        return _WIN
+    import ctypes
+    from ctypes import wintypes
+
+    class Basic(ctypes.Structure):
+        _fields_ = [("PerProcessUserTimeLimit", ctypes.c_int64), ("PerJobUserTimeLimit", ctypes.c_int64),
+                    ("LimitFlags", wintypes.DWORD), ("MinimumWorkingSetSize", ctypes.c_size_t),
+                    ("MaximumWorkingSetSize", ctypes.c_size_t), ("ActiveProcessLimit", wintypes.DWORD),
+                    ("Affinity", ctypes.c_size_t), ("PriorityClass", wintypes.DWORD),
+                    ("SchedulingClass", wintypes.DWORD)]
+
+    class Extended(ctypes.Structure):
+        _fields_ = [("BasicLimitInformation", Basic), ("IoInfo", ctypes.c_uint64 * 6),
+                    ("ProcessMemoryLimit", ctypes.c_size_t), ("JobMemoryLimit", ctypes.c_size_t),
+                    ("PeakProcessMemoryUsed", ctypes.c_size_t), ("PeakJobMemoryUsed", ctypes.c_size_t)]
+
+    class Accounting(ctypes.Structure):
+        _fields_ = [("TotalUserTime", ctypes.c_int64), ("TotalKernelTime", ctypes.c_int64),
+                    ("ThisPeriodTotalUserTime", ctypes.c_int64), ("ThisPeriodTotalKernelTime", ctypes.c_int64),
+                    ("TotalPageFaultCount", wintypes.DWORD), ("TotalProcesses", wintypes.DWORD),
+                    ("ActiveProcesses", wintypes.DWORD), ("TotalTerminatedProcesses", wintypes.DWORD)]
+
+    class ThreadEntry(ctypes.Structure):
+        _fields_ = [("dwSize", wintypes.DWORD), ("cntUsage", wintypes.DWORD), ("th32ThreadID", wintypes.DWORD),
+                    ("th32OwnerProcessID", wintypes.DWORD), ("tpBasePri", wintypes.LONG),
+                    ("tpDeltaPri", wintypes.LONG), ("dwFlags", wintypes.DWORD)]
+
+    k32 = ctypes.WinDLL("kernel32", use_last_error=True)
+    signatures = {
+        "CreateJobObjectW": ([wintypes.LPVOID, wintypes.LPCWSTR], wintypes.HANDLE),
+        "SetInformationJobObject": ([wintypes.HANDLE, ctypes.c_int, wintypes.LPVOID, wintypes.DWORD], wintypes.BOOL),
+        "QueryInformationJobObject": ([wintypes.HANDLE, ctypes.c_int, wintypes.LPVOID, wintypes.DWORD,
+                                       wintypes.LPVOID], wintypes.BOOL),
+        "AssignProcessToJobObject": ([wintypes.HANDLE, wintypes.HANDLE], wintypes.BOOL),
+        "TerminateJobObject": ([wintypes.HANDLE, wintypes.UINT], wintypes.BOOL),
+        "CloseHandle": ([wintypes.HANDLE], wintypes.BOOL),
+        "CreateToolhelp32Snapshot": ([wintypes.DWORD, wintypes.DWORD], wintypes.HANDLE),
+        "Thread32First": ([wintypes.HANDLE, ctypes.POINTER(ThreadEntry)], wintypes.BOOL),
+        "Thread32Next": ([wintypes.HANDLE, ctypes.POINTER(ThreadEntry)], wintypes.BOOL),
+        "OpenThread": ([wintypes.DWORD, wintypes.BOOL, wintypes.DWORD], wintypes.HANDLE),
+        "ResumeThread": ([wintypes.HANDLE], wintypes.DWORD),
+    }
+    for name, (argtypes, restype) in signatures.items():
+        function = getattr(k32, name)
+        function.argtypes, function.restype = argtypes, restype
+    _WIN.update(ctypes=ctypes, k32=k32, Extended=Extended, Accounting=Accounting, ThreadEntry=ThreadEntry,
+                invalid=wintypes.HANDLE(-1).value)
+    return _WIN
+
+
+def _last_error() -> OSError:
+    w = _win()
+    return w["ctypes"].WinError(w["ctypes"].get_last_error())
+
+
+def job_open():
+    """A new job object whose only limit is KILL_ON_JOB_CLOSE: no breakaway of any kind."""
+    w = _win()
+    job = w["k32"].CreateJobObjectW(None, None)
+    if not job:
+        raise _last_error()
+    info = w["Extended"]()
+    info.BasicLimitInformation.LimitFlags = JOB_KILL_ON_CLOSE
+    if not w["k32"].SetInformationJobObject(job, 9, w["ctypes"].byref(info), w["ctypes"].sizeof(info)):
+        error = _last_error()
+        w["k32"].CloseHandle(job)
+        raise error
+    return job
+
+
+def job_add(job, process: subprocess.Popen) -> None:
+    """Put the (suspended) process into the job."""
+    if not _win()["k32"].AssignProcessToJobObject(job, int(process._handle)):
+        raise _last_error()
+
+
+def resume_process(pid: int) -> None:
+    """Resume every thread of a process started with CREATE_SUSPENDED."""
+    w = _win()
+    k32, ctypes = w["k32"], w["ctypes"]
+    snapshot = k32.CreateToolhelp32Snapshot(0x4, 0)  # TH32CS_SNAPTHREAD
+    if not snapshot or snapshot == w["invalid"]:
+        raise _last_error()
+    resumed = 0
+    try:
+        entry = w["ThreadEntry"]()
+        entry.dwSize = ctypes.sizeof(entry)
+        more = k32.Thread32First(snapshot, ctypes.byref(entry))
+        while more:
+            if entry.th32OwnerProcessID == pid:
+                thread = k32.OpenThread(0x2, False, entry.th32ThreadID)  # THREAD_SUSPEND_RESUME
+                if not thread:
+                    raise _last_error()
+                try:
+                    if k32.ResumeThread(thread) == 0xFFFFFFFF:
+                        raise _last_error()
+                    resumed += 1
+                finally:
+                    k32.CloseHandle(thread)
+            more = k32.Thread32Next(snapshot, ctypes.byref(entry))
+    finally:
+        k32.CloseHandle(snapshot)
+    if resumed == 0:
+        raise OSError("no thread of the model's process was found to resume")
+
+
+def job_end(job) -> int:
+    """TerminateJobObject, then the number of the job's processes still alive (read again for a while)."""
+    w = _win()
+    k32, ctypes = w["k32"], w["ctypes"]
+    k32.TerminateJobObject(job, 1)
+    deadline = time.monotonic() + END_CHECK_SECONDS
+    while True:
+        accounting = w["Accounting"]()
+        if not k32.QueryInformationJobObject(job, 1, ctypes.byref(accounting), ctypes.sizeof(accounting), None):
+            return 1  # the count cannot be read: fail closed
+        if accounting.ActiveProcesses == 0 or time.monotonic() >= deadline:
+            return int(accounting.ActiveProcesses)
+        time.sleep(0.1)
+
+
+def job_close(job) -> None:
+    """Close the job's handle; KILL_ON_JOB_CLOSE ends whatever is still in it."""
+    _win()["k32"].CloseHandle(job)
+
+
+# ---------------------------------------------------------------- seams: the user's processes (LR-67, LR-77)
+
+_PROC: dict = {}
+
+
+def _proc():
+    """kernel32 and advapi32 with the signatures the search for processes needs, made once. Windows only."""
+    if _PROC:
+        return _PROC
+    import ctypes
+    from ctypes import wintypes
+
+    class Entry(ctypes.Structure):
+        _fields_ = [("dwSize", wintypes.DWORD), ("cntUsage", wintypes.DWORD), ("th32ProcessID", wintypes.DWORD),
+                    ("th32DefaultHeapID", ctypes.c_size_t), ("th32ModuleID", wintypes.DWORD),
+                    ("cntThreads", wintypes.DWORD), ("th32ParentProcessID", wintypes.DWORD),
+                    ("pcPriClassBase", wintypes.LONG), ("dwFlags", wintypes.DWORD), ("szExeFile", wintypes.WCHAR * 260)]
+
+    class ServiceStatus(ctypes.Structure):
+        _fields_ = [("dwServiceType", wintypes.DWORD), ("dwCurrentState", wintypes.DWORD),
+                    ("dwControlsAccepted", wintypes.DWORD), ("dwWin32ExitCode", wintypes.DWORD),
+                    ("dwServiceSpecificExitCode", wintypes.DWORD), ("dwCheckPoint", wintypes.DWORD),
+                    ("dwWaitHint", wintypes.DWORD), ("dwProcessId", wintypes.DWORD), ("dwServiceFlags", wintypes.DWORD)]
+
+    class UnicodeString(ctypes.Structure):
+        _fields_ = [("Length", wintypes.USHORT), ("MaximumLength", wintypes.USHORT), ("Buffer", ctypes.c_void_p)]
+
+    class ProcessInfo(ctypes.Structure):  # SYSTEM_PROCESS_INFORMATION, up to SessionId (LR-82)
+        _fields_ = [("NextEntryOffset", wintypes.ULONG), ("NumberOfThreads", wintypes.ULONG),
+                    ("WorkingSetPrivateSize", ctypes.c_int64), ("HardFaultCount", wintypes.ULONG),
+                    ("NumberOfThreadsHighWatermark", wintypes.ULONG), ("CycleTime", ctypes.c_uint64),
+                    ("CreateTime", ctypes.c_int64), ("UserTime", ctypes.c_int64), ("KernelTime", ctypes.c_int64),
+                    ("ImageName", UnicodeString), ("BasePriority", wintypes.LONG),
+                    ("UniqueProcessId", ctypes.c_void_p), ("InheritedFromUniqueProcessId", ctypes.c_void_p),
+                    ("HandleCount", wintypes.ULONG), ("SessionId", wintypes.ULONG)]
+
+    k32 = ctypes.WinDLL("kernel32", use_last_error=True)
+    adv = ctypes.WinDLL("advapi32", use_last_error=True)
+    nt = ctypes.WinDLL("ntdll")
+    signatures = {
+        (nt, "NtQuerySystemInformation"): ([ctypes.c_int, ctypes.c_void_p, wintypes.ULONG, ctypes.POINTER(wintypes.ULONG)],
+                                           ctypes.c_long),
+        (k32, "QueryInformationJobObject"): ([wintypes.HANDLE, ctypes.c_int, wintypes.LPVOID, wintypes.DWORD,
+                                              wintypes.LPVOID], wintypes.BOOL),
+        (adv, "GetSecurityInfo"): ([wintypes.HANDLE, ctypes.c_int, wintypes.DWORD, ctypes.POINTER(ctypes.c_void_p),
+                                    ctypes.c_void_p, ctypes.c_void_p, ctypes.c_void_p, ctypes.POINTER(ctypes.c_void_p)],
+                                   wintypes.DWORD),
+        (adv, "SetSecurityInfo"): ([wintypes.HANDLE, ctypes.c_int, wintypes.DWORD, ctypes.c_void_p, ctypes.c_void_p,
+                                    ctypes.c_void_p, ctypes.c_void_p], wintypes.DWORD),
+        (adv, "ConvertStringSecurityDescriptorToSecurityDescriptorW"): (
+            [wintypes.LPCWSTR, wintypes.DWORD, ctypes.POINTER(ctypes.c_void_p), ctypes.c_void_p], wintypes.BOOL),
+        (adv, "GetSecurityDescriptorDacl"): ([ctypes.c_void_p, ctypes.POINTER(wintypes.BOOL),
+                                              ctypes.POINTER(ctypes.c_void_p), ctypes.POINTER(wintypes.BOOL)],
+                                             wintypes.BOOL),
+        (k32, "CreateToolhelp32Snapshot"): ([wintypes.DWORD, wintypes.DWORD], wintypes.HANDLE),
+        (k32, "Process32FirstW"): ([wintypes.HANDLE, ctypes.POINTER(Entry)], wintypes.BOOL),
+        (k32, "Process32NextW"): ([wintypes.HANDLE, ctypes.POINTER(Entry)], wintypes.BOOL),
+        (k32, "OpenProcess"): ([wintypes.DWORD, wintypes.BOOL, wintypes.DWORD], wintypes.HANDLE),
+        (k32, "CloseHandle"): ([wintypes.HANDLE], wintypes.BOOL),
+        (k32, "GetProcessTimes"): ([wintypes.HANDLE] + [ctypes.POINTER(wintypes.FILETIME)] * 4, wintypes.BOOL),
+        (k32, "QueryFullProcessImageNameW"): ([wintypes.HANDLE, wintypes.DWORD, wintypes.LPWSTR,
+                                               ctypes.POINTER(wintypes.DWORD)], wintypes.BOOL),
+        (k32, "IsProcessInJob"): ([wintypes.HANDLE, wintypes.HANDLE, ctypes.POINTER(wintypes.BOOL)], wintypes.BOOL),
+        (k32, "TerminateProcess"): ([wintypes.HANDLE, wintypes.UINT], wintypes.BOOL),
+        (k32, "WaitForSingleObject"): ([wintypes.HANDLE, wintypes.DWORD], wintypes.DWORD),
+        (k32, "GetCurrentProcess"): ([], wintypes.HANDLE),
+        (k32, "GetSystemTimeAsFileTime"): ([ctypes.POINTER(wintypes.FILETIME)], None),
+        (k32, "LocalFree"): ([wintypes.HLOCAL], wintypes.HLOCAL),
+        (adv, "OpenProcessToken"): ([wintypes.HANDLE, wintypes.DWORD, ctypes.POINTER(wintypes.HANDLE)], wintypes.BOOL),
+        (adv, "GetTokenInformation"): ([wintypes.HANDLE, ctypes.c_int, wintypes.LPVOID, wintypes.DWORD,
+                                        ctypes.POINTER(wintypes.DWORD)], wintypes.BOOL),
+        (adv, "ConvertSidToStringSidW"): ([wintypes.LPVOID, ctypes.POINTER(wintypes.LPWSTR)], wintypes.BOOL),
+        (adv, "OpenSCManagerW"): ([wintypes.LPCWSTR, wintypes.LPCWSTR, wintypes.DWORD], wintypes.HANDLE),
+        (adv, "OpenServiceW"): ([wintypes.HANDLE, wintypes.LPCWSTR, wintypes.DWORD], wintypes.HANDLE),
+        (adv, "QueryServiceStatusEx"): ([wintypes.HANDLE, ctypes.c_int, wintypes.LPVOID, wintypes.DWORD,
+                                         ctypes.POINTER(wintypes.DWORD)], wintypes.BOOL),
+        (adv, "CloseServiceHandle"): ([wintypes.HANDLE], wintypes.BOOL),
+    }
+    for (dll, name), (argtypes, restype) in signatures.items():
+        function = getattr(dll, name)
+        function.argtypes, function.restype = argtypes, restype
+    _PROC.update(ctypes=ctypes, wintypes=wintypes, k32=k32, adv=adv, nt=nt, Entry=Entry, ServiceStatus=ServiceStatus,
+                 ProcessInfo=ProcessInfo)
+    return _PROC
+
+
+def _token_sid(handle) -> str | None:
+    p = _proc()
+    ctypes, wintypes, k32, adv = p["ctypes"], p["wintypes"], p["k32"], p["adv"]
+    token = wintypes.HANDLE()
+    if not adv.OpenProcessToken(handle, 0x8, ctypes.byref(token)):  # TOKEN_QUERY
+        return None
+    try:
+        size = wintypes.DWORD()
+        adv.GetTokenInformation(token, 1, None, 0, ctypes.byref(size))  # TokenUser
+        if not size.value:
+            return None
+        buffer = ctypes.create_string_buffer(size.value)
+        if not adv.GetTokenInformation(token, 1, buffer, size, ctypes.byref(size)):
+            return None
+        text = wintypes.LPWSTR()
+        if not adv.ConvertSidToStringSidW(ctypes.c_void_p.from_buffer(buffer).value, ctypes.byref(text)):
+            return None
+        try:
+            return text.value
+        finally:
+            k32.LocalFree(text)
+    finally:
+        k32.CloseHandle(token)
+
+
+def _schedule_pid() -> int | None:
+    """The process id of the Task Scheduler service, from the service manager."""
+    p = _proc()
+    ctypes, adv = p["ctypes"], p["adv"]
+    manager = adv.OpenSCManagerW(None, None, 0x1)  # SC_MANAGER_CONNECT
+    if not manager:
+        return None
+    try:
+        service = adv.OpenServiceW(manager, "Schedule", 0x4)  # SERVICE_QUERY_STATUS
+        if not service:
+            return None
+        try:
+            status = p["ServiceStatus"]()
+            needed = p["wintypes"].DWORD()
+            if not adv.QueryServiceStatusEx(service, 0, ctypes.byref(status), ctypes.sizeof(status), ctypes.byref(needed)):
+                return None
+            return int(status.dwProcessId) or None
+        finally:
+            adv.CloseServiceHandle(service)
+    finally:
+        adv.CloseServiceHandle(manager)
+
+
+def now_filetime() -> int:
+    """The current time as a Windows FILETIME (100-ns steps since 1601)."""
+    p = _proc()
+    value = p["wintypes"].FILETIME()
+    p["k32"].GetSystemTimeAsFileTime(p["ctypes"].byref(value))
+    return (value.dwHighDateTime << 32) | value.dwLowDateTime
+
+
+def _system_processes() -> dict[int, dict]:
+    """LR-82: every process, from NtQuerySystemInformation(SystemProcessInformation), without opening any."""
+    p = _proc()
+    ctypes, wintypes = p["ctypes"], p["wintypes"]
+    size = 1 << 20
+    while True:
+        buffer = ctypes.create_string_buffer(size)
+        needed = wintypes.ULONG()
+        status = p["nt"].NtQuerySystemInformation(5, buffer, size, ctypes.byref(needed)) & 0xFFFFFFFF
+        if status == 0xC0000004 and size < (1 << 28):  # STATUS_INFO_LENGTH_MISMATCH: a larger buffer
+            size = max(size * 2, needed.value + (1 << 16))
+            continue
+        if status != 0:
+            raise OSError(f"the process list cannot be read ({status:#x})")
+        break
+    found: dict[int, dict] = {}
+    base, offset = ctypes.addressof(buffer), 0
+    while True:
+        entry = p["ProcessInfo"].from_address(base + offset)
+        name = entry.ImageName
+        image = ctypes.wstring_at(name.Buffer, name.Length // 2) if name.Buffer else ""
+        found[int(entry.UniqueProcessId or 0)] = {"ppid": int(entry.InheritedFromUniqueProcessId or 0), "image": image,
+                                                   "session": int(entry.SessionId), "created": int(entry.CreateTime)}
+        if not entry.NextEntryOffset:
+            return found
+        offset += entry.NextEntryOffset
+
+
+def _job_pids(job) -> set[int]:
+    """LR-82: the ids of the processes in the job, from the job's own list (no process is opened)."""
+    if job is None:
+        return set()
+    p = _proc()
+    ctypes = p["ctypes"]
+    count = 1024
+    while True:
+        class Listing(ctypes.Structure):
+            _fields_ = [("Assigned", ctypes.c_ulong), ("Listed", ctypes.c_ulong), ("Ids", ctypes.c_size_t * count)]
+
+        data = Listing()
+        if p["k32"].QueryInformationJobObject(job, 3, ctypes.byref(data), ctypes.sizeof(data), None):
+            return {int(data.Ids[i]) for i in range(data.Listed)}
+        if ctypes.get_last_error() == 234 and count < (1 << 16):  # ERROR_MORE_DATA
+            count *= 4
+            continue
+        raise ctypes.WinError(ctypes.get_last_error())
+
+
+def _process_facts(pid: int) -> tuple[str | None, str | None]:
+    """LR-82: (owner SID, image path) of a process: the owner from its token, else from its security descriptor
+    read with READ_CONTROL (the owner's own right), else None. The path only when the process can be opened."""
+    p = _proc()
+    ctypes, wintypes, k32, adv = p["ctypes"], p["wintypes"], p["k32"], p["adv"]
+    sid = path = None
+    handle = k32.OpenProcess(0x1000, False, pid)  # PROCESS_QUERY_LIMITED_INFORMATION
+    if handle:
+        try:
+            sid = _token_sid(handle)
+            buffer = ctypes.create_unicode_buffer(1024)
+            size = wintypes.DWORD(1024)
+            if k32.QueryFullProcessImageNameW(handle, 0, buffer, ctypes.byref(size)):
+                path = buffer.value
+        finally:
+            k32.CloseHandle(handle)
+    if sid is not None:
+        return sid, path
+    handle = k32.OpenProcess(0x20000, False, pid)  # READ_CONTROL
+    if not handle:
+        return None, path
+    try:
+        owner, descriptor = ctypes.c_void_p(), ctypes.c_void_p()
+        if adv.GetSecurityInfo(handle, 6, 0x1, ctypes.byref(owner), None, None, None, ctypes.byref(descriptor)) != 0:
+            return None, path
+        try:
+            text = wintypes.LPWSTR()
+            if not owner.value or not adv.ConvertSidToStringSidW(owner.value, ctypes.byref(text)):
+                return None, path
+            try:
+                return text.value, path
+            finally:
+                k32.LocalFree(text)
+        finally:
+            k32.LocalFree(descriptor)
+    finally:
+        k32.CloseHandle(handle)
+
+
+OTHERS_SEEN: set[tuple[int, int]] = set()  # LR-97: (pid, creation time) of other users' processes the searches saw
+OTHERS_BOUND = 100_000
+
+
+def user_processes(job) -> list[dict]:
+    """LR-82, LR-87: the processes of the current user and those of unknown owner. Never their command lines."""
+    p = _proc()
+    me = _token_sid(p["k32"].GetCurrentProcess())
+    table = _system_processes()
+    inside = _job_pids(job)
+    schedule = _schedule_pid()
+    session = table.get(os.getpid(), {}).get("session")
+    facts: dict[int, tuple[str | None, str | None]] = {}
+
+    def fact(pid: int) -> tuple[str | None, str | None]:
+        if pid not in facts:
+            facts[pid] = _process_facts(pid)
+        return facts[pid]
+
+    def whose(sid: str | None) -> str:
+        return "self" if sid == me else "unknown" if sid is None else "other"
+
+    found = []
+    for pid, entry in table.items():
+        if pid in (0, 4):
+            continue
+        sid, path = fact(pid)
+        if whose(sid) == "other" and pid not in inside:
+            if len(OTHERS_SEEN) < OTHERS_BOUND:
+                OTHERS_SEEN.add((pid, entry["created"]))  # LR-97: counted at the end of a run, never named
+            continue  # known to be another user's
+        ppid = entry["ppid"]
+        parent = table.get(ppid)
+        alive = parent is not None and ppid not in (0, pid) and parent["created"] <= entry["created"]
+        parent_sid, parent_path = fact(ppid) if alive else (None, None)
+        parent_image = parent["image"] if alive else None
+        broker = ("wmi" if (parent_image or "").lower() == "wmiprvse.exe"
+                  else "schedule" if alive and schedule is not None and ppid == schedule else None)
+        found.append({"pid": pid, "ppid": ppid, "image": entry["image"], "path": path, "parent_image": parent_image,
+                      "parent_path": parent_path, "created": entry["created"], "in_job": pid in inside,
+                      "broker": broker, "owner": "self" if sid == me or pid in inside else "unknown",
+                      "session": entry["session"], "same_session": entry["session"] == session,
+                      "parent_owner": whose(parent_sid) if alive else None, "parent_in_job": ppid in inside,
+                      "parent_alive": alive})
+    return found
+
+
+def job_count(job) -> int:
+    """The job's number of live processes, without ending them."""
+    w = _win()
+    accounting = w["Accounting"]()
+    if not w["k32"].QueryInformationJobObject(job, 1, w["ctypes"].byref(accounting), w["ctypes"].sizeof(accounting), None):
+        return -1
+    return int(accounting.ActiveProcesses)
+
+
+def _grant_terminate(pid: int) -> None:
+    """LR-82: give the current user every right on a process it owns but cannot open (WRITE_DAC, the owner's)."""
+    p = _proc()
+    ctypes, wintypes, k32, adv = p["ctypes"], p["wintypes"], p["k32"], p["adv"]
+    me = _token_sid(k32.GetCurrentProcess())
+    handle = k32.OpenProcess(0x40000, False, pid)  # WRITE_DAC
+    if not handle or not me:
+        return
+    try:
+        descriptor = ctypes.c_void_p()
+        if not adv.ConvertStringSecurityDescriptorToSecurityDescriptorW(f"D:(A;;0x1fffff;;;{me})", 1,
+                                                                        ctypes.byref(descriptor), None):
+            return
+        try:
+            present, dacl, defaulted = wintypes.BOOL(), ctypes.c_void_p(), wintypes.BOOL()
+            if adv.GetSecurityDescriptorDacl(descriptor, ctypes.byref(present), ctypes.byref(dacl), ctypes.byref(defaulted)):
+                adv.SetSecurityInfo(handle, 6, 0x4, None, None, dacl, None)  # SE_KERNEL_OBJECT, the DACL
+        finally:
+            k32.LocalFree(descriptor)
+    finally:
+        k32.CloseHandle(handle)
+
+
+def end_process(pid: int) -> bool:
+    """End one process. True only when it is verified gone (LR-89); tries WRITE_DAC first when it cannot (LR-82)."""
+    p = _proc()
+    k32 = p["k32"]
+    rights = 0x0001 | 0x00100000  # PROCESS_TERMINATE | SYNCHRONIZE
+    handle = k32.OpenProcess(rights, False, pid)
+    if not handle:
+        _grant_terminate(pid)
+        handle = k32.OpenProcess(rights, False, pid)
+    if not handle:
+        return False
+    try:
+        if not k32.TerminateProcess(handle, 1):
+            return k32.WaitForSingleObject(handle, 0) == 0  # already gone counts; anything else does not
+        return k32.WaitForSingleObject(handle, END_CHECK_SECONDS * 1000) == 0  # WAIT_OBJECT_0: it has ended
+    finally:
+        k32.CloseHandle(handle)
+
+
+def process_alive(pid: int, created: int) -> bool:
+    """LR-89, LR-95: whether a process with this id and creation time is in the process list (never opened)."""
+    if os.name != "nt":
+        return False
+    entry = _system_processes().get(int(pid))
+    return entry is not None and entry["created"] == int(created)
+
+
+SESSION_IMAGES_SYSTEM = ("conhost.exe", "dllhost.exe", "runtimebroker.exe", "backgroundtaskhost.exe",
+                         "smartscreen.exe")  # LR-67: Windows' own session processes, in System32
+TERMINAL_IMAGE = "openconsole.exe"  # LR-67: Windows Terminal's console host
+
+
+def allowed_by_parent(record: dict, exclude: set, console_parents: set) -> bool:
+    """LR-90: an image of LR-67's list passes only under a live, older parent of another or unknown owner that is
+    neither the launcher nor its chain; conhost.exe only under a process of the job (at the start check: the chain)."""
+    if str(record.get("image") or "").lower() == "conhost.exe":
+        return bool(record.get("parent_in_job")) or record.get("ppid") in console_parents
+    return (bool(record.get("parent_alive")) and record.get("parent_owner") in ("other", "unknown")
+            and record.get("ppid") not in exclude)
+
+
+def outside_processes(records: list[dict], since: int, exclude: set, console_parents: set = frozenset()) -> list[dict]:
+    """LR-67's filter, with LR-82's rule for a process of unknown owner and LR-90's for an allowed image's parent:
+    the records that are foreign processes. `exclude` holds the launcher and its chain."""
+    folders = system_folders()  # LR-81: never from the environment
+    allowed_folders = tuple(str(f).rstrip("\\/").lower() + "\\" for f in (folders["system32"], folders["syswow64"]) if f)
+    terminal_folders = tuple(str(f).rstrip("\\/").lower() + "\\windowsapps\\microsoft.windowsterminal_"
+                             for f in folders["program_files"] if f)
+    foreign = []
+    for record in records:
+        if record.get("in_job") or record.get("pid") in exclude:
+            continue
+        created = record.get("created")
+        if isinstance(created, int) and created < since:  # an unreadable creation time does not excuse it
+            continue
+        if record.get("owner", "self") != "self":  # LR-82: an unknown owner is judged by its parent
+            if (record.get("ppid") in exclude or record.get("parent_in_job") or record.get("parent_owner") == "self"
+                    or not record.get("parent_alive") or record.get("broker") == "wmi"
+                    or (record.get("broker") == "schedule" and record.get("same_session"))):
+                foreign.append(record)
+            continue
+        if record.get("broker"):
+            foreign.append(record)
+            continue
+        image = str(record.get("image") or "").lower()
+        path = str(record.get("path") or "").lower()
+        if (image in SESSION_IMAGES_SYSTEM and path.startswith(allowed_folders) and path.endswith("\\" + image)
+                and allowed_by_parent(record, exclude, console_parents)):
+            continue
+        if (image == TERMINAL_IMAGE and terminal_folders and path.startswith(terminal_folders)
+                and path.endswith("\\" + image) and allowed_by_parent(record, exclude, console_parents)):
+            continue
+        foreign.append(record)
+    return foreign
+
+
+def launcher_chain(records: list[dict]) -> set[int]:
+    """LR-84: the launcher's process and its ancestors, by parent id, each created before its child."""
+    by_pid = {r.get("pid"): r for r in records}
+    chain, pid = set(), os.getpid()
+    while pid in by_pid and pid not in chain:
+        chain.add(pid)
+        record, parent = by_pid[pid], by_pid.get(by_pid[pid].get("ppid"))
+        if parent is None or not isinstance(parent.get("created"), int) or not isinstance(record.get("created"), int) \
+                or parent["created"] > record["created"]:
+            break
+        pid = parent.get("pid")
+    return chain
+
+
+def describe_process(record: dict) -> str:
+    """LR-67: a process by its id, its image file name and its creation time; never its command line."""
+    created = record.get("created")
+    when = "unknown"
+    if isinstance(created, int):
+        when = (datetime(1601, 1, 1, tzinfo=timezone.utc) + timedelta(microseconds=created // 10)).strftime(
+            "%Y-%m-%dT%H:%M:%S.%fZ")
+    return f"pid {record.get('pid')}, image {record.get('image')}, created {when}, owner {record.get('owner', 'self')}"
+
+
+# ---------------------------------------------------------------- the operator and its witness (LR-96, LR-97)
+
+
+def _sid_text(ctypes, wintypes, adv, k32, pointer) -> str | None:
+    if not pointer:
+        return None
+    text = wintypes.LPWSTR()
+    if not adv.ConvertSidToStringSidW(pointer, ctypes.byref(text)):
+        return None
+    try:
+        return text.value
+    finally:
+        k32.LocalFree(ctypes.cast(text, ctypes.c_void_p))
+
+
+def session_user_sid() -> str | None:
+    """LR-97: the SID of the user logged on to the launcher's own Windows session: the session that holds this
+    process, its user from the terminal services' session information, and that account's SID. Read from Windows
+    alone, never from the configuration, an argument or the process's variables. None when it cannot be read."""
+    if os.name != "nt":
+        return None
+    import ctypes
+    from ctypes import wintypes
+    try:
+        wts = ctypes.WinDLL("wtsapi32", use_last_error=True)
+    except OSError:
+        return None
+    k32 = ctypes.WinDLL("kernel32", use_last_error=True)
+    adv = ctypes.WinDLL("advapi32", use_last_error=True)
+    wts.WTSQuerySessionInformationW.argtypes = [wintypes.HANDLE, wintypes.DWORD, ctypes.c_int,
+                                                ctypes.POINTER(wintypes.LPWSTR), ctypes.POINTER(wintypes.DWORD)]
+    wts.WTSQuerySessionInformationW.restype = wintypes.BOOL
+    wts.WTSFreeMemory.argtypes, wts.WTSFreeMemory.restype = [ctypes.c_void_p], None
+    k32.ProcessIdToSessionId.argtypes = [wintypes.DWORD, ctypes.POINTER(wintypes.DWORD)]
+    k32.ProcessIdToSessionId.restype = wintypes.BOOL
+    k32.LocalFree.argtypes, k32.LocalFree.restype = [wintypes.HLOCAL], wintypes.HLOCAL
+    adv.LookupAccountNameW.argtypes = [wintypes.LPCWSTR, wintypes.LPCWSTR, ctypes.c_void_p,
+                                       ctypes.POINTER(wintypes.DWORD), wintypes.LPWSTR, ctypes.POINTER(wintypes.DWORD),
+                                       ctypes.POINTER(ctypes.c_int)]
+    adv.LookupAccountNameW.restype = wintypes.BOOL
+    adv.ConvertSidToStringSidW.argtypes = [ctypes.c_void_p, ctypes.POINTER(wintypes.LPWSTR)]
+    adv.ConvertSidToStringSidW.restype = wintypes.BOOL
+    session = wintypes.DWORD()
+    if not k32.ProcessIdToSessionId(os.getpid(), ctypes.byref(session)):
+        return None
+
+    def text(kind: int) -> str | None:  # WTSUserName 5, WTSDomainName 7
+        buffer, size = wintypes.LPWSTR(), wintypes.DWORD()
+        if not wts.WTSQuerySessionInformationW(None, session.value, kind, ctypes.byref(buffer), ctypes.byref(size)):
+            return None
+        try:
+            return buffer.value
+        finally:
+            wts.WTSFreeMemory(ctypes.cast(buffer, ctypes.c_void_p))
+
+    user, domain = text(5), text(7)
+    if not user:
+        return None
+    name = f"{domain}\\{user}" if domain else user
+    sid_size, domain_size, use = wintypes.DWORD(0), wintypes.DWORD(0), ctypes.c_int()
+    adv.LookupAccountNameW(None, name, None, ctypes.byref(sid_size), None, ctypes.byref(domain_size), ctypes.byref(use))
+    if not sid_size.value:
+        return None
+    sid = ctypes.create_string_buffer(sid_size.value)
+    found_domain = ctypes.create_unicode_buffer(max(domain_size.value, 1))
+    if not adv.LookupAccountNameW(None, name, sid, ctypes.byref(sid_size), found_domain, ctypes.byref(domain_size),
+                                  ctypes.byref(use)):
+        return None
+    return _sid_text(ctypes, wintypes, adv, k32, ctypes.cast(sid, ctypes.c_void_p))
+
+
+def witness_security(path: str | Path) -> tuple[str | None, list[tuple[str, int, str]] | None, bool] | None:
+    """LR-97: (owner SID, the access list's rules as (SID, mask, "Allow" or "Deny"), or None for a null list, whether
+    it is a link or a junction) of a file or a folder, from its security descriptor; None when it cannot be read.
+    A rule of a kind this function does not parse is given as an allow rule of every right (fail closed)."""
+    if os.name != "nt":
+        return None
+    try:
+        reparse = bool(os.lstat(path).st_file_attributes & 0x400)  # FILE_ATTRIBUTE_REPARSE_POINT
+    except OSError:
+        return None
+    import ctypes
+    from ctypes import wintypes
+    k32 = ctypes.WinDLL("kernel32", use_last_error=True)
+    adv = ctypes.WinDLL("advapi32", use_last_error=True)
+    adv.GetNamedSecurityInfoW.argtypes = [wintypes.LPCWSTR, ctypes.c_int, wintypes.DWORD,
+                                          ctypes.POINTER(ctypes.c_void_p), ctypes.POINTER(ctypes.c_void_p),
+                                          ctypes.POINTER(ctypes.c_void_p), ctypes.POINTER(ctypes.c_void_p),
+                                          ctypes.POINTER(ctypes.c_void_p)]
+    adv.GetNamedSecurityInfoW.restype = wintypes.DWORD
+    adv.ConvertSidToStringSidW.argtypes = [ctypes.c_void_p, ctypes.POINTER(wintypes.LPWSTR)]
+    adv.ConvertSidToStringSidW.restype = wintypes.BOOL
+    k32.LocalFree.argtypes, k32.LocalFree.restype = [wintypes.HLOCAL], wintypes.HLOCAL
+    owner, dacl, descriptor = ctypes.c_void_p(), ctypes.c_void_p(), ctypes.c_void_p()
+    if adv.GetNamedSecurityInfoW(str(path), 1, 0x1 | 0x4, ctypes.byref(owner), None, ctypes.byref(dacl), None,
+                                 ctypes.byref(descriptor)) != 0:  # SE_FILE_OBJECT; OWNER and DACL
+        return None
+    try:
+        parts = _security_parts(ctypes, wintypes, adv, k32, owner.value, dacl.value)
+        return None if parts is None else (parts[0], parts[1], reparse)
+    finally:
+        k32.LocalFree(descriptor)
+
+
+def _security_parts(ctypes, wintypes, adv, k32, owner, dacl) -> tuple[str | None, list | None] | None:
+    """LR-97: the owner's SID and the access list's rules that apply to the object itself (a rule its children only
+    inherit is left out). A rule of a kind not parsed here reads as an allow rule of every right (fail closed)."""
+    adv.GetAce.argtypes = [ctypes.c_void_p, wintypes.DWORD, ctypes.POINTER(ctypes.c_void_p)]
+    adv.GetAce.restype = wintypes.BOOL
+
+    class Acl(ctypes.Structure):
+        _fields_ = [("AclRevision", ctypes.c_ubyte), ("Sbz1", ctypes.c_ubyte), ("AclSize", wintypes.WORD),
+                    ("AceCount", wintypes.WORD), ("Sbz2", wintypes.WORD)]
+
+    class Ace(ctypes.Structure):  # ACCESS_ALLOWED_ACE and ACCESS_DENIED_ACE, up to SidStart
+        _fields_ = [("AceType", ctypes.c_ubyte), ("AceFlags", ctypes.c_ubyte), ("AceSize", wintypes.WORD),
+                    ("Mask", wintypes.DWORD)]
+
+    owner_sid = _sid_text(ctypes, wintypes, adv, k32, owner)
+    if not dacl:
+        return owner_sid, None
+    rules: list[tuple[str, int, str]] = []
+    for index in range(Acl.from_address(dacl).AceCount):
+        pointer = ctypes.c_void_p()
+        if not adv.GetAce(dacl, index, ctypes.byref(pointer)):
+            return None
+        ace = Ace.from_address(pointer.value)
+        if ace.AceFlags & 0x8:  # INHERIT_ONLY_ACE: it grants nothing on this object
+            continue
+        if ace.AceType in (0, 1):  # ACCESS_ALLOWED_ACE_TYPE, ACCESS_DENIED_ACE_TYPE
+            sid = _sid_text(ctypes, wintypes, adv, k32, pointer.value + ctypes.sizeof(Ace))
+            rules.append((sid or "?", int(ace.Mask), "Allow" if ace.AceType == 0 else "Deny"))
+        elif ace.AceType in (6, 10, 12):  # denied object, denied callback, denied callback object
+            rules.append(("?", int(ace.Mask), "Deny"))
+        else:
+            rules.append(("?", 0xFFFFFFFF, "Allow"))
+    return owner_sid, rules
+
+
+def witness_file(path: str | Path) -> tuple[tuple, bytes] | None:
+    """LR-97 (review round 1, F2): the witness file opened once, without following a link: (its security as
+    witness_security gives it, read from that open; at most WITNESS_MAX_BYTES + 1 of its bytes, from the same
+    open). The open shares reading, writing and deleting; while it lasts the witness's replacement of the file may
+    still fail, and the witness then tries again (xtl_witness.py). None when it cannot be opened."""
+    if os.name != "nt":
+        return None
+    import ctypes
+    from ctypes import wintypes
+    k32 = ctypes.WinDLL("kernel32", use_last_error=True)
+    adv = ctypes.WinDLL("advapi32", use_last_error=True)
+    k32.CreateFileW.argtypes = [wintypes.LPCWSTR, wintypes.DWORD, wintypes.DWORD, ctypes.c_void_p, wintypes.DWORD,
+                                wintypes.DWORD, wintypes.HANDLE]
+    k32.CreateFileW.restype = wintypes.HANDLE
+    k32.ReadFile.argtypes = [wintypes.HANDLE, ctypes.c_void_p, wintypes.DWORD, ctypes.POINTER(wintypes.DWORD),
+                             ctypes.c_void_p]
+    k32.ReadFile.restype = wintypes.BOOL
+    k32.GetFileAttributesW.argtypes, k32.GetFileAttributesW.restype = [wintypes.LPCWSTR], wintypes.DWORD
+    k32.CloseHandle.argtypes, k32.CloseHandle.restype = [wintypes.HANDLE], wintypes.BOOL
+    k32.LocalFree.argtypes, k32.LocalFree.restype = [wintypes.HLOCAL], wintypes.HLOCAL
+    adv.GetSecurityInfo.argtypes = [wintypes.HANDLE, ctypes.c_int, wintypes.DWORD] + [ctypes.POINTER(ctypes.c_void_p)] * 5
+    adv.GetSecurityInfo.restype = wintypes.DWORD
+    adv.ConvertSidToStringSidW.argtypes = [ctypes.c_void_p, ctypes.POINTER(wintypes.LPWSTR)]
+    adv.ConvertSidToStringSidW.restype = wintypes.BOOL
+
+    class Information(ctypes.Structure):  # BY_HANDLE_FILE_INFORMATION, up to its attributes
+        _fields_ = [("dwFileAttributes", wintypes.DWORD), ("rest", ctypes.c_byte * 48)]
+
+    k32.GetFileInformationByHandle.argtypes = [wintypes.HANDLE, ctypes.POINTER(Information)]
+    k32.GetFileInformationByHandle.restype = wintypes.BOOL
+    # GENERIC_READ | READ_CONTROL; share read, write and delete; OPEN_EXISTING; FILE_FLAG_OPEN_REPARSE_POINT
+    handle = k32.CreateFileW(str(path), 0x80000000 | 0x20000, 0x7, None, 3, 0x00200000, None)
+    if not handle or handle == wintypes.HANDLE(-1).value:
+        return None
+    try:
+        information = Information()
+        if not k32.GetFileInformationByHandle(handle, ctypes.byref(information)):
+            return None
+        reparse = bool(information.dwFileAttributes & 0x400) or bool(information.dwFileAttributes & 0x10)
+        owner, dacl, descriptor = ctypes.c_void_p(), ctypes.c_void_p(), ctypes.c_void_p()
+        if adv.GetSecurityInfo(handle, 1, 0x1 | 0x4, ctypes.byref(owner), None, ctypes.byref(dacl), None,
+                               ctypes.byref(descriptor)) != 0:
+            return None
+        try:
+            parts = _security_parts(ctypes, wintypes, adv, k32, owner.value, dacl.value)
+        finally:
+            k32.LocalFree(descriptor)
+        if parts is None:
+            return None
+        chunks, left = [], WITNESS_MAX_BYTES + 1
+        buffer = ctypes.create_string_buffer(1 << 16)
+        while left > 0:
+            got = wintypes.DWORD()
+            if not k32.ReadFile(handle, buffer, min(len(buffer), left), ctypes.byref(got), None):
+                return None
+            if not got.value:
+                break
+            chunks.append(buffer.raw[:got.value])
+            left -= got.value
+        return (parts[0], parts[1], reparse), b"".join(chunks)
+    finally:
+        k32.CloseHandle(handle)
+
+
+def process_created(process) -> int | None:
+    """LR-96: the creation time, as a FILETIME, of a process the launcher started, from the launcher's own handle."""
+    handle = getattr(process, "_handle", None)
+    if os.name != "nt" or handle is None:
+        return None
+    p = _proc()
+    ctypes, wintypes = p["ctypes"], p["wintypes"]
+    times = [wintypes.FILETIME() for _ in range(4)]
+    if not p["k32"].GetProcessTimes(int(handle), *(ctypes.byref(t) for t in times)):
+        return None
+    created = (times[0].dwHighDateTime << 32) | times[0].dwLowDateTime
+    return created or None
+
+
+class Witness:
+    """LR-97: the operator's witness file. `read()` gives (written, pairs) only when the folder's owner is the operator,
+    SYSTEM or Administrators, the file's owner is the operator, nobody else may write, delete, add, or change the
+    owner or the rules of either, neither is a link, the file is well formed, and it was written at most
+    WITNESS_FRESH_SECONDS ago; otherwise None, and `reason` says why."""
+
+    def __init__(self, path: str | None, operator: str | None, me: str | None) -> None:
+        self.path = path
+        self.operator = operator if operator and operator != me else None
+        self.reason = ""
+
+    def refuse(self, reason: str) -> None:
+        self.reason = reason
+        return None
+
+    def problem(self, what: str, security, owners: tuple) -> str:
+        if security is None:
+            return f"the {what}'s security cannot be read"
+        owner, rules, reparse = security
+        if reparse:
+            return f"the {what} is a link"
+        if owner not in owners:
+            return f"the {what}'s owner is not the operator"
+        if rules is None:
+            return f"the {what} has no access list"
+        for sid, mask, kind in rules:
+            if kind != "Deny" and sid != self.operator and sid not in WITNESS_WRITERS and mask & WITNESS_WRITE_BITS:
+                return f"another user may change the {what}"
+        return ""
+
+    def ancestor_problem(self, folder: Path) -> str:
+        """Review round 1, F2: every folder above the witness's folder, up to the drive's root, is no link, belongs to
+        the operator, SYSTEM, Administrators or TrustedInstaller, and lets nobody else move, replace or re-permit
+        what it holds (ANCESTOR_BITS)."""
+        trusted = (self.operator, *WITNESS_WRITERS, TRUSTED_INSTALLER)
+        for ancestor in folder.parents:
+            security = witness_security(ancestor)
+            if security is None:
+                return "a folder above the witness cannot be read"
+            owner, rules, reparse = security
+            if reparse:
+                return "a folder above the witness is a link"
+            if owner not in trusted:
+                return "a folder above the witness belongs to another user"
+            if rules is None:
+                return "a folder above the witness has no access list"
+            for sid, mask, kind in rules:
+                if kind != "Deny" and sid not in trusted and mask & ANCESTOR_BITS:
+                    return "another user may move or change a folder above the witness"
+        return ""
+
+    def read(self) -> tuple[int, frozenset] | None:
+        if not self.path:
+            return self.refuse("no witness file is configured")
+        if not self.operator:
+            return self.refuse("no operator")
+        path = Path(self.path)
+        problem = (self.ancestor_problem(path.parent)
+                   or self.problem("folder", witness_security(path.parent), (self.operator, *WITNESS_WRITERS)))
+        if problem:
+            return self.refuse(problem)
+        opened = witness_file(path)  # the file's security and its bytes from one open (review round 1, F2)
+        if opened is None:
+            return self.refuse("the file cannot be read")
+        security, data = opened
+        problem = self.problem("file", security, (self.operator,))
+        if problem:
+            return self.refuse(problem)
+        if len(data) > WITNESS_MAX_BYTES:
+            return self.refuse("the file is too large")
+        try:
+            value = json.loads(data.decode("utf-8"))
+        except (UnicodeDecodeError, ValueError, RecursionError):
+            return self.refuse("the file is not JSON")
+        if (not isinstance(value, dict) or set(value) != {"format", "started", "written", "pairs"}
+                or value["format"] != WITNESS_FORMAT or not _is_int(value["started"], 0)
+                or not _is_int(value["written"], 0) or not isinstance(value["pairs"], list)):
+            return self.refuse("the file is not a witness file")
+        pairs = set()
+        for pair in value["pairs"]:
+            if not (isinstance(pair, list) and len(pair) == 2 and _is_int(pair[0], 0) and _is_int(pair[1], 0)):
+                return self.refuse("the file holds a malformed pair")
+            pairs.add((pair[0], pair[1]))
+        age = now_filetime() - value["written"]
+        if not 0 <= age <= WITNESS_FRESH_SECONDS * FILETIME_SECOND:
+            return self.refuse("the file is not fresh")
+        self.reason = ""
+        return value["written"], frozenset(pairs)
+
+
+class OperatorRule:
+    """LR-97: the operator's witness, applied to the processes of unknown owner that today's LR-82 judges foreign.
+    A listed (pid, creation time) is the operator's: passed and counted. Otherwise the rule waits, at most
+    WITNESS_WAIT_SECONDS, for a write made WITNESS_AFTER_SECONDS after the creation: listed by then, passed; not
+    listed and alive, foreign; not listed and gone, unjudged (counted, no stop). No witness, or one not trusted at
+    any reading: the old rules."""
+
+    def __init__(self, witness: "Witness | None", log, limit: int = 0) -> None:
+        self.witness, self.log = witness, log
+        self.limit = limit  # review round 1, F1: max_unjudged; one more stops the run
+        self.over = False
+        self.passed: set[tuple[int, int]] = set()
+        self.unjudged: set[tuple[int, int]] = set()
+        self.last_reason: str | None = None
+
+    @staticmethod
+    def plain_orphan(record: dict, exclude) -> bool:
+        """Review round 1, F1: LR-82 judges the record foreign only because its parent is gone; no mark of the
+        executor (the launcher or its chain as parent, a parent in the job or of the executor's user, WMI's or the
+        Task Scheduler's broker)."""
+        return (not record.get("parent_alive") and record.get("ppid") not in exclude and not record.get("parent_in_job")
+                and record.get("parent_owner") != "self" and not record.get("broker"))
+
+    def untrusted(self) -> None:
+        reason = getattr(self.witness, "reason", "") or "no witness"
+        if reason != self.last_reason:
+            self.log.write(f"witness: not trusted ({reason}): the old rules apply")
+            self.last_reason = reason
+
+    @staticmethod
+    def alive(pair: tuple[int, int]) -> bool:
+        try:
+            return process_alive(*pair)
+        except OSError:
+            return True  # fail closed: a process that cannot be shown gone stays foreign
+
+    def sort(self, found: list[dict], exclude=frozenset()) -> list[dict]:
+        """The records of `found` that stay foreign. `exclude` holds the launcher and its chain."""
+        waiting = [r for r in found if r.get("owner") == "unknown" and not r.get("in_job")
+                   and _is_int(r.get("pid"), 0) and _is_int(r.get("created"), 0)]
+        if not waiting or self.witness is None:
+            return list(found)
+        state = self.witness.read()
+        if state is None:
+            self.untrusted()
+            return list(found)
+        self.last_reason = None
+        verdict: dict[int, str] = {}
+        deadline = time.monotonic() + WITNESS_WAIT_SECONDS
+        after = int(WITNESS_AFTER_SECONDS * FILETIME_SECOND)
+        while True:
+            written, pairs = state
+            still = []
+            for record in waiting:
+                pair = (record["pid"], record["created"])
+                if pair in pairs:
+                    verdict[id(record)] = "passed"
+                elif written >= record["created"] + after:
+                    gone = self.plain_orphan(record, exclude) and not self.alive(pair)
+                    verdict[id(record)] = "unjudged" if gone else "foreign"
+                else:
+                    still.append(record)
+            waiting = still
+            if not waiting or time.monotonic() >= deadline:
+                break  # what still waits stays foreign: the old rules
+            time.sleep(WITNESS_POLL_SECONDS)
+            state = self.witness.read()
+            if state is None:
+                self.untrusted()
+                break
+        kept = []
+        for record in found:
+            outcome = verdict.get(id(record), "foreign")
+            pair = (record.get("pid"), record.get("created"))
+            if outcome == "passed":
+                if pair not in self.passed:
+                    self.log.write(f"search: a process of the operator, listed by the witness, passed: "
+                                   f"{describe_process(record)}")
+                self.passed.add(pair)
+            elif outcome == "unjudged":
+                if pair not in self.unjudged:
+                    self.log.write(f"search: a process of unknown owner, not listed by the witness and gone, "
+                                   f"unjudged: {describe_process(record)}")
+                self.unjudged.add(pair)
+                if len(self.unjudged) > self.limit and not self.over:
+                    self.over = True
+                    self.log.write(f"search: {len(self.unjudged)} processes unjudged, more than max_unjudged "
+                                   f"{self.limit}")
+            else:
+                kept.append(record)
+        return kept
+
+
+def local_time(created) -> str:
+    """LR-98: a FILETIME as the local clock's HH:MM:SS, for the watch."""
+    if not isinstance(created, int):
+        return "--:--:--"
+    moment = datetime(1601, 1, 1, tzinfo=timezone.utc) + timedelta(microseconds=created // 10)
+    return moment.astimezone().strftime("%H:%M:%S")
+
+
+def trusted_path() -> str:
+    """LR-81: the inherited PATH's folders inside the Windows folder or a Program Files folder (POSIX: /usr, ...)."""
+    if os.name == "nt":
+        folders = system_folders()
+        roots = tuple(os.path.normcase(os.path.abspath(f)).rstrip("\\/") + os.sep
+                      for f in (folders["windows"], *folders["program_files"]) if f)
+    else:
+        roots = POSIX_TRUSTED
+    kept: list[str] = []
+    for entry in os.environ.get("PATH", "").split(os.pathsep):
+        if not entry.strip():
+            continue
+        full = os.path.normcase(os.path.abspath(entry)).rstrip("\\/") + os.sep
+        if full.startswith(roots) and entry not in kept:
+            kept.append(entry)
+    return os.pathsep.join(kept)
+
+
+def git_env(extra: dict[str, str] | None = None) -> dict[str, str]:
+    """LR-80, LR-81: git's whole environment; nothing else of the launcher's own is passed on."""
+    env = {"PATH": trusted_path(), "GIT_TERMINAL_PROMPT": "0", "GCM_INTERACTIVE": "never", "GIT_CONFIG_NOSYSTEM": "1",
+           "GIT_CONFIG_GLOBAL": os.devnull, "GIT_NO_REPLACE_OBJECTS": "1",
+           "GIT_GRAFT_FILE": str(hooks_folder() / NO_GRAFTS), "GIT_ATTR_NOSYSTEM": "1"}
+    if os.name == "nt":
+        windows = system_folders()["windows"]
+        env.update({"SystemRoot": windows, "WINDIR": windows})
+    env.update(extra or {})
+    return env
+
+
+def git_program() -> str:
+    """LR-81: git, looked up in the trusted PATH alone."""
+    found = shutil.which("git", path=trusted_path())
+    if not found:
+        raise Stop("STEP_FAILED", "git was not found in a trusted folder of PATH.")
+    return found
+
+
+def git_base() -> list[str]:
+    """LR-80: every git command of the launcher starts so."""
+    return [git_program(), "-c", f"core.hooksPath={hooks_folder()}", *GIT_SAFE]
+
+
+def post_repo_problem(git_dir: Path, start: str, replace_refs: str) -> str | None:
+    """LR-80: what in the launcher's own repository could change what git shows; None when nothing."""
+    for name in ("info/grafts", "objects/info/alternates", "objects/info/http-alternates", "commondir"):
+        if (git_dir / name).exists():
+            return name
+    if replace_refs.strip():
+        return "refs/replace/"
+    shallow = git_dir / "shallow"
+    if shallow.exists():
+        try:
+            entries = shallow.read_text(encoding="ascii").split()
+        except (OSError, UnicodeDecodeError):
+            return "shallow"
+        if any(entry != start for entry in entries):
+            return "shallow"
+    return None
+
+
+def default_claude_image(command: str) -> str:
+    """LR-86: the file name shutil.which resolves Claude Code's command to (its plain name when it does not)."""
+    resolved = shutil.which(command)
+    return Path(resolved).name if resolved else Path(command).name
+
+
 # ---------------------------------------------------------------- pure functions named by the contract
 
 
@@ -201,7 +1350,7 @@ def branch_slug(title: str) -> str:
 
 
 def claude_path(path: str) -> str:
-    """LR-27: C:\\Users\\Public becomes //c/Users/Public."""
+    """LR-27: C:\\Data\\Keys becomes //c/Data/Keys."""
     text = str(path).replace("\\", "/").rstrip("/")
     if re.fullmatch(r"[A-Za-z]:(/.*)?", text):
         text = text[0].lower() + text[2:]
@@ -308,6 +1457,22 @@ def load_config(path: Path) -> dict:
     for key in ("api_url", "repo_url", "gate_url"):
         if key in section and not isinstance(section[key], str):
             raise ConfigError(f"[launcher] {key} must be a string")
+    for key in LIMIT_KEYS:  # LR-53
+        value = section.get(key)
+        if not isinstance(value, int) or isinstance(value, bool) or value < 1:
+            raise ConfigError(f"[launcher] {key} must be a positive integer")
+    ledger = section.get("ledger_file")  # LR-55
+    if not isinstance(ledger, str) or not DRIVE_PATH.fullmatch(ledger):
+        raise ConfigError("[launcher] ledger_file must be a full drive path")
+    unjudged = section.get("max_unjudged", 0)  # review round 1, F1: unjudged processes a run may tolerate
+    if not isinstance(unjudged, int) or isinstance(unjudged, bool) or unjudged < 0:
+        raise ConfigError("[launcher] max_unjudged must be an integer of 0 or more")
+    witness = section.get("witness_file")  # LR-97: optional; without it the old rules apply
+    if witness is not None and (not isinstance(witness, str) or not DRIVE_PATH.fullmatch(witness)):
+        raise ConfigError("[launcher] witness_file must be a full drive path")
+    image = section.get("claude_image", default_claude_image(section["claude_command"][0]))  # LR-68, LR-86
+    if not isinstance(image, str) or not re.fullmatch(r"[^\\/:*?\"<>|\r\n]+", image):
+        raise ConfigError("[launcher] claude_image must be a file name")
     if not Path(section["key_file"]).is_file():
         raise ConfigError("the key file is missing")
     return section
@@ -381,6 +1546,191 @@ class Log:
         self.handle.close()
 
 
+# ---------------------------------------------------------------- the ledger (LR-55, LR-56)
+
+
+def _is_int(value: object, least: int) -> bool:
+    return isinstance(value, int) and not isinstance(value, bool) and value >= least
+
+
+def _is_text(value: object) -> bool:
+    return isinstance(value, str) and value != ""
+
+
+RECORD_FIELDS = {
+    "process_unended": {  # LR-89: a foreign process the launcher could not end
+        "attempt": _is_text, "pid": lambda v: _is_int(v, 1), "created": lambda v: _is_int(v, 0),
+        "image": lambda v: isinstance(v, str), "time": _is_text},
+    "attempt_reserved": {
+        "task": _is_text, "attempt": _is_text, "role": lambda v: v in ("task", "fix", "spec"), "time": _is_text,
+        "limit": lambda v: _is_int(v, 1), "max_messages_task": lambda v: _is_int(v, 1),
+        "max_runs_task": lambda v: _is_int(v, 1), "messages_before": lambda v: _is_int(v, 0),
+        "runs_before": lambda v: _is_int(v, 0)},
+    "message": {
+        "attempt": _is_text, "message_id": _is_text, "generated": lambda v: isinstance(v, bool),
+        "ordinal": lambda v: _is_int(v, 1), "time": _is_text, "over_limit": lambda v: isinstance(v, bool),
+        "subagent": lambda v: isinstance(v, bool)},
+    "attempt_finished": {
+        "attempt": _is_text, "messages": lambda v: _is_int(v, 0), "outcome": _is_text,
+        "result": lambda v: v is None or isinstance(v, dict),
+        "exit_code": lambda v: v is None or (isinstance(v, int) and not isinstance(v, bool)), "time": _is_text},
+}
+
+
+OPTIONAL_FIELDS = {"attempt_finished": {"count_complete": lambda v: isinstance(v, bool)}}  # LR-71
+
+
+class Ledger:
+    """An append-only JSON-lines file of attempts. Every read and append holds `<file>.lock`."""
+
+    def __init__(self, path: Path, log: Log) -> None:
+        self.path = path
+        self.lock_path = Path(str(path) + ".lock")
+        self.log = log
+
+    @contextlib.contextmanager
+    def locked(self):
+        try:
+            self.path.parent.mkdir(parents=True, exist_ok=True)
+            handle = open(self.lock_path, "a+b")
+        except OSError:
+            raise Stop("LEDGER_FAILED", "The ledger's folder or lock file cannot be written.") from None
+        try:
+            try:
+                if os.name == "nt":
+                    import msvcrt
+
+                    os.lseek(handle.fileno(), 0, 0)
+                    msvcrt.locking(handle.fileno(), msvcrt.LK_LOCK, 1)  # tries for about 10 seconds
+                else:
+                    import fcntl
+
+                    deadline = time.monotonic() + 10
+                    while True:
+                        try:
+                            fcntl.flock(handle.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)
+                            break
+                        except OSError:
+                            if time.monotonic() >= deadline:
+                                raise
+                            time.sleep(0.2)
+            except OSError:
+                raise Stop("LEDGER_FAILED", "The ledger is locked by another launcher.") from None
+            try:
+                yield
+            finally:
+                try:
+                    if os.name == "nt":
+                        import msvcrt
+
+                        os.lseek(handle.fileno(), 0, 0)
+                        msvcrt.locking(handle.fileno(), msvcrt.LK_UNLCK, 1)
+                    else:
+                        import fcntl
+
+                        fcntl.flock(handle.fileno(), fcntl.LOCK_UN)
+                except OSError:
+                    pass  # closing the handle releases the lock too
+        finally:
+            handle.close()
+
+    def read(self) -> list[dict]:
+        """Every record, checked; any fault stops the run (the launcher never repairs the ledger)."""
+        try:
+            data = self.path.read_bytes() if self.path.exists() else b""
+        except OSError:
+            raise Stop("LEDGER_FAILED", "The ledger cannot be read.") from None
+        if data and not data.endswith(b"\n"):
+            raise Stop("LEDGER_FAILED", "The ledger's last line is unfinished. The operator must repair it.")
+        records: list[dict] = []
+        reserved: set[str] = set()
+        finished: set[str] = set()
+        for number, line in enumerate(data.split(b"\n")[:-1], start=1):
+            try:
+                record = json.loads(line.decode("utf-8"))
+            except (UnicodeDecodeError, ValueError):
+                record = None
+            kind = record.get("record") if isinstance(record, dict) else None
+            fields = RECORD_FIELDS.get(kind) if isinstance(kind, str) else None
+            optional = OPTIONAL_FIELDS.get(kind, {}) if fields is not None else {}
+            if (fields is None or not {"record", *fields} <= set(record) <= {"record", *fields, *optional}
+                    or not all(check(record[key]) for key, check in fields.items())
+                    or not all(check(record[key]) for key, check in optional.items() if key in record)):
+                raise Stop("LEDGER_FAILED", f"The ledger's line {number} is not a known record. The operator must repair it.")
+            attempt = record["attempt"]
+            if kind == "attempt_reserved":
+                if attempt in reserved:
+                    raise Stop("LEDGER_FAILED", f"The ledger's line {number} reserves an attempt twice.")
+                reserved.add(attempt)
+            elif kind == "process_unended":  # LR-89: written during an attempt or after its end
+                if attempt not in reserved:
+                    raise Stop("LEDGER_FAILED", f"The ledger's line {number} belongs to no reserved attempt.")
+            elif attempt not in reserved or attempt in finished:
+                raise Stop("LEDGER_FAILED", f"The ledger's line {number} belongs to no open attempt.")
+            elif kind == "attempt_finished":
+                finished.add(attempt)
+            records.append(record)
+        return records
+
+    @staticmethod
+    def totals(records: list[dict], task: str) -> tuple[int, int]:
+        """LR-56: the task's messages (charged conservatively) and its runs."""
+        attempts = {r["attempt"]: r for r in records if r["record"] == "attempt_reserved" and r["task"] == task}
+        counted = {attempt: 0 for attempt in attempts}
+        finished: dict[str, int] = {}
+        for record in records:
+            if record["attempt"] in attempts:
+                if record["record"] == "message":
+                    counted[record["attempt"]] += 1
+                elif record["record"] == "attempt_finished":
+                    finished[record["attempt"]] = record["messages"]
+        used = 0
+        for attempt, reservation in attempts.items():
+            charge = finished[attempt] if attempt in finished else reservation["limit"]
+            used += max(charge, counted[attempt])
+        return used, len(attempts)
+
+    def check(self, task: str, max_messages: int, max_runs: int) -> tuple[int, int]:
+        with self.locked():
+            used, runs = self.totals(self.read(), task)
+        if used >= max_messages or runs >= max_runs:
+            self.log.write(f"task {task}: {used} of {max_messages} messages and {runs} of {max_runs} runs used")
+            raise Stop("BUDGET_EXHAUSTED", f"The task {task} has used up its messages or its runs. Nothing was started.")
+        return used, runs
+
+    def reserve(self, record: dict, parts: list[int]) -> dict:
+        """Check the task's budget and append its reservation, under one lock (LR-56)."""
+        with self.locked():
+            used, runs = self.totals(self.read(), record["task"])
+            if used >= record["max_messages_task"] or runs >= record["max_runs_task"]:
+                self.log.write(f"task {record['task']}: {used} messages and {runs} runs used")
+                raise Stop("BUDGET_EXHAUSTED",
+                           f"The task {record['task']} has used up its messages or its runs. Nothing was started.")
+            record = {**record, "limit": min([*parts, record["max_messages_task"] - used]),
+                      "messages_before": used, "runs_before": runs, "time": utc_now()}
+            self._append(record)
+        return record
+
+    def append(self, record: dict) -> None:
+        with self.locked():
+            self._append(record)
+
+    def _append(self, record: dict) -> None:
+        line = json.dumps(record, sort_keys=True, separators=(",", ":"), ensure_ascii=True) + "\n"
+        try:
+            with open(self.path, "a+b") as handle:
+                handle.seek(0, os.SEEK_END)
+                if handle.tell() > 0:
+                    handle.seek(-1, os.SEEK_END)
+                    if handle.read(1) != b"\n":
+                        raise Stop("LEDGER_FAILED", "The ledger's last line is unfinished. The operator must repair it.")
+                handle.write(line.encode("ascii"))
+                handle.flush()
+                os.fsync(handle.fileno())
+        except OSError:
+            raise Stop("LEDGER_FAILED", "The ledger cannot be written.") from None
+
+
 # ---------------------------------------------------------------- GitHub, through the API
 
 
@@ -449,7 +1799,8 @@ def run(argv: list[str], log: Log, what: str, cwd: Path | None = None, env: dict
 def plain_env() -> dict[str, str]:
     """The launcher's environment for git and the gate, without git config from the environment."""
     env = {k: v for k, v in os.environ.items() if not k.upper().startswith("GIT_CONFIG")}
-    env.update({"GIT_TERMINAL_PROMPT": "0", "GCM_INTERACTIVE": "never"})
+    # LR-70: the executor's global git configuration, which the model could write, is never read.
+    env.update({"GIT_TERMINAL_PROMPT": "0", "GCM_INTERACTIVE": "never", "GIT_CONFIG_GLOBAL": os.devnull})
     return env
 
 
@@ -465,27 +1816,436 @@ def model_env(role: str, venv: Path | None) -> dict[str, str]:
     return env
 
 
-def kill_tree(process: subprocess.Popen) -> None:
-    if os.name == "nt":
-        subprocess.run([_system32("taskkill.exe"), "/T", "/F", "/PID", str(process.pid)], capture_output=True, check=False)
-    else:
-        process.kill()
+END_OF_STREAM, LINE_TOO_LONG, READ_FAILED = "end", "too-long", "read-failed"
+
+
+def read_stream(stream, lines: queue.Queue) -> None:
+    """The reader thread: one item per line of the model's output, then one of the three end markers."""
     try:
-        process.wait(timeout=30)
-    except subprocess.TimeoutExpired:
+        while True:
+            chunk = stream.readline(MAX_STREAM_LINE + 2)
+            if not chunk:
+                lines.put(END_OF_STREAM)
+                return
+            if len(chunk[:-1] if chunk.endswith(b"\n") else chunk) > MAX_STREAM_LINE:
+                lines.put(LINE_TOO_LONG)
+                return
+            lines.put(chunk)
+    except (OSError, ValueError):
+        lines.put(READ_FAILED)
+
+
+def write_prompt(stream, prompt: bytes) -> None:
+    """The writer thread: the prompt to the model's standard input, which is then closed."""
+    try:
+        stream.write(prompt)
+        stream.flush()
+    except (OSError, ValueError):
         pass
+    finally:
+        with contextlib.suppress(OSError, ValueError):
+            stream.close()
+
+
+class ModelRun:
+    """One attempt of the model (LR-51 to LR-62, LR-67 to LR-75): start it in its job, read and count its stream,
+    watch for processes outside the job, stop it."""
+
+    def __init__(self, launcher: "Launcher", argv: list[str], env: dict[str, str], prompt: bytes, limit: int,
+                 attempt: str) -> None:
+        self.launcher, self.log, self.ledger = launcher, launcher.log, launcher.ledger
+        self.argv, self.env, self.prompt, self.limit, self.attempt = argv, env, prompt, limit, attempt
+        self.claude_image = launcher.claude_image
+        self.exclude = {os.getpid()} | set(launcher.chain)  # LR-90: the launcher and its chain
+        self.count = 0
+        self.over = 0
+        self.complete = True  # LR-68, LR-71: False when the messages cannot all be known
+        self.seen: set[str] = set()
+        self.nth_id: str | None = None
+        self.reached = False
+        self.pending: set[str] = set()
+        self.results: set[str] = set()
+        self.bad_lines = 0
+        self.result: dict | None = None
+        self.reasons: list[str] = []
+        self.exit_code: int | None = None
+        self.process: subprocess.Popen | None = None
+        self.job = None
+        self.in_job = False
+        self.ran = False
+        self.ended = False
+        self.since: int | None = None
+        self.model_created: int | None = None  # LR-96: from the launcher's own handle to the model's process
+        self.own_logged: set[tuple] = set()
+        self.last_scan = 0.0
+        self.stop_began: float | None = None
+        self.lines: queue.Queue = queue.Queue()
+        self.open_stream = False
+
+    # -------- the stream (LR-52, LR-57, LR-60, LR-72)
+
+    def want_stop(self, code: str) -> None:
+        if code not in self.reasons:
+            self.reasons.append(code)
+
+    def handle(self, raw: bytes) -> None:
+        line = raw.rstrip(b"\r\n")
+        if not line.strip():
+            return
+        try:
+            event = json.loads(line.decode("utf-8"))
+        except (UnicodeDecodeError, ValueError):
+            event = None
+        except (RecursionError, MemoryError):  # LR-72: too deep or too large to parse
+            if ASSISTANT_START.search(line[:512]):
+                self.log.write("model stream: an assistant event that cannot be parsed counts as a message")
+                self.count_message(None, False, set(), False)
+                self.want_stop("STREAM_UNREADABLE")
+                return
+            event = None
+        if not isinstance(event, dict):
+            self.bad_lines += 1
+            text = scrub(line[:4 * CUT].decode("utf-8", "replace"), self.log.secrets)[:CUT]
+            self.log.write(f"model stream: a line that is not a JSON object: {text}")
+            if self.bad_lines > MAX_BAD_LINES:
+                self.log.write(f"model stream: more than {MAX_BAD_LINES} lines that are not JSON objects")
+                self.want_stop("STREAM_UNREADABLE")
+            return
+        kind = event.get("type")
+        message = event.get("message") if isinstance(event.get("message"), dict) else {}
+        content = message.get("content") if isinstance(message.get("content"), list) else []
+        if kind == "assistant":
+            self.assistant(event, message, content)
+        elif kind == "user":
+            for item in content:
+                if isinstance(item, dict) and item.get("type") == "tool_result" and isinstance(item.get("tool_use_id"), str):
+                    self.results.add(item["tool_use_id"])
+            self.check_limit()
+        elif kind == "result":
+            self.result = event
+        elif kind == "system" and event.get("subtype") == "api_retry":
+            error = scrub(str(event.get("error")), self.log.secrets)[:CUT]
+            self.log.write(f"model stream: api_retry, error {error}")
+
+    def assistant(self, event: dict, message: dict, content: list) -> None:
+        mid = message.get("id")
+        usable = isinstance(mid, str) and 0 < len(mid) <= MAX_MESSAGE_ID
+        tools = {item["id"] for item in content
+                 if isinstance(item, dict) and item.get("type") == "tool_use" and isinstance(item.get("id"), str)}
+        if usable and mid in self.seen:  # a fragment of a message already counted
+            if self.reached and mid == self.nth_id:
+                self.pending |= tools
+                self.check_limit()
+            return
+        self.count_message(mid if usable else None, usable, tools, event.get("parent_tool_use_id") is not None)
+
+    def count_message(self, mid: str | None, usable: bool, tools: set, subagent: bool) -> None:
+        self.count += 1
+        if usable:
+            self.seen.add(mid)
+        over = self.count > self.limit
+        self.over += over
+        record = {"record": "message", "attempt": self.attempt, "message_id": mid if usable else f"gen-{self.count}",
+                  "generated": not usable, "ordinal": self.count, "time": utc_now(), "over_limit": over,
+                  "subagent": subagent}
+        try:
+            self.ledger.append(record)
+        except Stop:
+            self.log.write("ledger: a message record could not be written")
+            self.want_stop("LEDGER_FAILED")
+        self.log.write(f"model message {self.count}: {'generated id' if not usable else 'id'}, "
+                       f"over_limit {over}, subagent {subagent}")
+        if self.count == self.limit:
+            self.reached, self.nth_id, self.pending = True, (mid if usable else None), set(tools)
+            self.check_limit()
+        elif over:
+            self.want_stop("MESSAGE_LIMIT")
+
+    def check_limit(self) -> None:
+        """LR-57: after the L-th message, stop once each of its tool uses has its result."""
+        if self.reached and "MESSAGE_LIMIT" not in self.reasons and self.pending <= self.results:
+            self.log.write(f"model reached its limit of {self.limit} messages")
+            self.want_stop("MESSAGE_LIMIT")
+
+    # -------- processes outside the job (LR-67, LR-68)
+
+    def describe(self, record: dict) -> str:
+        return describe_process(record)
+
+    def own_exited(self, record: dict) -> bool:
+        """LR-96: a record with the model's pid and the model's creation time is the model's own process; listed
+        outside the job, it counts as gone only when the launcher's own handle shows that it has exited, waited for
+        at most END_CHECK_SECONDS. No readable creation time: never."""
+        if self.process is None or self.model_created is None:
+            return False
+        if record.get("pid") != self.process.pid or record.get("created") != self.model_created:
+            return False
+        try:
+            self.process.wait(timeout=END_CHECK_SECONDS)
+        except subprocess.TimeoutExpired:
+            return False
+        pair = (record.get("pid"), record.get("created"))
+        if pair not in self.own_logged:
+            self.own_logged.add(pair)
+            self.log.write(f"search: the model's own exited process was still listed: {self.describe(record)}")
+        return True
+
+    def judge(self, found: list[dict]) -> list[dict]:
+        """LR-96, then LR-97: the records of `found` that stay foreign."""
+        kept = self.launcher.rule.sort([record for record in found if not self.own_exited(record)], self.exclude)
+        if self.launcher.rule.over:  # review round 1, F1: more unjudged than max_unjudged
+            self.want_stop("PROCESS_OUTSIDE_JOB")
+        return kept
+
+    def scan(self) -> None:
+        """LR-67, LR-68 while the model runs, its grace and the wait for its exit included (LR-85)."""
+        if os.name != "nt" or self.since is None:
+            return
+        self.last_scan = time.monotonic()
+        try:
+            records = user_processes(self.job)
+        except OSError:
+            self.log.write("search: the user's processes could not be listed")
+            return
+        model_pid = self.process.pid if self.process is not None else None
+        for record in records:
+            if (str(record.get("image") or "").lower() == self.claude_image and record.get("pid") != model_pid
+                    and (record.get("owner", "self") == "self" or record.get("in_job"))  # LR-82
+                    and "SECOND_MODEL" not in self.reasons):
+                self.log.write(f"search: a second Claude Code: {self.describe(record)}")
+                self.complete = False
+                self.want_stop("SECOND_MODEL")
+        for record in self.judge(outside_processes(records, self.since, self.exclude)):
+            ended = end_process(record["pid"])
+            self.log.write(f"search: a process outside the job: {self.describe(record)}; "
+                           f"{'it is ended' if ended else 'it could not be ended'}")
+            if not ended:
+                self.launcher.note_unended(record)  # LR-89
+            self.want_stop("PROCESS_OUTSIDE_JOB")
+
+    def search_after_end(self) -> None:
+        """LR-67 after the model's job has ended, before any git step."""
+        if os.name != "nt" or self.since is None:
+            return
+        found_any = False
+        for _ in range(END_SEARCHES):
+            try:
+                found = self.judge(outside_processes(user_processes(self.job), self.since, self.exclude))
+            except OSError:
+                self.log.write("search: the user's processes could not be listed after the end")
+                found, found_any = [], True
+            if not found:
+                break
+            found_any = True
+            for record in found:
+                ended = end_process(record["pid"])  # LR-89: the log says what really happened
+                self.log.write(f"search after the end: a process outside the job: {self.describe(record)}; "
+                               f"{'it is ended' if ended else 'it could not be ended'}")
+                if not ended:
+                    self.launcher.note_unended(record)
+            time.sleep(0.5)
+        if found_any:
+            self.reasons.insert(0, "PROCESS_SURVIVED")
+
+    # -------- the model's own processes (LR-58, LR-73 to LR-75)
+
+    def start(self) -> bool:
+        """Start the model in its job. False when the job could not be set up (JOB_SETUP_FAILED)."""
+        windows = os.name == "nt"
+        if windows:
+            try:
+                self.job = job_open()
+            except OSError:
+                self.log.write("model: the job object could not be created")
+                return False
+        flags = (subprocess.CREATE_NEW_PROCESS_GROUP | CREATE_SUSPENDED) if windows else 0
+        try:
+            self.process = subprocess.Popen(self.argv, cwd=self.launcher.repo, env=self.env, stdin=subprocess.PIPE,
+                                            stdout=subprocess.PIPE, stderr=subprocess.DEVNULL, creationflags=flags,
+                                            start_new_session=not windows)
+        except OSError:
+            raise Stop("MODEL_FAILED", "The model could not start.") from None
+        self.log.write(f"model pid {self.process.pid}")
+        if windows:
+            self.model_created = process_created(self.process)  # LR-96: read while it is still suspended
+            try:
+                job_add(self.job, self.process)
+                self.in_job = True
+                # LR-67 from the model's resume; LR-84: from the start check, when it ran, so nothing slips between
+                self.since = self.launcher.watch_from or now_filetime()
+                resume_process(self.process.pid)
+            except OSError:
+                self.log.write("model: the job object could not be set up; the suspended process is terminated")
+                self.kill_started()
+                return False
+        self.ran = True
+        return True
+
+    def kill_started(self) -> None:
+        """LR-74, LR-75: kill a started process that never ran or is not known to be in the job."""
+        with contextlib.suppress(OSError):
+            self.process.kill()
+        with contextlib.suppress(subprocess.TimeoutExpired):
+            self.process.wait(timeout=30)
+        self.ended = True
+
+    def begin_stop(self) -> None:
+        self.stop_began = time.monotonic()
+        self.log.write(f"stop: {', '.join(self.reasons)}; a break to the model's process group; grace begins")
+        try:
+            if os.name == "nt":
+                self.process.send_signal(signal.CTRL_BREAK_EVENT)
+            else:
+                os.killpg(self.process.pid, signal.SIGINT)
+        except (OSError, ValueError):
+            self.log.write("stop: the break could not be sent")
+
+    def end_all(self) -> int:
+        """End every process of the model: the job (Windows) or the group (POSIX). Returns the survivors."""
+        self.ended = True
+        if os.name == "nt":
+            alive = job_count(self.job)
+            self.log.write(f"job: {alive} processes alive before TerminateJobObject")
+            if self.stop_began is None and alive > 0:
+                self.log.write(f"job: {alive} processes still running after the model ended by itself; they are ended")
+            self.log.write("job: TerminateJobObject called")
+            left = job_end(self.job)
+            self.log.write(f"job: {left} processes left after TerminateJobObject")
+            return left
+        with contextlib.suppress(ProcessLookupError, PermissionError):
+            os.killpg(self.process.pid, signal.SIGKILL)
+        deadline = time.monotonic() + END_CHECK_SECONDS
+        while True:
+            self.process.poll()
+            try:
+                os.killpg(self.process.pid, 0)
+            except ProcessLookupError:
+                return 0
+            except PermissionError:
+                pass
+            if time.monotonic() >= deadline:
+                return 1
+            time.sleep(0.1)
+
+    def wait_process(self, until: float) -> bool:
+        """Wait for the model's own process until the monotonic time `until`, in short steps (Ctrl+C stays live),
+        searching for processes outside the job at the same interval (LR-85)."""
+        while time.monotonic() < until:
+            if time.monotonic() - self.last_scan >= SCAN_SECONDS:
+                self.scan()
+            try:
+                self.process.wait(timeout=min(0.5, max(0.0, until - time.monotonic())))
+                return True
+            except subprocess.TimeoutExpired:
+                continue
+        return self.process.poll() is not None
+
+    def drain(self) -> None:
+        """LR-71: read the stream to its end, for at most DRAIN_SECONDS; otherwise the count is incomplete."""
+        until = time.monotonic() + DRAIN_SECONDS
+        while self.open_stream and time.monotonic() < until:
+            try:
+                item = self.lines.get(timeout=0.2)
+            except queue.Empty:
+                continue
+            if item in (END_OF_STREAM, LINE_TOO_LONG, READ_FAILED):
+                self.open_stream = False
+            else:
+                self.handle(item)
+        if self.open_stream:
+            self.log.write(f"model stream: its end was not reached in {DRAIN_SECONDS} s; the count is incomplete")
+            self.complete = False
+
+    def run(self, timeout_seconds: int) -> str:
+        """Run the attempt to its end and return its outcome (LR-62)."""
+        try:
+            if not self.start():
+                return "JOB_SETUP_FAILED"
+            deadline = time.monotonic() + timeout_seconds
+            threading.Thread(target=write_prompt, args=(self.process.stdin, self.prompt), daemon=True).start()
+            threading.Thread(target=read_stream, args=(self.process.stdout, self.lines), daemon=True).start()
+            self.open_stream = True
+            while self.open_stream:
+                now = time.monotonic()
+                if self.stop_began is None and now >= deadline:
+                    self.log.write(f"model: ran past {timeout_seconds // 60} minutes")
+                    self.want_stop("TIMEOUT")
+                if now - self.last_scan >= SCAN_SECONDS:  # LR-85: during the grace too
+                    self.scan()
+                if self.reasons and self.stop_began is None:
+                    self.begin_stop()
+                until = deadline if self.stop_began is None else self.stop_began + GRACE_SECONDS
+                if self.stop_began is not None and now >= until:
+                    break
+                try:
+                    item = self.lines.get(timeout=min(0.5, SCAN_SECONDS, max(0.01, until - now)))
+                except queue.Empty:
+                    continue
+                if item in (LINE_TOO_LONG, READ_FAILED):
+                    self.log.write(f"model stream: {'a line longer than 32 MiB' if item == LINE_TOO_LONG else 'the output could not be read'}")
+                    self.want_stop("STREAM_UNREADABLE")
+                    self.open_stream = False
+                elif item == END_OF_STREAM:
+                    self.open_stream = False
+                else:
+                    self.handle(item)
+            self.scan()  # the last look while the model's processes may still run (LR-85: also after a stop)
+            if self.reasons and self.stop_began is None:
+                self.begin_stop()
+            if self.stop_began is None and not self.wait_process(deadline):
+                self.log.write(f"model: ran past {timeout_seconds // 60} minutes")
+                self.want_stop("TIMEOUT")
+                self.begin_stop()
+            if self.stop_began is not None:
+                self.wait_process(self.stop_began + GRACE_SECONDS)
+                self.log.write("stop: grace ends")
+            survivors = self.end_all()
+            if survivors:
+                self.log.write(f"model: {survivors} processes survived the end of its job or group")
+                self.reasons.insert(0, "PROCESS_SURVIVED")
+            self.search_after_end()
+        finally:
+            if self.process is not None and not self.ended:
+                with contextlib.suppress(Exception):
+                    if os.name == "nt" and not self.in_job:
+                        self.kill_started()  # LR-74
+                    else:
+                        self.end_all()
+            if self.open_stream:
+                self.drain()
+            if self.process is not None and self.ran:
+                with contextlib.suppress(subprocess.TimeoutExpired):
+                    self.process.wait(timeout=30)
+                self.exit_code = self.process.returncode
+            if self.job is not None:
+                job_close(self.job)
+        return self.outcome()
+
+    def outcome(self) -> str:
+        for code in ("PROCESS_SURVIVED", "LEDGER_FAILED", "SECOND_MODEL", "PROCESS_OUTSIDE_JOB"):
+            if code in self.reasons:
+                return code
+        if self.count >= self.limit:
+            return "MESSAGE_LIMIT"
+        if self.reasons:  # TIMEOUT or STREAM_UNREADABLE, whichever came first
+            return self.reasons[0]
+        if self.exit_code != 0:
+            return "MODEL_FAILED"
+        if self.result is None:
+            return "STREAM_UNREADABLE"
+        return "DONE"
 
 
 class Git:
     def __init__(self, log: Log, repo: Path) -> None:
         self.log = log
         self.repo = repo
-        self.exe = shutil.which("git") or "git"
 
     def __call__(self, *args: str, what: str = "", env: dict[str, str] | None = None, check: bool = True,
                  code: str = "GIT_FAILED") -> subprocess.CompletedProcess:
         label = what or "git " + " ".join(args[:2])
-        result = run([self.exe, "-C", str(self.repo), *args], self.log, label, env=env or plain_env())
+        # LR-80, LR-81: the launcher's hooks folder, no lingering git process, the allow-list environment
+        result = run([*git_base(), "-C", str(self.repo), *args], self.log, label, env=env or git_env())
         if check and result.returncode != 0:
             raise Stop(code, f"{label} failed.")
         return result
@@ -515,6 +2275,18 @@ class Launcher:
         self.log = Log(self.runs_dir / "logs" / f"{self.run_id}.log")
         self.token = ""
         self.api = Api(self.api_url, self.log)
+        self.ledger = Ledger(Path(config["ledger_file"]), self.log)
+        self.claude_image = str(config.get("claude_image", default_claude_image(config["claude_command"][0]))).lower()
+        self.model_since: int | None = None  # LR-83: where LR-67's searches start, as a FILETIME
+        self.watch_from: int | None = None  # LR-84: the start check's reading
+        self.chain: set[int] = set()  # LR-84, LR-90: the launcher's process and its ancestors
+        self.unended: set[tuple] = set()  # LR-89: (pid, creation time) of foreign processes that could not be ended
+        self.operator: str | None = None  # LR-97: the user of the launcher's session; never written anywhere
+        self.rule = OperatorRule(None, self.log)  # LR-97: the old rules until the operator and the witness are known
+        self.attempt: ModelRun | None = None  # LR-96: the model's attempt, for the search before the push
+        OTHERS_SEEN.clear()
+        self.task_id = {"task": f"issue-{getattr(args, 'issue', '')}",
+                        "spec": f"spec-{getattr(args, 'slug', '')}"}.get(args.command, "")
 
     # -------- preflight (LR-3 to LR-11)
 
@@ -551,14 +2323,158 @@ class Launcher:
         for path in (Path(__file__).resolve(), self.config_path):
             if can_write(path):
                 raise Stop("SELF_WRITABLE", f"This user can change {path.name}. Its folder must be read-only for it.")
+        self.check_hooks_folder()
+        if os.name == "nt" and not self.claude_image.endswith(".exe"):  # LR-86
+            raise Stop("CLAUDE_IMAGE", f"Claude Code's image {self.claude_image} is not an .exe file name. "
+                                       "Set claude_image in launcher.toml.")
         self.check_folders()
+        self.identify_operator(sid)
+        self.check_start_processes()
+
+    def identify_operator(self, me: str | None) -> None:
+        """LR-97: the operator is the user of the launcher's own session, never this user and never configured; then
+        the operator's witness. Without an operator the old rules apply, and the log says so in one line."""
+        try:
+            operator = session_user_sid()
+        except OSError:
+            operator = None
+        if not isinstance(operator, str) or not SID.fullmatch(operator) or not me or operator == me:
+            operator = None  # review round 1, F9: without this user's own SID there is no operator either
+        self.operator = operator
+        limit = self.config.get("max_unjudged", 0)
+        if operator is None:
+            self.rule = OperatorRule(None, self.log, limit)
+            self.log.say("operator not identified: the old rules apply")
+            return
+        self.log.say("operator identified: yes")
+        path = self.config.get("witness_file")
+        witness = Witness(path, operator, me) if path else None
+        self.rule = OperatorRule(witness, self.log, limit)
+        if witness is None:
+            self.log.say("witness: not configured: the old rules apply")
+        elif witness.read() is None:
+            self.log.say(f"witness: not found or not trusted ({witness.reason}): the old rules apply")
+        else:
+            self.log.say("witness: found")
+
+    def operator_summary(self) -> None:
+        """LR-97: at the end of a run, how many processes of the operator and of other users were passed."""
+        since = self.model_since
+        others = sum(1 for _, created in OTHERS_SEEN if since is not None and created >= since)
+        self.log.write(f"operator rule: {len(self.rule.passed)} of the operator passed, {others} of other users "
+                       f"passed, {len(self.rule.unjudged)} unjudged")
+
+    def watch(self, minutes: int) -> None:
+        """LR-98: probe 2. For `minutes`, every second, the processes that today's rules (old) or the operator's
+        witness (new) would judge foreign, each once, with its time, image and owner class; then the counts. It ends
+        nothing, uses no network and writes no ledger."""
+        try:
+            me = current_sid()
+        except (OSError, Stop):
+            me = None
+        self.identify_operator(me)
+        since = now_filetime()
+        until = time.monotonic() + minutes * WATCH_MINUTE_SECONDS
+        old_flags: set[tuple] = set()
+        new_flags: set[tuple] = set()
+        reported: set[tuple] = set()
+        while time.monotonic() < until:
+            try:
+                records = user_processes(None)
+            except OSError:
+                self.log.say("watch: the processes could not be listed")
+                time.sleep(1.0)
+                continue
+            exclude = {os.getpid()} | launcher_chain(records)
+            old = outside_processes(records, since, exclude)
+            new = {(r.get("pid"), r.get("created")) for r in self.rule.sort(old, exclude)}
+            for record in old:
+                pair = (record.get("pid"), record.get("created"))
+                old_flags.add(pair)
+                if pair in new:
+                    new_flags.add(pair)
+                if pair in reported:
+                    continue
+                reported.add(pair)
+                owner = ("own" if record.get("owner", "self") == "self"
+                         else "operator" if pair in self.rule.passed else "unknown")
+                rules = ("old and new" if pair in new else "old; unjudged by the new" if pair in self.rule.unjudged
+                         else "old only")
+                self.log.say(f"watch: {local_time(record.get('created'))} {record.get('image')} owner {owner}: "
+                             f"flagged by {rules}")
+            time.sleep(max(0.0, min(1.0, until - time.monotonic())))
+        self.log.say(f"WATCH DONE: flagged by the old rules {len(old_flags)}, by the new rules {len(new_flags)}, "
+                     f"unjudged {len(self.rule.unjudged)}, passed as the operator's {len(self.rule.passed)}")
+
+    def check_hooks_folder(self) -> None:
+        """LR-10 extended by LR-80: the hooks folder is a plain folder that holds only its README, and is read-only."""
+        hooks = hooks_folder()
+        try:
+            plain = not hooks.is_symlink() and not hooks.is_junction() and hooks.is_dir()
+            names = sorted(p.name for p in hooks.iterdir()) if plain else []
+        except OSError:
+            plain, names = False, []
+        if not plain or names != [HOOKS_README] or can_create(hooks):
+            raise Stop("SELF_WRITABLE", f"The launcher's git hooks folder {hooks.name} must be a read-only folder "
+                                        f"that holds only its {HOOKS_README}.")
+
+    def check_start_processes(self) -> None:
+        """LR-84: nothing of this user runs besides the launcher's own chain and Windows' own session processes."""
+        if os.name != "nt":
+            return
+        self.watch_from = now_filetime()  # LR-84, LR-92: read first; from here on the searches look at every new process
+        self.check_unended()
+        try:
+            records = user_processes(None)
+        except OSError:
+            raise Stop("PROCESS_AT_START", "The processes of this user could not be listed. Nothing was started.") from None
+        self.chain = launcher_chain(records)
+        mine = [r for r in records if r.get("owner", "self") == "self"]
+        found = outside_processes(mine, 0, self.chain, console_parents=self.chain)  # LR-90: the chain's console host
+        for record in found:
+            self.log.write(f"start check: another process of this user: {describe_process(record)}")
+        if found:
+            raise Stop("PROCESS_AT_START", "Another process of this user is running. Close it, or end it, and start "
+                                           "again. Nothing was started.")
+
+    def check_unended(self) -> None:
+        """LR-89: refuse while a process an earlier run could not end is alive, whatever its owner."""
+        with self.ledger.locked():
+            records = self.ledger.read()
+        alive = [r for r in records if r["record"] == "process_unended" and process_alive(r["pid"], r["created"])]
+        for record in alive:
+            self.log.write(f"start check: a process an earlier run could not end is alive: pid {record['pid']}, "
+                           f"image {record['image']}, run {record['attempt']}")
+        if alive:
+            raise Stop("PROCESS_UNENDED", STOP_MESSAGES["PROCESS_UNENDED"])
+
+    def note_unended(self, record: dict) -> None:
+        """LR-89: record, once per process and run, a foreign process the launcher could not end."""
+        pid, created = record.get("pid"), record.get("created")
+        if (pid, created) in self.unended:
+            return
+        self.unended.add((pid, created))
+        if not isinstance(pid, int) or isinstance(pid, bool) or not isinstance(created, int) or isinstance(created, bool):
+            self.log.write("ledger: a process that could not be ended has no readable id or creation time")
+            return
+        entry = {"record": "process_unended", "attempt": self.run_id, "pid": pid, "created": created,
+                 "image": str(record.get("image") or "")[:260], "time": utc_now()}
+        try:
+            self.ledger.append(entry)
+        except Stop:
+            self.log.write("ledger: a process_unended record could not be written")
+
+    def stop_message(self, code: str) -> str:
+        """LR-89: the stop's message, saying when a process could not be ended."""
+        return STOP_MESSAGES.get(code, code) + (UNENDED_NOTE if self.unended else "")
 
     def check_folders(self) -> None:
-        for folder in self.config["must_not_open"]:
+        for number, folder in enumerate(self.config["must_not_open"], 1):
             state = folder_openable(folder)
-            self.log.write(f"must_not_open {folder}: {state}")
+            self.log.write(f"must_not_open entry {number}: {state}")  # LR-97 rule 6: the number, never the path
             if state == "open":
-                raise Stop("FOLDER_OPEN", f"This user can open {folder}. Deny it first; the launcher reads nothing there.")
+                raise Stop("FOLDER_OPEN", f"This user can open must_not_open entry {number} of launcher.toml. Deny it "
+                                          "first; the launcher reads nothing there.")
 
     # -------- token (LR-12 to LR-14)
 
@@ -613,7 +2529,7 @@ class Launcher:
         shallow = self.args.command == "spec"
         source = Path(self.repo_url).resolve().as_uri() if shallow and Path(self.repo_url).is_dir() else self.repo_url
         clone = ["clone", "--no-tags", *(["--depth", "1"] if shallow else []), source, str(self.repo)]
-        result = run([shutil.which("git") or "git", *clone], self.log, "git clone", env=plain_env())
+        result = run([*git_base(), *clone], self.log, "git clone", env=git_env())  # LR-80, LR-81
         if result.returncode != 0:
             raise Stop("CLONE_FAILED", "The repository could not be cloned.")
         config = self.read_quality()
@@ -639,8 +2555,8 @@ class Launcher:
             raise Stop("PIN_UNKNOWN", "judge.yml does not name quality-gate by exactly one full SHA.")
         self.pin = pins.pop()
         self.gate = self.run_dir / "gate"
-        result = run([shutil.which("git") or "git", "clone", "--no-tags", self.gate_url, str(self.gate)], self.log,
-                     "git clone gate", env=plain_env())
+        result = run([*git_base(), "clone", "--no-tags", self.gate_url, str(self.gate)], self.log, "git clone gate",
+                     env=git_env())
         if result.returncode != 0:
             raise Stop("PIN_UNKNOWN", "quality-gate could not be cloned.")
         gate_git = Git(self.log, self.gate)
@@ -657,8 +2573,8 @@ class Launcher:
             raise Stop("PIN_UNKNOWN", "quality.toml cannot be read on the default branch.") from None
 
     def gate_env(self) -> dict[str, str]:
-        env = plain_env()
-        env.update({"PYTHONPATH": str(self.gate), "GITHUB_REPOSITORY": self.repository, "GITHUB_API_URL": self.api_url})
+        # LR-81: the gate's commands run git too (hide-paths), so they get git's allow-list environment
+        env = git_env({"PYTHONPATH": str(self.gate), "GITHUB_REPOSITORY": self.repository, "GITHUB_API_URL": self.api_url})
         if self.token:
             env["GATE_TOKEN"] = self.token
         return env
@@ -675,6 +2591,8 @@ class Launcher:
         values = dict(line.split("=", 1) for line in output.read_text(encoding="utf-8").splitlines() if "=" in line)
         self.max_turns = int(values["max-turns"])
         self.timeout_minutes = int(values["timeout-minutes"])
+        if self.timeout_minutes > MAX_TIMEOUT_MINUTES:  # LR-76
+            raise Stop("TIMEOUT_TOO_LONG", STOP_MESSAGES["TIMEOUT_TOO_LONG"])
         self.spec_settings = json.loads(values.get("spec-settings") or "{}")
         self.max_fix_rounds = self.quality.get("limits", {}).get("max_fix_rounds")
         self.log.write(f"limits: max_turns {self.max_turns}, timeout_minutes {self.timeout_minutes}")
@@ -688,6 +2606,7 @@ class Launcher:
         self.git("config", "user.name", self.bot_name)
         self.git("config", "user.email", self.bot_email)
         self.git("config", "credential.helper", "")
+        self.git("config", "core.autocrlf", "false")  # LR-91: the model's git and the launcher's agree on line endings
         exclude = self.repo / ".git" / "info" / "exclude"
         exclude.parent.mkdir(parents=True, exist_ok=True)
         with open(exclude, "a", encoding="utf-8", newline="\n") as handle:
@@ -742,6 +2661,10 @@ class Launcher:
         self.branch = str(head.get("ref"))
         if not re.fullmatch(r"[0-9a-f]{40}", self.head_sha) or not re.fullmatch(r"[A-Za-z0-9._/-]+", self.branch):
             raise Stop("NOT_A_FIX_TARGET", "The PR's head is malformed.")
+        task = FIX_TASK.match(self.branch)  # LR-54: a fix round is a retry of its issue's task
+        if not task:
+            raise Stop("NOT_A_FIX_TARGET", "The PR's branch does not name its issue as ai/<N>-...")
+        self.task_id = f"issue-{task.group(1)}"
         self.note = self.decide(pr_number)
         self.git("fetch", "--no-tags", "origin", f"+refs/heads/{self.branch}:refs/remotes/origin/{self.branch}")
         self.git("checkout", "-B", self.branch, f"origin/{self.branch}")
@@ -835,14 +2758,19 @@ class Launcher:
             return None
         venv = self.run_dir / "venv"
         lock = self.repo / "requirements.lock"
-        result = run([self.config["app_python"], "-m", "venv", *([] if lock.is_file() else ["--without-pip"]), str(venv)],
-                     self.log, "venv", env=plain_env())
+        temporary = self.run_dir / "tmp"
+        temporary.mkdir(exist_ok=True)
+        # LR-94: nothing of the launcher's environment (PIP_*, PYTHON*, proxies), no user configuration
+        env = git_env({"TEMP": str(temporary), "TMP": str(temporary), "TMPDIR": str(temporary)})
+        result = run([self.config["app_python"], "-I", "-m", "venv", *([] if lock.is_file() else ["--without-pip"]),
+                      str(venv)], self.log, "venv", env=env)
         if result.returncode != 0:
             raise Stop("VENV_FAILED", "The application's virtual environment could not be made.")
         if lock.is_file():
             python = venv / ("Scripts/python.exe" if os.name == "nt" else "bin/python")
-            result = run([str(python), "-m", "pip", "install", "--quiet", "-r", "requirements.lock"], self.log, "pip install",
-                         cwd=self.repo, env=plain_env())
+            result = run([str(python), "-I", "-m", "pip", "install", "--isolated", "--no-cache-dir",
+                          "--disable-pip-version-check", "--no-input", "--quiet", "-r", "requirements.lock"], self.log,
+                         "pip install", cwd=self.repo, env=env)
             if result.returncode != 0:
                 raise Stop("VENV_FAILED", "The application's requirements could not be installed.")
         return venv
@@ -853,6 +2781,8 @@ class Launcher:
             base = claude_path(path)
             for target in (base, base + "/**"):
                 deny += [f"{tool}({target})" for tool in FILE_TOOLS]
+        for path in (self.ledger.path, self.ledger.lock_path):  # LR-55
+            deny += [f"{tool}({claude_path(str(path))})" for tool in FILE_TOOLS]
         deny += ALWAYS_DENIED
         if self.args.command == "spec":
             deny += list((self.spec_settings.get("permissions") or {}).get("deny") or [])
@@ -869,75 +2799,193 @@ class Launcher:
                               note=getattr(self, "note", None))
         settings_path = self.run_dir / "claude-settings.json"
         settings_path.write_text(json.dumps(self.settings(), indent=2), encoding="utf-8")
-        argv = [*self.config["claude_command"], "-p", "--max-turns", str(self.max_turns), "--allowedTools",
-                ",".join(TOOLS[role]), "--settings", str(settings_path), "--output-format", "json"]
         self.check_folders()
-        self.log.write(f"model starts: max_turns {self.max_turns}, timeout {self.timeout_minutes} min")
-        flags = subprocess.CREATE_NEW_PROCESS_GROUP if os.name == "nt" else 0
+        reservation = self.reserve(role)
+        limit = reservation["limit"]
+        argv = [*self.config["claude_command"], "-p", "--max-turns", str(limit), "--allowedTools",
+                ",".join(TOOLS[role]), "--settings", str(settings_path), "--output-format", "stream-json", "--verbose"]
+        self.log.write(f"model starts: limit {limit}, timeout {self.timeout_minutes} min")
+        self.config_snapshot = self.clone_config()  # LR-70: what the clone's config must still be afterwards
+        attempt = ModelRun(self, argv, model_env(role, venv), prompt.encode("utf-8"), limit, self.run_id)
+        self.attempt = attempt  # LR-96: the search before the push knows the model's own process too
+        outcome = "ERROR"
         try:
-            process = subprocess.Popen(argv, cwd=self.repo, env=model_env(role, venv), stdin=subprocess.PIPE,
-                                       stdout=subprocess.PIPE, stderr=subprocess.PIPE, creationflags=flags,
-                                       start_new_session=os.name != "nt")
-        except OSError:
-            raise Stop("MODEL_FAILED", "The model could not start.") from None
-        try:
-            stdout, _ = process.communicate(prompt.encode("utf-8"), timeout=self.timeout_minutes * 60)
-        except subprocess.TimeoutExpired:
-            kill_tree(process)
-            self.log.write("model: timed out and killed")
-            raise Stop("TIMEOUT", f"The model ran past {self.timeout_minutes} minutes and was stopped.") from None
-        self.log.write(f"model: exit {process.returncode}")
-        self.record_model_output(stdout)
-        if process.returncode != 0:
-            raise Stop("MODEL_FAILED", f"The model exited with {process.returncode}.")
+            outcome = attempt.run(self.timeout_minutes * 60)
+        except Stop as stop:
+            outcome = stop.code
+            raise
+        except KeyboardInterrupt:
+            outcome = "INTERRUPTED"
+            raise
+        finally:
+            self.model_since = attempt.since  # LR-83
+            outcome = self.finish(attempt, outcome)
+        if outcome == "TIMEOUT":
+            raise Stop("TIMEOUT", f"The model ran past {self.timeout_minutes} minutes and was stopped.")
+        if outcome == "MODEL_FAILED":
+            raise Stop("MODEL_FAILED", f"The model exited with {attempt.exit_code}.")
+        if outcome != "DONE":
+            raise Stop(outcome, self.stop_message(outcome))
 
-    def record_model_output(self, stdout: bytes) -> None:
+    def reserve(self, role: str) -> dict:
+        """LR-53, LR-56: the effective limit, and the attempt reserved in the ledger before the model starts."""
+        parts = [self.config["max_messages_attempt"], self.max_turns]
+        cli = getattr(self.args, "max_messages", None)
+        if cli is not None:
+            parts.append(cli)
+        record = {"record": "attempt_reserved", "task": self.task_id, "attempt": self.run_id, "role": role,
+                  "time": "", "limit": 0, "max_messages_task": self.config["max_messages_task"],
+                  "max_runs_task": self.config["max_runs_task"], "messages_before": 0, "runs_before": 0}
+        reservation = self.ledger.reserve(record, parts)
+        self.log.write(f"task {self.task_id}: {reservation['messages_before']} messages and "
+                       f"{reservation['runs_before']} runs before this attempt (of {reservation['max_messages_task']} "
+                       f"and {reservation['max_runs_task']})")
+        self.log.write(f"model limit {reservation['limit']}: max_messages_attempt {parts[0]}, quality.toml max_turns "
+                       f"{parts[1]}, --max-messages {cli if cli is not None else 'not given'}, task left "
+                       f"{reservation['max_messages_task'] - reservation['messages_before']}")
+        return reservation
+
+    def finish(self, attempt: "ModelRun", outcome: str) -> str:
+        """LR-55: attempt_finished, and LR-49/LR-62's lines from the result event."""
+        self.log.write(f"model: exit {attempt.exit_code}, outcome {outcome}, {attempt.count} messages, "
+                       f"{attempt.over} over the limit")
+        result = None
+        if attempt.result is not None:
+            result = {}
+            for field in MODEL_FIELDS:
+                value = attempt.result.get(field)
+                result[field] = scrub(value, self.log.secrets)[:CUT] if isinstance(value, str) else value
+                self.log.write(f"model {field}: {result[field]}")
+            self.log.write("model result: " + scrub(str(attempt.result.get("result") or ""), self.log.secrets)[:2000])
+        else:
+            self.log.write("model stream: no result event")
+        messages = attempt.count if attempt.complete else max(attempt.count, attempt.limit)  # LR-68, LR-71
+        record = {"record": "attempt_finished", "attempt": self.run_id, "messages": messages, "outcome": outcome,
+                  "result": result, "exit_code": attempt.exit_code, "time": utc_now(), "count_complete": attempt.complete}
         try:
-            data = json.loads(stdout.decode("utf-8", "replace"))
-        except ValueError:
-            self.log.write("model output: not JSON")
-            return
-        if not isinstance(data, dict):
-            self.log.write("model output: not a JSON object")
-            return
-        for field in MODEL_FIELDS:
-            self.log.write(f"model {field}: {data.get(field)}")
-        self.log.write("model result: " + scrub(str(data.get("result") or ""), self.log.secrets)[:2000])
+            self.ledger.append(record)
+        except Stop:
+            self.log.write("ledger: attempt_finished could not be written; the attempt stays charged at its limit")
+            return "LEDGER_FAILED" if outcome == "DONE" else outcome
+        return outcome
 
     # -------- after the model (LR-33 to LR-41)
 
+    def clone_config(self) -> bytes | None:
+        """The clone's .git/config, or None when .git is not a plain folder (LR-70)."""
+        dot_git = self.repo / ".git"
+        if dot_git.is_symlink() or dot_git.is_junction() or not dot_git.is_dir():
+            return None
+        try:
+            return (dot_git / "config").read_bytes()
+        except OSError:
+            return None
+
     def after_model(self) -> None:
-        current = self.git("symbolic-ref", "--quiet", "--short", "HEAD", check=False).stdout.decode().strip()
-        ancestor = self.git("merge-base", "--is-ancestor", self.start, "HEAD", check=False).returncode == 0
-        if current != self.branch or not ancestor:
+        config = self.clone_config()  # LR-70: a first check, before git reads anything of the clone
+        if config is None or config != self.config_snapshot:
+            raise Stop("GIT_CONFIG_CHANGED", STOP_MESSAGES["GIT_CONFIG_CHANGED"])
+        post = self.run_dir / f"post-{secrets.token_hex(16)}"  # LR-79: named now, after every process of the model
+        try:
+            post.mkdir()
+        except OSError:
+            raise Stop("GIT_FAILED", "The launcher's own repository could not be made.") from None
+        self.post = post
+        git = self.post_git = Git(self.log, post)
+        git("init", "--bare", "--quiet", "--template=", str(post), what="git init (the launcher's own repository)")
+        head_ref = sha = None
+        for line in git.out("ls-remote", "--symref", str(self.repo), "HEAD", what="git ls-remote (the clone)").splitlines():
+            if line.startswith("ref: ") and line.endswith("\tHEAD"):
+                head_ref = line[5:-5]
+            elif re.fullmatch(r"[0-9a-f]{40}\tHEAD", line):
+                sha = line[:40]
+        if head_ref != f"refs/heads/{self.branch}" or sha is None:  # LR-33
             raise Stop("BRANCH_MOVED", f"The model left the branch {self.branch}. Nothing was pushed.")
-        if self.git.out("status", "--porcelain", "--untracked-files=all"):
-            identity = {"GIT_AUTHOR_NAME": self.bot_name, "GIT_AUTHOR_EMAIL": self.bot_email,
-                        "GIT_COMMITTER_NAME": self.bot_name, "GIT_COMMITTER_EMAIL": self.bot_email}
-            self.git("add", "-A")
-            self.git("-c", f"user.name={self.bot_name}", "-c", f"user.email={self.bot_email}", "commit", "--quiet",
-                     "-m", LEFTOVER_MESSAGE, env={**plain_env(), **identity})
-            self.log.write("leftover changes committed by the launcher")
-        identities = self.git.out("log", "--format=%an%x1f%ae%x1f%cn%x1f%ce", f"{self.start}..HEAD")
+        git("-c", "fetch.fsckObjects=true", "fetch", "--quiet", "--no-tags", "--no-write-fetch-head",
+            "--no-recurse-submodules", "--update-shallow", str(self.repo), sha, what="git fetch (the clone's head)")
+        replaced = git.out("for-each-ref", "--format=%(refname)", "refs/replace/")
+        problem = post_repo_problem(post, self.start, replaced)  # LR-80
+        if problem:
+            self.log.write(f"the launcher's own repository holds {problem}")
+            raise Stop("GIT_REPO_UNSAFE", STOP_MESSAGES["GIT_REPO_UNSAFE"])
+        if git("merge-base", "--is-ancestor", self.start, sha, check=False).returncode != 0:  # LR-33
+            raise Stop("BRANCH_MOVED", f"The model left the branch {self.branch}. Nothing was pushed.")
+        tip = self.leftovers(git, post, sha)  # LR-34
+        identities = git.out("log", "--format=%an%x1f%ae%x1f%cn%x1f%ce", f"{self.start}..{tip}")
         expected = "\x1f".join([self.bot_name, self.bot_email, self.bot_name, self.bot_email])
         if any(line != expected for line in identities.splitlines() if line):
             raise Stop("IDENTITY", "A commit is not authored and committed as the app's bot. Nothing was pushed.")
-        commits = self.git.out("rev-list", "--reverse", f"{self.start}..HEAD").split()
+        commits = git.out("rev-list", "--reverse", f"{self.start}..{tip}").split()
         if not commits:
             raise Stop("NO_CHANGES", "The model made no commit. Nothing was pushed.")
-        if self.args.command == "spec":
-            changed = self.git.out("diff", "--name-only", self.start, "HEAD").splitlines()
-            if any(not path.startswith("acceptance/") for path in changed if path):
-                raise Stop("SPEC_OUTSIDE_ACCEPTANCE", "The spec-test author changed a path outside acceptance/. Nothing was pushed.")
+        if self.args.command == "spec":  # LR-93: every commit, against its parent; no merge commit
+            if git.out("rev-list", "--min-parents=2", f"{self.start}..{tip}"):
+                raise Stop("SPEC_MERGE_COMMIT", STOP_MESSAGES["SPEC_MERGE_COMMIT"])
+            for commit in commits:
+                changed = git.out("diff-tree", "-r", "--no-commit-id", "--name-only", commit).splitlines()
+                if any(not path.startswith("acceptance/") for path in changed if path):
+                    raise Stop("SPEC_OUTSIDE_ACCEPTANCE", "The spec-test author changed a path outside acceptance/. Nothing was pushed.")
+        self.verified = git.out("rev-parse", "--verify", f"{tip}^{{commit}}")  # LR-69: the commit the checks saw
+        if not re.fullmatch(r"[0-9a-f]{40}", self.verified) or self.verified != commits[-1]:
+            raise Stop("GIT_FAILED", "The verified commit could not be read.")
+        self.log.write(f"verified commit {self.verified}")
         if self.args.command == "fix":
             pr = self.api.call("GET", f"/repos/{self.repository}/pulls/{self.args.pr}", self.token, code="HEAD_MOVED")
             if ((pr or {}).get("head") or {}).get("sha") != self.head_sha:
                 raise Stop("HEAD_MOVED", "The PR's head moved since the decision. Nothing was pushed.")
         self.commits = commits
 
+    def leftovers(self, git: Git, post: Path, sha: str) -> str:
+        """LR-34 in LR-79's repository: the clone's working tree read as data, committed as the bot when it differs."""
+        (post / "info").mkdir(exist_ok=True)
+        (post / "info" / "exclude").write_text(f"{PROPOSAL_FILE}\n", encoding="utf-8")
+        env = git_env({"GIT_INDEX_FILE": str(post / "launcher-index")})
+        tree_of = ["--git-dir", str(post), "--work-tree", str(self.repo)]
+        git(*tree_of, "read-tree", sha, env=env, what="git read-tree (leftovers)")
+        # A spec run's clone hides the denied paths with a sparse checkout (LR-23): there only new and changed files
+        # are leftovers, never the hidden paths' absence.
+        adding = ["--ignore-removal", "--", ":/"] if self.args.command == "spec" else ["-A"]
+        git(*tree_of, "add", *adding, env=env, what="git add (leftovers)")
+        tree = git(*tree_of, "write-tree", env=env, what="git write-tree (leftovers)").stdout.decode().strip()
+        if tree == git.out("rev-parse", f"{sha}^{{tree}}"):
+            return sha
+        identity = {"GIT_AUTHOR_NAME": self.bot_name, "GIT_AUTHOR_EMAIL": self.bot_email,
+                    "GIT_COMMITTER_NAME": self.bot_name, "GIT_COMMITTER_EMAIL": self.bot_email}
+        commit = git("commit-tree", tree, "-p", sha, "-m", LEFTOVER_MESSAGE, env=git_env(identity),
+                     what="git commit-tree (leftovers)").stdout.decode().strip()
+        self.log.write("leftover changes committed by the launcher")
+        return commit
+
+    def search_before_push(self) -> None:
+        """LR-83: one more search just before the push; a foreign process stops the run."""
+        if os.name != "nt" or self.model_since is None:
+            return
+        try:
+            found = outside_processes(user_processes(None), self.model_since, {os.getpid()} | self.chain)
+        except OSError:
+            self.log.write("search before the push: the user's processes could not be listed")
+            raise Stop("PROCESS_BEFORE_PUSH", STOP_MESSAGES["PROCESS_BEFORE_PUSH"]) from None
+        if self.attempt is not None:  # LR-96, then LR-97
+            found = self.attempt.judge(found)
+        else:
+            found = self.rule.sort(found, {os.getpid()} | self.chain)
+        if self.rule.over and not found:  # review round 1, F1: more unjudged than max_unjudged
+            raise Stop("PROCESS_BEFORE_PUSH", self.stop_message("PROCESS_BEFORE_PUSH"))
+        for record in found:
+            ended = end_process(record["pid"])
+            self.log.write(f"search before the push: a process: {describe_process(record)}; "
+                           f"{'it is ended' if ended else 'it could not be ended'}")
+            if not ended:
+                self.note_unended(record)  # LR-89
+        if found:
+            raise Stop("PROCESS_BEFORE_PUSH", self.stop_message("PROCESS_BEFORE_PUSH"))
+
     def push(self) -> None:
-        env = {**plain_env(), **git_auth_env(self.token, self.repo_url)}
-        result = self.git("push", "origin", f"HEAD:refs/heads/{self.branch}", env=env, check=False, what="git push")
+        self.search_before_push()  # LR-83
+        env = git_env(git_auth_env(self.token, self.repo_url))
+        # LR-69, LR-79: the verified commit, by its SHA, from the launcher's own repository, to the explicit repo_url.
+        result = self.post_git("push", self.repo_url, f"{self.verified}:refs/heads/{self.branch}", "--no-follow-tags",
+                               "--no-verify", env=env, check=False, what="git push")
         if result.returncode != 0:
             raise Stop("PUSH_FAILED", f"The push of {self.branch} was refused.")
         self.log.write(f"pushed {self.branch}: {' '.join(self.commits)}")
@@ -961,6 +3009,8 @@ class Launcher:
                               what="gate.publish post-proposal")
 
     def work(self) -> None:
+        if self.task_id:  # LR-56: task and spec know their task now, before any network use
+            self.ledger.check(self.task_id, self.config["max_messages_task"], self.config["max_runs_task"])
         self.prepare()
         self.mint_token()
         self.set_identity()
@@ -992,9 +3042,11 @@ def parse(argv: list[str] | None) -> argparse.Namespace:
     parser.add_argument("--config", default=str(DEFAULT_CONFIG))
     commands = parser.add_subparsers(dest="command", required=True)
     commands.add_parser("check")
-    commands.add_parser("task").add_argument("--issue", type=positive, required=True)
-    commands.add_parser("spec").add_argument("--slug", type=slug, required=True)
-    commands.add_parser("fix").add_argument("--pr", type=positive, required=True)
+    commands.add_parser("watch").add_argument("--minutes", type=positive, required=True)  # LR-98: probe 2
+    for name, flag, kind in (("task", "--issue", positive), ("spec", "--slug", slug), ("fix", "--pr", positive)):
+        command = commands.add_parser(name)
+        command.add_argument(flag, type=kind, required=True)
+        command.add_argument("--max-messages", type=positive, default=None)  # LR-53: can only lower the limit
     return parser.parse_args(argv)
 
 
@@ -1002,7 +3054,8 @@ def main(argv: list[str] | None = None) -> int:
     try:
         args = parse(argv)
     except SystemExit:
-        print("CONFIG: usage: xtl_launcher [--config FILE] check | task --issue N | spec --slug S | fix --pr N", flush=True)
+        print("CONFIG: usage: xtl_launcher [--config FILE] check | watch --minutes M | task --issue N | spec --slug S"
+              " | fix --pr N [--max-messages M]", flush=True)
         return 2
     try:
         config_path = Path(args.config)
@@ -1020,6 +3073,10 @@ def main(argv: list[str] | None = None) -> int:
     log.write(f"start {args.command} {launcher.run_id}")
     code = 1
     try:
+        if args.command == "watch":  # LR-98: read-only, without the preflight's refusals
+            launcher.watch(args.minutes)
+            code = 0
+            return code
         launcher.preflight()
         if args.command == "check":
             log.say("PREFLIGHT OK")
@@ -1036,6 +3093,8 @@ def main(argv: list[str] | None = None) -> int:
         log.say(f"STOPPED ERROR: an unexpected {type(error).__name__}.")
     finally:
         launcher.revoke()
+        if args.command in ("task", "spec", "fix") and launcher.model_since is not None:
+            launcher.operator_summary()  # LR-97
         log.write(f"end, exit {code}")
         log.close()
     return code

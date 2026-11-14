@@ -63,7 +63,10 @@ def test_lr39_fix_push_without_force(fix_run):
     pushes = fix_run.git_commands("push")
     assert len(pushes) == 1
     argv = pushes[0]["argv"]
-    assert f"HEAD:refs/heads/{W.PR_BRANCH}" in argv and "origin" in argv
+    # LR-69 (amendment Stage A2): the verified commit's SHA to the explicit repo_url, never HEAD or origin.
+    tip = fix_run.refs_after[f"refs/heads/{W.PR_BRANCH}"]
+    assert f"{tip}:refs/heads/{W.PR_BRANCH}" in argv and "origin" not in argv
+    assert W.same_path(argv[argv.index("push") + 1], fix_run.world.config["repo_url"])
     assert not any(a.startswith("+") or a.startswith("--force") or a == "-f" for a in argv), argv
 
 
