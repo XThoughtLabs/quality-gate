@@ -59,7 +59,11 @@ CONTROL_NAMES = {"quality.toml", "codeowners"}
 DEPENDENCY_NAMES = {"pyproject.toml", "setup.py", "pipfile", "pipfile.lock", "poetry.lock", "uv.lock"}
 DEPENDENCY_PATTERN = re.compile(r"(requirements.*\.(txt|in|lock)|constraints.*\.txt)")
 SCHEMA_FOLDERS = {"migrations", "migration", "alembic"}
-DDL = re.compile(r"\b(CREATE|ALTER|DROP)\s+(TABLE|INDEX|VIEW|TRIGGER)\b|\bPRAGMA\s+user_version\b", re.IGNORECASE)
+DDL = re.compile(r"\b(CREATE|ALTER|DROP)\s+((TEMP|TEMPORARY|UNIQUE|VIRTUAL)\s+)*(TABLE|INDEX|VIEW|TRIGGER)\b"
+                 r"|\bPRAGMA\s+user_version\b", re.IGNORECASE)
+TOKEN_SHAPE = re.compile(r"[A-Za-z0-9_.-]+")
+SECRET_SHAPES = re.compile(r"gh[pousr]_[A-Za-z0-9_]{20,}|github_pat_[A-Za-z0-9_]{20,}"
+                           r"|eyJ[A-Za-z0-9_-]{4,}\.[A-Za-z0-9_-]{4,}\.[A-Za-z0-9_-]{4,}")
 CODEOWNERS_PLACES = (".github/CODEOWNERS", "CODEOWNERS", "docs/CODEOWNERS")
 CODEOWNERS_UNSUPPORTED = set("*?[]!\\")
 
@@ -127,23 +131,35 @@ class Secrets:
             self.values.append(value)
 
     def scrub(self, text: str) -> str:
-        for value in self.values:
+        for value in sorted(set(self.values), key=len, reverse=True):
             text = text.replace(value, "[secret]")
-        return text
+        return SECRET_SHAPES.sub("[secret]", text)  # amendment R2: anything shaped like a token or a JWT
+
+
+class NoRedirect(urllib.request.HTTPRedirectHandler):
+    """Amendment R4: a 3xx answer is an answer; no redirect is followed (it would carry the Authorization header)."""
+
+    def redirect_request(self, req, fp, code, msg, headers, newurl):  # noqa: ANN001  # reason: urllib's signature
+        return None
 
 
 def default_http(method: str, url: str, headers: dict, body: bytes | None) -> tuple[int, bytes]:
-    """One request to GitHub's API with a 30 s timeout; an HTTP error's status and body are an answer (CR-11)."""
+    """One request to GitHub's API with a 30 s timeout, no proxy and no redirect; an HTTP error's status and body are
+    an answer (CR-11)."""
     parts = urllib.parse.urlsplit(url)
     if not url.startswith(API + "/") or parts.scheme != "https" or parts.netloc != "api.github.com":
         raise ControllerError("GITHUB_ERROR", "a request to a host other than api.github.com was refused")
     request = urllib.request.Request(url, data=body, method=method, headers=headers)
+    opener = urllib.request.build_opener(urllib.request.ProxyHandler({}), NoRedirect())
     try:
-        with urllib.request.urlopen(request, timeout=TIMEOUT_SECONDS) as response:  # noqa: S310  # reason: https only, checked above
+        with opener.open(request, timeout=TIMEOUT_SECONDS) as response:  # nosec B310  # reason: https to api.github.com only, checked above
             return response.status, response.read()
     except urllib.error.HTTPError as error:
-        return error.code, error.read()
-    except (urllib.error.URLError, OSError) as error:
+        try:
+            return error.code, error.read()
+        finally:
+            error.close()
+    except (urllib.error.URLError, OSError, ValueError) as error:
         raise Unreadable(f"no answer from GitHub ({type(error).__name__})") from None
 
 
@@ -427,7 +443,12 @@ class Run:
         if body is not None:
             data = json.dumps(body).encode("utf-8")
             headers["Content-Type"] = "application/json"
-        status, raw = self.http(method, API + route, headers, data)
+        try:
+            status, raw = self.http(method, API + route, headers, data)
+        except (ControllerError, Unreadable):
+            raise
+        except Exception as error:  # noqa: BLE001  # reason: amendment R2: any lost answer is "no answer", never a crash
+            raise Unreadable(f"{method} {route.split('?')[0]} got no answer ({type(error).__name__})") from None
         try:
             answer = json.loads(raw.decode("utf-8")) if raw else None
         except (UnicodeDecodeError, ValueError):
@@ -464,13 +485,17 @@ class Run:
         jwt = make_jwt(cfg["app_id"], self.key, self.clock())
         self.secrets.add(jwt)
         name = self.repo.split("/", 1)[1]
-        status, answer = self.request("POST", f"/app/installations/{cfg['installation_id']}/access_tokens",
-                                      {"repositories": [name], "permissions": dict(TOKEN_PERMISSIONS)}, bearer=jwt)
+        try:
+            status, answer = self.request("POST", f"/app/installations/{cfg['installation_id']}/access_tokens",
+                                          {"repositories": [name], "permissions": dict(TOKEN_PERMISSIONS)}, bearer=jwt)
+        except Unreadable as error:
+            raise ControllerError("GITHUB_ERROR", f"no installation token: {error}") from None
         token = answer.get("token") if isinstance(answer, dict) else None
-        if status != 201 or not isinstance(token, str) or not token:
+        if isinstance(token, str) and token:
+            self.secrets.add(token)
+        if status != 201 or not isinstance(token, str) or not TOKEN_SHAPE.fullmatch(token):
             self.record["message"] = self.message(status, answer)
-            raise ControllerError("GITHUB_ERROR", f"no installation token: GitHub answered {self.record['message']}")
-        self.secrets.add(token)
+            raise ControllerError("GITHUB_ERROR", f"no usable installation token: GitHub answered {status}")
         self.token = token
 
     def read_pr(self) -> dict:
@@ -535,7 +560,11 @@ class Run:
                 answer = self.get(f"/repos/{self.repo}/contents/{urllib.parse.quote(place)}?ref={tip}")
             except NotFound:
                 continue
+            if not isinstance(answer, dict) or answer.get("encoding") != "base64":
+                raise Unreadable(f"{place} comes back without base64 content")  # amendment R8
             text = base64.b64decode(answer["content"]).decode("utf-8")
+            if not text.strip():
+                raise Unreadable(f"{place} is empty")
             patterns = []
             for raw in text.splitlines():
                 line = raw.strip()
@@ -581,7 +610,9 @@ class Run:
             return "DEPENDENCY", f"{name} is a dependency file"
         if SCHEMA_FOLDERS & set(parts[:-1]) or leaf.endswith(".sql"):
             return "SCHEMA", f"{name} is a schema or migration file"
-        is_code = not is_test and leaf.endswith(".py") and any(low.startswith(f.lower()) for f in policy["code_folders"])
+        # Amendment R6: the admitted folders in their exact letter case.
+        real_leaf = name.rsplit("/", 1)[-1]
+        is_code = not is_test and real_leaf.endswith(".py") and any(name.startswith(f) for f in policy["code_folders"])
         if is_code:
             patch = item.get("patch")
             if not isinstance(patch, str):
@@ -589,17 +620,47 @@ class Run:
             for line in patch.splitlines():
                 if line[:1] in ("+", "-") and DDL.search(line):
                     return "SCHEMA", f"{name} adds or removes a schema statement"
+            if status == "modified" and self.schema_strings(name, self._merge_base) != self.schema_strings(name, self._head):
+                return "SCHEMA", f"{name} changes a string that holds a schema statement"  # amendment R1
+        if status == "added":
+            clash = [other for other in self._tree_lower.get(low, []) if other != name]
+            if clash:
+                return "CASE_CLASH", f"{name} differs from {clash[0]} only in letter case"  # amendment R6
         for pattern in patterns:
             if codeowners_names(pattern, low):
                 return "CODEOWNERS_PATH", f"{name} is named by the CODEOWNERS pattern {pattern}"
-        is_new_test = status == "added" and low.startswith(test_folder) and leaf.startswith("test_") \
-            and leaf.endswith(".py")
+        is_new_test = status == "added" and name.startswith(policy["test_folder"]) and real_leaf.startswith("test_") \
+            and real_leaf.endswith(".py")
         if not (is_code or is_new_test):
             return "OUTSIDE_POLICY", f"{name} ({status}) is neither ordinary application code nor an added ordinary test"
         entry = tree.get(name)
         if not entry or entry.get("type") != "blob" or entry.get("mode") != "100644":
             return "MODE", f"{name} is not a plain file in the head's tree"
+        if is_code:
+            self._kinds.add("code")
+        if is_new_test:
+            self._kinds.add("test")
         return None
+
+    def schema_strings(self, path: str, ref: str) -> list[str]:
+        """Amendment R1: the file's Python string literals that hold a schema word, white space made one space, in
+        lower case, sorted. Comments are no string literals."""
+        import io
+        import tokenize
+
+        answer = self.get(f"/repos/{self.repo}/contents/{urllib.parse.quote(path)}?ref={ref}")
+        if not isinstance(answer, dict) or answer.get("encoding") != "base64":
+            raise Unreadable(f"{path} at {ref} comes back without base64 content")
+        source = base64.b64decode(answer["content"]).decode("utf-8")
+        kinds = {tokenize.STRING, getattr(tokenize, "FSTRING_MIDDLE", tokenize.STRING)}
+        found = []
+        try:
+            for token in tokenize.generate_tokens(io.StringIO(source).readline):
+                if token.type in kinds and DDL.search(token.string):
+                    found.append(" ".join(token.string.split()).lower())
+        except (tokenize.TokenError, SyntaxError) as error:
+            raise Unreadable(f"{path} at {ref} cannot be read as Python ({type(error).__name__})") from None
+        return sorted(found)
 
     def rule_diff(self, pr: dict, info: dict) -> None:
         head = pr["head"]["sha"]
@@ -621,18 +682,32 @@ class Run:
         if answer.get("truncated") is not False or not isinstance(answer.get("tree"), list):
             raise Unreadable("the head's tree is truncated or unreadable")
         tree = {entry.get("path"): entry for entry in answer["tree"] if isinstance(entry, dict)}
+        merge_base = (compare.get("merge_base_commit") or {}).get("sha")
+        if not isinstance(merge_base, str) or not SHA40.fullmatch(merge_base):
+            raise Unreadable("the compare gives no merge base")
+        self._merge_base, self._head = merge_base, head
+        self._tree_lower: dict[str, list[str]] = {}
+        for path in tree:
+            if isinstance(path, str):
+                self._tree_lower.setdefault(path.lower(), []).append(path)
+        self._kinds: set[str] = set()
         for item in files:
             if not isinstance(item, dict):
                 raise Unreadable("a file entry of the compare is not an object")
             found = self.classify(item, patterns, tree)
             if found is not None:
                 raise Failed(*found)
+        # Amendment R7: ordinary code and an added ordinary test, both.
+        if "code" not in self._kinds:
+            raise Failed("NO_CODE_CHANGE", "the PR changes no ordinary application code")
+        if "test" not in self._kinds:
+            raise Failed("NO_NEW_TEST", "the PR adds no ordinary test")
         info["files_line"] = f"{len(files)} files: " + ", ".join(f"{f['filename']} ({f['status']})" for f in files)
 
     def rule_gate(self, pr: dict, info: dict) -> None:
         head = pr["head"]["sha"]
         gate = self.config["gate"]
-        runs = self.pages(f"/repos/{self.repo}/commits/{head}/check-runs", key="check_runs")
+        runs = self.pages(f"/repos/{self.repo}/commits/{head}/check-runs?filter=all", key="check_runs")
         failed, pending, missing = [], [], []
         for name in gate["checks"]:
             mine = [r for r in runs if isinstance(r, dict) and r.get("name") == name and r.get("head_sha") == head
@@ -767,23 +842,28 @@ class Run:
         policy = self.config["gate"]["policy_check"]
         app_id = self.config["controller"]["app_id"]
         try:
-            runs = self.pages(f"/repos/{self.repo}/commits/{head}/check-runs", key="check_runs")
+            runs = self.pages(f"/repos/{self.repo}/commits/{head}/check-runs?filter=all", key="check_runs")
         except Unreadable as error:
             raise ControllerError("GITHUB_ERROR", f"the check runs cannot be read before posting ({error}); "
                                                   f"posted: {self.posted}") from None
         own = [r for r in runs if isinstance(r, dict) and r.get("name") == policy and r.get("head_sha") == head
                and (r.get("app") or {}).get("id") == app_id and is_count(r.get("id"))]
         output = {"title": self.secrets.scrub(title)[:250], "summary": self.secrets.scrub(summary)[:60000]}
-        if own:
-            run_id = max(own, key=lambda r: r["id"])["id"]
-            status, answer = self.request("PATCH", f"/repos/{self.repo}/check-runs/{run_id}",
-                                          {"status": "completed", "conclusion": conclusion, "output": output})
-            expected = 200
-        else:
-            status, answer = self.request("POST", f"/repos/{self.repo}/check-runs",
-                                          {"name": policy, "head_sha": head, "status": "completed",
-                                           "conclusion": conclusion, "output": output})
-            expected = 201
+        try:
+            if own:
+                run_id = max(own, key=lambda r: r["id"])["id"]
+                status, answer = self.request("PATCH", f"/repos/{self.repo}/check-runs/{run_id}",
+                                              {"status": "completed", "conclusion": conclusion, "output": output})
+                expected = 200
+            else:
+                status, answer = self.request("POST", f"/repos/{self.repo}/check-runs",
+                                              {"name": policy, "head_sha": head, "status": "completed",
+                                               "conclusion": conclusion, "output": output})
+                expected = 201
+        except Unreadable as error:
+            self.record["message"] = self.secrets.scrub(str(error))
+            raise ControllerError("GITHUB_ERROR", f"{policy} {conclusion}: {error}; whether it was posted is unknown; "
+                                                  f"posted before: {self.posted}") from None
         if status != expected or not isinstance(answer, dict) or not is_count(answer.get("id")):
             self.record["message"] = self.message(status, answer)
             raise ControllerError("GITHUB_ERROR", f"{policy} could not be posted: GitHub answered "
@@ -849,8 +929,11 @@ class Run:
             mergeable = third.get("mergeable")
         if mergeable is not True:
             return "MERGE_REFUSED", f"NOT_MERGEABLE: GitHub gives mergeable {json.dumps(mergeable)} for PR {self.pr}"
-        status, answer = self.request("PUT", f"/repos/{self.repo}/pulls/{self.pr}/merge",
-                                      {"sha": head, "merge_method": "merge"})
+        try:
+            status, answer = self.request("PUT", f"/repos/{self.repo}/pulls/{self.pr}/merge",
+                                          {"sha": head, "merge_method": "merge"})
+        except Unreadable as error:
+            return self.settle_lost_merge(head, str(error))
         merge_sha = answer.get("sha") if isinstance(answer, dict) else None
         if status == 200 and isinstance(answer, dict) and answer.get("merged") is True \
                 and isinstance(merge_sha, str) and SHA40.fullmatch(merge_sha):
@@ -858,6 +941,21 @@ class Run:
             return "MERGED", f"PR {self.pr} at {head} merged as {merge_sha}"
         self.record["message"] = self.message(status, answer)
         return "MERGE_REFUSED", f"GitHub refused the merge: {self.record['message']}"
+
+    def settle_lost_merge(self, head: str, why: str) -> tuple[str, str]:
+        """Amendment R2: the merge request got no answer; one more read of the PR tells what happened."""
+        self.record["message"] = self.secrets.scrub(f"the merge answer was lost ({why})")
+        try:
+            pr = self.get(f"/repos/{self.repo}/pulls/{self.pr}")
+            merged = pr.get("merged") is True
+            merge_sha = pr.get("merge_commit_sha")
+        except (Unreadable, AttributeError, TypeError):
+            return "GITHUB_ERROR", f"the merge request got no answer and the PR cannot be read: the merge's outcome is " \
+                                   f"unknown; posted: {self.posted}"
+        if merged and isinstance(merge_sha, str) and SHA40.fullmatch(merge_sha):
+            self.record["merge_sha"] = merge_sha
+            return "MERGED", f"PR {self.pr} at {head} merged as {merge_sha}"
+        return "GITHUB_ERROR", f"the merge request got no answer; the PR is not merged; posted: {self.posted}"
 
 
 # ---------------------------------------------------------------- CR-9, CR-10, CR-12
@@ -908,6 +1006,11 @@ def main(argv: list[str] | None = None, *, http: Callable | None = None, windows
             outcome, detail = run.execute()
         except ControllerError as stop:
             outcome, detail = stop.outcome, stop.detail
+        except Unreadable as error:  # amendment R2: never an uncaught exception
+            outcome, detail = "GITHUB_ERROR", f"{error}; posted: {run.posted if run is not None else 'nothing'}"
+        except Exception as error:  # noqa: BLE001  # reason: amendment R2: an unexpected error is GITHUB_ERROR, fail closed
+            outcome, detail = "GITHUB_ERROR", (f"unexpected error ({type(error).__name__}); "
+                                               f"posted: {run.posted if run is not None else 'nothing'}")
         if run is not None and log_file is not None and outcome not in ("USAGE", "LOCKED"):
             run.record["outcome"] = outcome
             if outcome == "GITHUB_ERROR" and run.record.get("message") is None:
