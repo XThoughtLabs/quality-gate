@@ -184,37 +184,56 @@ def test_secrets_never_reach_the_environment(world, monkeypatch):
     assert F.TOKEN not in " ".join(seen.values())
 
 
+class _Answer:
+    status = 200
+
+    def read(self):
+        return b"{}"
+
+    def __enter__(self):
+        return self
+
+    def __exit__(self, *args):
+        return False
+
+
 @pytest.mark.cr("CR-11")
-def test_default_transport_goes_to_github_with_a_timeout(controller, monkeypatch):
-    calls = []
+def test_default_transport_goes_to_github_with_a_timeout_no_proxy_no_redirect(controller, monkeypatch):
+    """Amendment R4: an opener with an empty ProxyHandler and a handler that follows no redirect."""
+    import urllib.request
 
-    class Answer:
-        status = 200
+    calls, handlers = [], []
 
-        def read(self):
-            return b"{}"
+    class Opener:
+        def open(self, request, timeout=None):
+            calls.append((request.full_url, timeout, request.get_method()))
+            return _Answer()
 
-        def __enter__(self):
-            return self
+    def fake_build_opener(*given):
+        handlers.extend(given)
+        return Opener()
 
-        def __exit__(self, *args):
-            return False
-
-    def fake_urlopen(request, timeout=None, **kwargs):
-        calls.append((request.full_url, timeout, request.get_method()))
-        return Answer()
-
-    monkeypatch.setattr("urllib.request.urlopen", fake_urlopen)
+    monkeypatch.setattr("urllib.request.build_opener", fake_build_opener)
+    monkeypatch.setattr("urllib.request.urlopen", lambda *a, **k: pytest.fail("the default opener must not be used"))
     status, body = controller.default_http("GET", F.API + "/repos/acme/demo-stand/pulls/7",
                                            {"Authorization": "Bearer x"}, None)
     assert status == 200 and body == b"{}"
     assert calls == [(F.API + "/repos/acme/demo-stand/pulls/7", 30, "GET")]
+    proxies = [h for h in handlers if isinstance(h, urllib.request.ProxyHandler)]
+    assert len(proxies) == 1 and proxies[0].proxies == {}
+    redirect = [h for h in handlers if isinstance(h, urllib.request.HTTPRedirectHandler)
+                or (isinstance(h, type) and issubclass(h, urllib.request.HTTPRedirectHandler))]
+    assert len(redirect) == 1
+    handler = redirect[0]() if isinstance(redirect[0], type) else redirect[0]
+    request = urllib.request.Request(F.API + "/x", method="GET")
+    assert handler.redirect_request(request, None, 302, "Found", {}, "https://evil.example/x") is None
 
 
 @pytest.mark.cr("CR-11")
 @pytest.mark.parametrize("url", ["http://api.github.com/x", "https://evil.example/x", "https://api.github.com.evil/x"])
 def test_default_transport_refuses_another_host(controller, monkeypatch, url):
     monkeypatch.setattr("urllib.request.urlopen", lambda *a, **k: pytest.fail("no request may leave"))
+    monkeypatch.setattr("urllib.request.build_opener", lambda *a, **k: pytest.fail("no request may leave"))
     with pytest.raises(controller.ControllerError):
         controller.default_http("GET", url, {}, None)
 

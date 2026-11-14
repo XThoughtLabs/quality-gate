@@ -66,6 +66,25 @@ conftest.py               @acme
 """
 
 
+DEFAULT_SOURCE = b'"""An ordinary module."""\n\nLIMIT = 2000\n'
+
+STORE_BASE = b'''"""A store."""
+
+TASKS_TABLE = """
+CREATE TABLE IF NOT EXISTS tasks (
+    id INTEGER PRIMARY KEY,
+    priority INTEGER NOT NULL CHECK(priority BETWEEN 1 AND 5)
+)
+"""
+# A comment that names CREATE TABLE is no string literal.
+COPY = ["CREATE TEMP TABLE task_rows AS SELECT * FROM tasks", "DROP TABLE task_rows"]
+
+
+def visible(query):
+    return {"query": query.lower()}
+'''
+
+
 def b64(data: bytes) -> str:
     return base64.b64encode(data).decode("ascii")
 
@@ -166,6 +185,16 @@ class FakeGitHub:
         self.fail: dict[str, tuple[int, object]] = {}
         self.after: dict[str, object] = {}
         self.token_bodies: list = []
+        # Review round 1. Files at a ref for the contents route: {(ref, path): bytes or None (404)}; a code path not
+        # listed answers DEFAULT_SOURCE at the merge base and at the head.
+        self.files: dict[tuple[str, str], bytes | None] = {}
+        self.codeowners_encoding = "base64"
+        # Routes that get no answer: raise ConnectionResetError before acting ("no_answer") or after acting
+        # ("lose_answer"), as a lost connection would.
+        self.no_answer: set[str] = set()
+        self.lose_answer: set[str] = set()
+        self.token_value = TOKEN
+        self.counts: dict[str, int] = {}
 
     # ------------------------------------------------------------------ helpers for tests
     def routes(self, method: str | None = None) -> list[str]:
@@ -184,6 +213,9 @@ class FakeGitHub:
         payload = json.loads(body) if body else None
         route = self._route(method, parsed.path)
         self.calls.append(Call(method, url, parsed.path, query, dict(headers), payload, route))
+        self.counts[route] = self.counts.get(route, 0) + 1
+        if route in self.no_answer:
+            raise ConnectionResetError("the connection was reset (fake)")
         if not url.startswith(API + "/") or parsed.scheme != "https" or parsed.netloc != "api.github.com":
             return 404, b'{"message": "wrong host"}'
         if route == "token":
@@ -198,6 +230,8 @@ class FakeGitHub:
         hook = self.after.get(route)
         if hook is not None:
             hook(self)
+        if route in self.lose_answer:
+            raise ConnectionResetError("the answer was lost (fake)")
         return status, json.dumps(answer).encode()
 
     def _route(self, method: str, path: str) -> str:
@@ -252,9 +286,11 @@ class FakeGitHub:
         page = int(query.get("page", "1"))
         if route == "token":
             self.token_bodies.append(payload)
-            return 201, {"token": TOKEN, "expires_at": "2027-01-15T08:00:00Z"}
+            return 201, {"token": self.token_value, "expires_at": "2027-01-15T08:00:00Z"}
         if route == "pr":
             pr = copy.deepcopy(self.pr)
+            if pr.get("merged"):
+                pr.setdefault("merge_commit_sha", MERGE_SHA)
             pr["mergeable"] = self.mergeable.pop(0) if len(self.mergeable) > 1 else self.mergeable[0]
             return 200, pr
         if route == "closed":
@@ -274,9 +310,22 @@ class FakeGitHub:
             return 200, copy.deepcopy(self.compare)
         if route == "contents":
             name = urllib.parse.unquote(path.split("/contents/", 1)[1])
-            if query.get("ref") != self.base_tip or name not in self.codeowners:
+            ref = query.get("ref")
+            if name.endswith("CODEOWNERS"):
+                if ref != self.base_tip or name not in self.codeowners:
+                    return 404, {"message": "Not Found"}
+                if self.codeowners_encoding != "base64":
+                    return 200, {"type": "file", "encoding": self.codeowners_encoding, "content": ""}
+                return 200, {"type": "file", "encoding": "base64", "content": b64(self.codeowners[name].encode())}
+            if (ref, name) in self.files:
+                data = self.files[(ref, name)]
+            elif ref in (self.compare["merge_base_commit"]["sha"], self.pr["head"]["sha"]):
+                data = DEFAULT_SOURCE
+            else:
+                data = None
+            if data is None:
                 return 404, {"message": "Not Found"}
-            return 200, {"type": "file", "encoding": "base64", "content": b64(self.codeowners[name].encode())}
+            return 200, {"type": "file", "encoding": "base64", "content": b64(data)}
         if route == "tree":
             sha = path.rsplit("/", 1)[1]
             if query.get("recursive") != "1":

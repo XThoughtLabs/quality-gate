@@ -101,8 +101,6 @@ def test_the_first_bad_file_in_api_order_names_the_code(world):
 
 @pytest.mark.cr("CR-4")
 @pytest.mark.parametrize("files", [
-    [CODE],
-    [NEW_TEST],
     [CODE, NEW_TEST],
     [f("workflow/new_module.py", "added"), f("tests/sub/test_deeper.py", "added")],
 ])
@@ -128,7 +126,7 @@ def test_too_many_files_refuses(world):
 
 @pytest.mark.cr("CR-4")
 def test_299_files_are_read(world):
-    files = [f(f"workflow/m{i}.py", "added") for i in range(299)]
+    files = [f(f"workflow/m{i}.py", "added") for i in range(298)] + [NEW_TEST]
     with_files(world, *files)
     assert world.run().code == 0
 
@@ -212,7 +210,7 @@ def test_codeowners_pattern_forms(world, pattern, path):
                                      "x/workflow/service.py", "/workflow/service.py/", "service.py/"])
 def test_codeowners_patterns_that_do_not_name_the_file(world, pattern):
     world.gh.codeowners = {"CODEOWNERS": f"# comment\n\n{pattern} @acme\n"}
-    with_files(world, f("workflow/service.py"))
+    with_files(world, f("workflow/service.py"), NEW_TEST)
     assert world.run().code == 0
 
 
