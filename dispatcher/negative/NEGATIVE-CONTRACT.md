@@ -235,6 +235,10 @@ missing permissions); a new case shows the merge.
   - Then exactly one attempt, route 11: `PUT /repos/{r}/pulls/{N}/merge` with `{"sha": <expect-head>,
     "merge_method": "merge"}`, recorded like N3's attempts (NC-14). A 2xx answer is `FINDING` (exit 1); a 4xx is
     `DONE` (exit 0); anything else, or no answer, `GITHUB_ERROR` (exit 6).
+  - **Amendment S4 (review round 2):** a draft PR is a precondition too (exit 3). A 4xx is `DONE` only when GitHub's
+    message names `stage-a/policy`, and the stop line then quotes the message's line that names it; a 4xx that does
+    not name it (another missing check, a moved head, a draft) is `GITHUB_ERROR`, with the message's first line. No
+    answer ends `GITHUB_ERROR` with "the merge may have been done; read PR #N".
   - The tool does not read the PR's checks or statuses: the executor's app may lack the permission. The run sheet has
     the operator read them with his own login right before, and give the head he saw as `--expect-head`: every
     required check green except `stage-a/policy`, which must be absent. The intended PR is the positive task's PR,

@@ -111,6 +111,9 @@ the code `UNREADABLE` (fail closed). The first rule that fails, in this order, i
     the Python string literals that hold a schema word (found with the standard `tokenize` module; comments are not
     string literals) are compared, each with its runs of white space made one space and in lower case, as sorted lists.
     Any difference is `SCHEMA`. A file that cannot be read, is not base64, or does not tokenize is `UNREADABLE`.
+    **Amendment S3 (review round 2):** a "literal" here is a whole run of adjacent string literals (Python joins them),
+    and a whole f-string, its replacement fields counted as `{}`; so a schema split over adjacent pieces, or one in an
+    f-string with a field before the change, is compared whole.
   - **Amendment R6:** `CASE_CLASH`: an added path whose lower-case form equals the lower-case form of another path in
     the head's tree (on a checkout that ignores letter case, one file would replace the other).
   - `CODEOWNERS_PATH`: a path that a pattern of the base tip's CODEOWNERS names. The file is read from
@@ -193,7 +196,9 @@ Otherwise a failing run is *refused*.
      GitHub's status code and message, without a retry. **Amendment R2:** when the merge request gets no answer at
      all, the PR is read once more: merged, with a `merge_commit_sha`, ends the run `MERGED` (the record's `message`
      says the answer was lost); not merged ends it `GITHUB_ERROR` ("the merge request got no answer; the PR is not
-     merged"); unreadable ends it `GITHUB_ERROR` ("the merge's outcome is unknown"). The controller never approves, never changes a rule or a
+     merged"); unreadable ends it `GITHUB_ERROR` ("the merge's outcome is unknown"). **Amendment S1 (review round 2):**
+     `MERGED` only when the re-read PR's head is the run's head; merged at another head ends `GITHUB_ERROR` ("merged,
+     but not at this run's head"). The record's `message` names the PR's `merged_by` login. The controller never approves, never changes a rule or a
      setting, and uses no other route than those named in this contract.
 - **CR-9 Running twice.**
   - A PR that is already merged ends the run `ALREADY_MERGED`, after CR-2's first read, with nothing posted and no merge.
@@ -208,7 +213,8 @@ Otherwise a failing run is *refused*.
   `merge_sha`, and `message` (GitHub's status code and message, for a GitHub refusal or error). `rules` is an object
   keyed by `CR-2` to `CR-6`: `{"ok": true}`, or `{"ok": false, "code": <code>, "detail": <text>}`; a rule not
   evaluated is absent. A value not known is `null`. Never a token, a JWT or a key. A usage error and `LOCKED` write
-  no record.
+  no record. **Amendment S2 (review round 2):** a record that cannot be written does not change the outcome or its
+  exit code; the stop line is still printed, once, and ends with "; the record could not be written".
 - **CR-11 The key.**
   - Before the key is read: `key_file` must be an absolute path to a regular file that is no symbolic link, and its
     access rules and its folder's must allow nobody but the operator's own user, SYSTEM (`S-1-5-18`) and the
