@@ -111,6 +111,16 @@ def test_invalid_queue(world, doc):
 
 
 @pytest.mark.cr("CR-1b")
+def test_queue_tasks_whose_branch_slugs_collide_are_invalid(world):
+    """Two IDs of 38 letters differ only past the slug's 40-character cut (closes mutant M06)."""
+    long_id = "A" * 38
+    world.set_queue(queue_document(tasks=[(f"{long_id}-T1", f"{long_id}-T1 Same"), (f"{long_id}-T2", f"{long_id}-T2 Same")]))
+    result = world.run()
+    usage(world, result)
+    assert "QUEUE_INVALID" in result.stop and "branch slug" in result.stop
+
+
+@pytest.mark.cr("CR-1b")
 def test_queue_task_with_a_dependency_is_invalid(world):
     doc = queue_document()
     doc["tasks"][1]["depends_on"] = ["SA1-T1"]

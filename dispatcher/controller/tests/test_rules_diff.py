@@ -79,6 +79,8 @@ def f(name, status="modified", patch="@@ -1 +1 @@\n-a\n+b\n", **extra):
     (f("README.md"), "OUTSIDE_POLICY"),
     (f("workflow/data.json", "added"), "OUTSIDE_POLICY"),
     (f("tests/helpers.py", "added"), "OUTSIDE_POLICY"),
+    (f("workflow/test_new.py", "added"), "OUTSIDE_POLICY"),
+    (f("workflow/new_test.py", "added"), "OUTSIDE_POLICY"),
     (f("workflow/../quality.toml"), "BAD_PATH"),
     (f("workflow\\service.py"), "BAD_PATH"),
     (f("/workflow/service.py"), "BAD_PATH"),
@@ -207,7 +209,7 @@ def test_codeowners_pattern_forms(world, pattern, path):
 
 @pytest.mark.cr("CR-4")
 @pytest.mark.parametrize("pattern", ["/other/", "/workflow/store.py", "service", "/service.py", "flow/",
-                                     "x/workflow/service.py"])
+                                     "x/workflow/service.py", "/workflow/service.py/", "service.py/"])
 def test_codeowners_patterns_that_do_not_name_the_file(world, pattern):
     world.gh.codeowners = {"CODEOWNERS": f"# comment\n\n{pattern} @acme\n"}
     with_files(world, f("workflow/service.py"))

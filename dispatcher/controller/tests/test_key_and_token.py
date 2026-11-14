@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import os
+import stat
 import sys
 from pathlib import Path
 
@@ -82,6 +83,35 @@ def test_key_that_is_a_symbolic_link(world):
     world.set_config(key_file=f"'{link}'")
     result = world.run()
     assert result.code == 2 and "KEY_UNSAFE" in result.stop, result.out
+
+
+@pytest.mark.cr("CR-11")
+@pytest.mark.parametrize("mode, attributes", [(stat.S_IFLNK | 0o777, 0), (stat.S_IFREG | 0o600, 0x400)])
+def test_key_seen_as_a_link_or_reparse_point(world, monkeypatch, controller, mode, attributes):
+    """The same rule as the skipped test above, without the privilege a real link needs (closes mutant M56)."""
+    real_lstat = os.lstat
+
+    def fake_lstat(path, *args, **kwargs):
+        if str(path) == str(world.key_file):
+            values = list(real_lstat(path))
+            values[0] = mode
+            result = os.stat_result(values)
+            return FakeStat(result, attributes)
+        return real_lstat(path, *args, **kwargs)
+
+    monkeypatch.setattr(controller.os, "lstat", fake_lstat)
+    result = world.run()
+    assert result.code == 2 and "KEY_UNSAFE" in result.stop, result.out
+    assert world.gh.calls == []
+
+
+class FakeStat:
+    def __init__(self, base, attributes):
+        self._base = base
+        self.st_file_attributes = attributes
+
+    def __getattr__(self, name):
+        return getattr(self._base, name)
 
 
 @pytest.mark.cr("CR-11")

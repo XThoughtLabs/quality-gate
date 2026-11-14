@@ -88,7 +88,7 @@ def test_merge_carries_the_head_and_the_method(world):
     result = world.run()
     merges = [c for c in world.gh.calls if c.route == "merge"]
     assert len(merges) == 1
-    assert merges[0].body["sha"] == F.HEAD and merges[0].body["merge_method"] == "merge"
+    assert merges[0].body.get("sha") == F.HEAD and merges[0].body.get("merge_method") == "merge"
     assert world.last_record()["merge_sha"] == F.MERGE_SHA
     assert result.stop == f"CONTROLLER MERGED: PR {F.PR} at {F.HEAD} merged as {F.MERGE_SHA}"
 
@@ -178,9 +178,10 @@ def test_github_refuses_the_merge_once_without_retry(world, status, message):
 
 @pytest.mark.cr("CR-8")
 def test_a_200_without_merged_is_refused(world):
-    world.gh.merge_answer = (200, {"merged": False, "message": "odd"})
+    world.gh.merge_answer = (200, {"merged": False, "sha": F.MERGE_SHA, "message": "odd"})
     result = world.run()
     assert result.code == 4, result.out
+    assert world.last_record()["merge_sha"] is None
 
 
 @pytest.mark.cr("CR-8")
@@ -271,7 +272,8 @@ def test_a_refused_run_records_each_rule(world):
     world.gh.statuses = []
     world.run()
     rules = world.last_record()["rules"]
-    assert rules["CR-2"] == {"ok": False, "code": "PR_DRAFT", "detail": rules["CR-2"]["detail"]}
+    assert rules["CR-2"].get("ok") is False and rules["CR-2"].get("code") == "PR_DRAFT"
+    assert set(rules["CR-2"]) == {"ok", "code", "detail"} and "draft" in rules["CR-2"]["detail"]
     assert rules["CR-6"]["code"] == "REVIEW_MISSING"
     assert rules["CR-4"]["ok"] is True
     assert world.last_record()["outcome"] == "REFUSED"
