@@ -1,0 +1,33 @@
+# The milestone controller's configuration (CONTROLLER-CONTRACT.md, CR-1a). Copy it outside every repository, in
+# your own Windows user's space, and replace every <...>. Every key is required; an unknown key is refused.
+
+[controller]
+# The controller app (letter's table: Contents write, Checks write, Pull requests read, Commit statuses read).
+app_id = 1
+installation_id = 1
+# Written by the setup script, readable only by your own user (and SYSTEM, Administrators).
+key_file = '<your key folder>\<controller app name>.pem'
+# One JSON line per run (CR-10); the lock is this path plus ".lock" (CR-9).
+log_file = '<a folder in your own profile>\controller-log.jsonl'
+base_branch = "candidate/a"
+reports_branch = "reports"
+
+[executor]
+app_slug = "<executor app name>"
+app_id = 1
+# The user ID of the app's bot account "<executor app name>[bot]": GET https://api.github.com/users/<name>%5Bbot%5D
+bot_id = 1
+
+[reviewer]
+app_slug = "<reviewer app name>"
+app_id = 1
+bot_id = 1
+
+[gate]
+actions_app_id = 15368
+checks = ["gate/env", "gate/tests", "gate/acceptance", "gate/guard", "gate/security", "gate/report", "gate/archive", "gate/final"]
+policy_check = "stage-a/policy"
+
+[policy]
+code_folders = ["<application folder>/"]
+test_folder = "tests/"
